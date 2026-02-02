@@ -376,15 +376,120 @@ class TemplateSynthesizer:
         # Process affected records
         for record_num in range(start_record, end_record):
             if record_num in self.mft_record_to_source:
-                # Known file - reparse for cluster updates
+                # Known file - reparse for cluster updates and check for rename
                 self._reparse_mft_record(record_num)
+            elif record_num in self.mft_record_to_dir:
+                # Known directory - check for rename
+                self._check_directory_rename(record_num)
             else:
-                # Check if this is a new file
-                new_file = self._check_new_file(record_num)
-                if new_file:
-                    new_files.append(new_file)
+                # Check if this is a new file or directory
+                new_path = self._check_new_file(record_num)
+                if new_path:
+                    new_files.append(new_path)
+                else:
+                    self._check_new_directory(record_num)
 
         return new_files
+
+    def _check_directory_rename(self, record_num: int):
+        """Check if a tracked directory was renamed and update ext4."""
+        old_rel_path = self.mft_record_to_dir.get(record_num)
+        if not old_rel_path:
+            return
+
+        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+        if record_offset + MFT_RECORD_SIZE > len(self.template):
+            return
+
+        record = self._undo_fixups(bytearray(
+            self.template[record_offset:record_offset + MFT_RECORD_SIZE]
+        ))
+
+        if record[0:4] != b'FILE':
+            return
+
+        filename, parent_ref = self._extract_filename_and_parent(record)
+        if not filename:
+            return
+
+        # Determine new path
+        parent_record = parent_ref & 0xFFFFFFFFFFFF
+        if parent_record == 5:
+            new_rel_path = filename
+        elif parent_record in self.mft_record_to_dir:
+            parent_path = self.mft_record_to_dir[parent_record]
+            new_rel_path = os.path.join(parent_path, filename) if parent_path else filename
+        else:
+            new_rel_path = filename
+
+        # Check if renamed
+        if new_rel_path != old_rel_path:
+            old_path = os.path.join(self.source_dir, old_rel_path)
+            new_path = os.path.join(self.source_dir, new_rel_path)
+
+            try:
+                if os.path.exists(old_path) and not os.path.exists(new_path):
+                    os.rename(old_path, new_path)
+                    self.mft_record_to_dir[record_num] = new_rel_path
+                    log(f"  DIR RENAMED: {old_rel_path} -> {new_rel_path}")
+            except OSError as e:
+                log(f"  Failed to rename dir {old_rel_path}: {e}")
+
+    def _check_new_directory(self, record_num: int):
+        """Check if an MFT record is a new directory and create it in ext4."""
+        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+        if record_offset + MFT_RECORD_SIZE > len(self.template):
+            return
+
+        record = self._undo_fixups(bytearray(
+            self.template[record_offset:record_offset + MFT_RECORD_SIZE]
+        ))
+
+        if record[0:4] != b'FILE':
+            return
+
+        flags = struct.unpack('<H', record[22:24])[0]
+
+        # Check if in-use and IS a directory
+        if not (flags & 0x01) or not (flags & 0x02):
+            return
+
+        # Already tracked?
+        if record_num in self.mft_record_to_dir:
+            return
+
+        filename, parent_ref = self._extract_filename_and_parent(record)
+        if not filename:
+            return
+
+        # Skip system directories
+        if filename.startswith('$'):
+            return
+
+        # Determine the target path
+        parent_record = parent_ref & 0xFFFFFFFFFFFF
+
+        if parent_record == 5:
+            rel_path = filename
+        elif parent_record in self.mft_record_to_dir:
+            parent_path = self.mft_record_to_dir[parent_record]
+            rel_path = os.path.join(parent_path, filename) if parent_path else filename
+        else:
+            rel_path = filename
+
+        source_path = os.path.join(self.source_dir, rel_path)
+
+        # Create directory if it doesn't exist
+        try:
+            if not os.path.exists(source_path):
+                os.makedirs(source_path, exist_ok=True)
+                log(f"  NEW DIR created: {rel_path}")
+
+            # Track this directory
+            self.mft_record_to_dir[record_num] = rel_path
+
+        except OSError as e:
+            log(f"  Failed to create dir {rel_path}: {e}")
 
     def _check_new_file(self, record_num: int) -> Optional[str]:
         """Check if an MFT record is a new file and create it in ext4."""
@@ -462,12 +567,62 @@ class TemplateSynthesizer:
             return None
 
     def _reparse_mft_record(self, record_num: int):
-        """Re-parse an MFT record and update cluster mappings."""
+        """Re-parse an MFT record and update cluster mappings, check for renames."""
         source_path = self.mft_record_to_source.get(record_num)
         if not source_path:
             return
 
         log(f"Re-parsing MFT record {record_num} for {os.path.basename(source_path)}")
+
+        # Read the MFT record to check for rename
+        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+        if record_offset + MFT_RECORD_SIZE > len(self.template):
+            return
+
+        record = self._undo_fixups(bytearray(
+            self.template[record_offset:record_offset + MFT_RECORD_SIZE]
+        ))
+
+        if record[0:4] != b'FILE':
+            log(f"  Record {record_num} is not a valid FILE record")
+            return
+
+        # Check for rename
+        filename, parent_ref = self._extract_filename_and_parent(record)
+        if filename:
+            parent_record = parent_ref & 0xFFFFFFFFFFFF
+            if parent_record == 5:
+                new_rel_path = filename
+            elif parent_record in self.mft_record_to_dir:
+                parent_path = self.mft_record_to_dir[parent_record]
+                new_rel_path = os.path.join(parent_path, filename) if parent_path else filename
+            else:
+                new_rel_path = filename
+
+            new_path = os.path.join(self.source_dir, new_rel_path)
+
+            if new_path != source_path and os.path.exists(source_path):
+                try:
+                    # Ensure parent directory exists
+                    parent_dir = os.path.dirname(new_path)
+                    if parent_dir and not os.path.exists(parent_dir):
+                        os.makedirs(parent_dir, exist_ok=True)
+
+                    if not os.path.exists(new_path):
+                        os.rename(source_path, new_path)
+                        log(f"  FILE RENAMED: {os.path.basename(source_path)} -> {filename}")
+                        source_path = new_path
+                        self.mft_record_to_source[record_num] = new_path
+
+                        # Update source_to_clusters mapping
+                        if source_path in self.source_to_clusters:
+                            clusters = self.source_to_clusters.pop(source_path)
+                            self.source_to_clusters[new_path] = clusters
+                            for cluster in clusters:
+                                if cluster in self.cluster_map:
+                                    self.cluster_map[cluster] = (new_path, self.cluster_map[cluster][1])
+                except OSError as e:
+                    log(f"  Failed to rename file: {e}")
 
         # Remove old cluster mappings for this file
         if source_path in self.source_to_clusters:
@@ -478,27 +633,7 @@ class TemplateSynthesizer:
             log(f"  Removed {len(old_clusters)} old cluster mappings")
             self.source_to_clusters[source_path] = set()
 
-        # Read the MFT record from template (which now has updated data)
-        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
-        if record_offset + MFT_RECORD_SIZE > len(self.template):
-            return
-
-        record = bytearray(self.template[record_offset:record_offset + MFT_RECORD_SIZE])
-
-        if record[0:4] != b'FILE':
-            log(f"  Record {record_num} is not a valid FILE record")
-            return
-
-        # Undo fixups
-        usa_offset = struct.unpack('<H', record[4:6])[0]
-        usa_count = struct.unpack('<H', record[6:8])[0]
-        for i in range(1, usa_count):
-            sector_end = i * 512 - 2
-            if usa_offset + i*2 + 2 <= MFT_RECORD_SIZE and sector_end + 2 <= MFT_RECORD_SIZE:
-                original = struct.unpack('<H', record[usa_offset + i*2:usa_offset + i*2 + 2])[0]
-                struct.pack_into('<H', record, sector_end, original)
-
-        # Find $DATA attribute
+        # Find $DATA attribute (record already read and fixups undone above)
         first_attr = struct.unpack('<H', record[20:22])[0]
         off = first_attr
         data_runs = None

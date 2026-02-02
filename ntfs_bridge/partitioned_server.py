@@ -57,9 +57,8 @@ class PartitionedSynthesizer:
         mbr[0:2] = b'\xeb\xfe'
 
         # Disk signature at offset 0x1B8 (required by Windows)
-        import random
-        disk_sig = random.randint(0x10000000, 0xFFFFFFFF)
-        struct.pack_into('<I', mbr, 0x1B8, disk_sig)
+        # Use a fixed signature so Windows recognizes the disk after restarts
+        struct.pack_into('<I', mbr, 0x1B8, 0x4E544653)  # "NTFS" in ASCII hex
 
         part1_offset = 446
         start_sector = self.PARTITION_OFFSET // 512
@@ -162,23 +161,27 @@ class PartitionedNBDServer:
         # Send initial magic
         sock.sendall(b'NBDMAGIC')
         sock.sendall(struct.pack('>Q', 0x49484156454F5054))  # IHAVEOPT
-        sock.sendall(struct.pack('>H', 0x0001))  # Handshake flags
+        # Handshake flags: NBD_FLAG_FIXED_NEWSTYLE (0x0001) | NBD_FLAG_NO_ZEROES (0x0002)
+        sock.sendall(struct.pack('>H', 0x0003))
 
         # Receive client flags
-        sock.recv(4)
+        client_flags = sock.recv(4)
+        log(f"Client flags: {client_flags.hex() if client_flags else 'none'}")
 
         # Handle options
         while True:
             opt_hdr = sock.recv(16)
             if len(opt_hdr) < 16:
+                log(f"Short option header: {len(opt_hdr)} bytes")
                 return False
 
             opt_magic, opt_type, opt_len = struct.unpack('>QII', opt_hdr)
+            log(f"Option: magic={opt_magic:#x} type={opt_type} len={opt_len}")
             opt_data = sock.recv(opt_len) if opt_len > 0 else b''
 
             if opt_type == NBD_OPT_GO or opt_type == NBD_OPT_INFO:
-                # Send block size info
-                block_info = struct.pack('>HIII', NBD_INFO_BLOCK_SIZE, 1, 4096, 32*1024*1024)
+                # Send block size info (min=512, preferred=4096, max=32MB)
+                block_info = struct.pack('>HIII', NBD_INFO_BLOCK_SIZE, 512, 4096, 32*1024*1024)
                 self._send_opt_reply(sock, opt_type, NBD_REP_INFO, block_info)
 
                 # Send export info
@@ -190,6 +193,7 @@ class PartitionedNBDServer:
                 self._send_opt_reply(sock, opt_type, NBD_REP_ACK, b'')
 
                 if opt_type == NBD_OPT_GO:
+                    log("Handshake complete, entering transmission phase")
                     return True
             else:
                 # Unknown option, send unsupported error
@@ -202,13 +206,20 @@ class PartitionedNBDServer:
         sock.sendall(hdr + data)
 
     def _handle_request(self, sock):
-        hdr = sock.recv(28)
+        try:
+            hdr = sock.recv(28)
+        except Exception as e:
+            log(f"Recv error: {e}")
+            return False
+
         if len(hdr) < 28:
+            log(f"Short read: got {len(hdr)} bytes, expected 28")
             return False
 
         magic, flags, cmd, handle, offset, length = struct.unpack('>IHHQQI', hdr)
 
         if magic != NBD_REQUEST_MAGIC:
+            log(f"Bad magic: {magic:#x}")
             return False
 
         if cmd == NBD_CMD_READ:
