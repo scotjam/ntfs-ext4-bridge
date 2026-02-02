@@ -49,11 +49,14 @@ class TemplateSynthesizer:
         # Track which clusters belong to which MFT record (for cleanup on remap)
         self.source_to_clusters: Dict[str, Set[int]] = {}
 
+        # Directory tracking: record_num -> directory path (relative to source_dir)
+        self.mft_record_to_dir: Dict[int, str] = {}
+
         # Calculate MFT extent (may span multiple clusters)
         # We'll update this when we see MFT $DATA attribute
         self.mft_clusters: Set[int] = set()
 
-        # Scan template MFT to find files and map their clusters
+        # Scan template MFT to find directories first, then files
         self._scan_template_mft()
 
         log(f"MFT tracking initialized: {len(self.mft_record_to_source)} files tracked")
@@ -63,7 +66,27 @@ class TemplateSynthesizer:
         print(f"  Mapped clusters: {len(self.cluster_map)}")
 
     def _scan_template_mft(self):
-        """Scan MFT in template to find files and map their data clusters."""
+        """Scan MFT in template to find directories and files."""
+        offset = self.mft_offset
+        record_num = 0
+
+        # First pass: find all directories
+        while offset + MFT_RECORD_SIZE <= len(self.template):
+            record = self.template[offset:offset + MFT_RECORD_SIZE]
+
+            if record[0:4] != b'FILE':
+                break
+
+            record = self._undo_fixups(bytearray(record))
+            flags = struct.unpack('<H', record[22:24])[0]
+
+            if flags & 0x01 and flags & 0x02:  # In-use and is directory
+                self._process_directory_record(record, record_num)
+
+            offset += MFT_RECORD_SIZE
+            record_num += 1
+
+        # Second pass: find all files
         offset = self.mft_offset
         record_num = 0
 
@@ -73,31 +96,61 @@ class TemplateSynthesizer:
             if record[0:4] != b'FILE':
                 break
 
-            # Undo fixups to read record
-            record = bytearray(record)
-            usa_offset = struct.unpack('<H', record[4:6])[0]
-            usa_count = struct.unpack('<H', record[6:8])[0]
-            for i in range(1, usa_count):
-                sector_end = i * 512 - 2
-                if usa_offset + i*2 + 2 <= MFT_RECORD_SIZE and sector_end + 2 <= MFT_RECORD_SIZE:
-                    original = struct.unpack('<H', record[usa_offset + i*2:usa_offset + i*2 + 2])[0]
-                    struct.pack_into('<H', record, sector_end, original)
-
-            # Check if in-use and is a file (not directory)
+            record = self._undo_fixups(bytearray(record))
             flags = struct.unpack('<H', record[22:24])[0]
+
             if flags & 0x01 and not (flags & 0x02):  # In-use, not directory
                 self._process_file_record(record, record_num)
 
             offset += MFT_RECORD_SIZE
             record_num += 1
 
-    def _process_file_record(self, record: bytearray, record_num: int):
-        """Process a file record to extract filename and data run mapping."""
+    def _undo_fixups(self, record: bytearray) -> bytearray:
+        """Undo USA fixups in an MFT record."""
+        usa_offset = struct.unpack('<H', record[4:6])[0]
+        usa_count = struct.unpack('<H', record[6:8])[0]
+        for i in range(1, usa_count):
+            sector_end = i * 512 - 2
+            if usa_offset + i*2 + 2 <= MFT_RECORD_SIZE and sector_end + 2 <= MFT_RECORD_SIZE:
+                original = struct.unpack('<H', record[usa_offset + i*2:usa_offset + i*2 + 2])[0]
+                struct.pack_into('<H', record, sector_end, original)
+        return record
+
+    def _process_directory_record(self, record: bytearray, record_num: int):
+        """Process a directory record to build directory mapping."""
+        filename, parent_ref = self._extract_filename_and_parent(record)
+        if not filename:
+            return
+
+        # Skip system directories
+        if filename.startswith('$'):
+            return
+
+        # Root directory (record 5) maps to source_dir
+        if record_num == 5:
+            self.mft_record_to_dir[5] = ''
+            return
+
+        # Get parent path
+        parent_record = parent_ref & 0xFFFFFFFFFFFF  # Lower 48 bits
+        if parent_record == 5:
+            # Direct child of root
+            dir_path = filename
+        elif parent_record in self.mft_record_to_dir:
+            parent_path = self.mft_record_to_dir[parent_record]
+            dir_path = os.path.join(parent_path, filename) if parent_path else filename
+        else:
+            # Parent not found yet, use just filename
+            dir_path = filename
+
+        self.mft_record_to_dir[record_num] = dir_path
+
+    def _extract_filename_and_parent(self, record: bytearray) -> Tuple[Optional[str], int]:
+        """Extract filename and parent directory reference from MFT record."""
         first_attr = struct.unpack('<H', record[20:22])[0]
         off = first_attr
-
         filename = None
-        data_runs = None
+        parent_ref = 0
 
         while off < MFT_RECORD_SIZE - 8:
             attr_type = struct.unpack('<I', record[off:off+4])[0]
@@ -109,31 +162,65 @@ class TemplateSynthesizer:
                 break
 
             name_len = record[off+9]
-            name_offset = struct.unpack('<H', record[off+10:off+12])[0] if name_len > 0 else 0
-            attr_name = record[off+name_offset:off+name_offset+name_len*2].decode('utf-16-le') if name_len > 0 else ''
+            attr_name = ''
+            if name_len > 0:
+                name_offset = struct.unpack('<H', record[off+10:off+12])[0]
+                attr_name = record[off+name_offset:off+name_offset+name_len*2].decode('utf-16-le', errors='ignore')
 
-            if attr_type == 0x30 and not attr_name:  # $FILE_NAME (unnamed)
-                # Get filename from this attribute
+            if attr_type == 0x30 and not attr_name:  # $FILE_NAME
                 val_len = struct.unpack('<I', record[off+16:off+20])[0]
                 val_off = struct.unpack('<H', record[off+20:off+22])[0]
                 fn_data = record[off+val_off:off+val_off+val_len]
                 if len(fn_data) >= 66:
+                    # Parent directory reference (first 8 bytes)
+                    parent_ref = struct.unpack('<Q', fn_data[0:8])[0]
                     fn_len = fn_data[64]
                     fn_namespace = fn_data[65]
                     # Prefer Win32 or Win32+DOS namespace (1 or 3)
                     if fn_namespace in (1, 3) or filename is None:
                         filename = fn_data[66:66+fn_len*2].decode('utf-16-le', errors='ignore')
 
-            elif attr_type == 0x80 and not attr_name:  # $DATA (unnamed)
+            off += attr_len
+
+        return filename, parent_ref
+
+    def _extract_data_runs(self, record: bytearray) -> Optional[List[Tuple[int, int]]]:
+        """Extract data runs from MFT record's $DATA attribute."""
+        first_attr = struct.unpack('<H', record[20:22])[0]
+        off = first_attr
+
+        while off < MFT_RECORD_SIZE - 8:
+            attr_type = struct.unpack('<I', record[off:off+4])[0]
+            if attr_type == 0xFFFFFFFF:
+                break
+
+            attr_len = struct.unpack('<I', record[off+4:off+8])[0]
+            if attr_len == 0 or attr_len > MFT_RECORD_SIZE:
+                break
+
+            name_len = record[off+9]
+            attr_name = ''
+            if name_len > 0:
+                name_offset = struct.unpack('<H', record[off+10:off+12])[0]
+                attr_name = record[off+name_offset:off+name_offset+name_len*2].decode('utf-16-le', errors='ignore')
+
+            if attr_type == 0x80 and not attr_name:  # $DATA (unnamed)
                 non_res = record[off+8]
                 if non_res:
-                    # Non-resident data - get data runs
                     runs_off = struct.unpack('<H', record[off+32:off+34])[0]
                     real_size = struct.unpack('<Q', record[off+48:off+56])[0]
                     runs = record[off+runs_off:off+attr_len]
-                    data_runs = self._parse_data_runs(runs, real_size)
+                    return self._parse_data_runs(runs, real_size)
+                break
 
             off += attr_len
+
+        return None
+
+    def _process_file_record(self, record: bytearray, record_num: int):
+        """Process a file record to extract filename and data run mapping."""
+        filename, parent_ref = self._extract_filename_and_parent(record)
+        data_runs = self._extract_data_runs(record)
 
         # If we found a file with non-resident data, try to map it
         if filename and data_runs:
@@ -252,18 +339,22 @@ class TemplateSynthesizer:
         """Check if a write affects the MFT region."""
         # MFT starts at mft_offset
         # Check if write range overlaps with MFT
-        # Need to cover at least all tracked records plus some buffer
-        # User files typically start at record 64+, so check 128 records to be safe
+        # Cover a generous range to catch new file creation (256 records)
         max_tracked_record = max(self.mft_record_to_source.keys()) if self.mft_record_to_source else 64
-        mft_end = self.mft_offset + (max_tracked_record + 10) * MFT_RECORD_SIZE
+        mft_end = self.mft_offset + max(256, max_tracked_record + 64) * MFT_RECORD_SIZE
         write_end = offset + length
         result = not (write_end <= self.mft_offset or offset >= mft_end)
         if result:
             log(f"Write at offset {offset} (len {length}) is in MFT region")
         return result
 
-    def handle_mft_write(self, offset: int, data: bytes):
-        """Handle a write to the MFT region - re-parse affected records."""
+    def handle_mft_write(self, offset: int, data: bytes) -> List[str]:
+        """Handle a write to the MFT region - re-parse affected records.
+
+        Returns list of newly created file paths.
+        """
+        new_files = []
+
         # Calculate which MFT records are affected
         rel_offset = offset - self.mft_offset
         if rel_offset < 0:
@@ -282,10 +373,93 @@ class TemplateSynthesizer:
         if template_offset + len(data) <= len(self.template):
             self.template[template_offset:template_offset + len(data)] = data
 
-        # Re-parse affected records
+        # Process affected records
         for record_num in range(start_record, end_record):
             if record_num in self.mft_record_to_source:
+                # Known file - reparse for cluster updates
                 self._reparse_mft_record(record_num)
+            else:
+                # Check if this is a new file
+                new_file = self._check_new_file(record_num)
+                if new_file:
+                    new_files.append(new_file)
+
+        return new_files
+
+    def _check_new_file(self, record_num: int) -> Optional[str]:
+        """Check if an MFT record is a new file and create it in ext4."""
+        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+        if record_offset + MFT_RECORD_SIZE > len(self.template):
+            return None
+
+        record = self._undo_fixups(bytearray(
+            self.template[record_offset:record_offset + MFT_RECORD_SIZE]
+        ))
+
+        if record[0:4] != b'FILE':
+            return None
+
+        flags = struct.unpack('<H', record[22:24])[0]
+
+        # Check if in-use and is a file (not directory)
+        if not (flags & 0x01) or (flags & 0x02):
+            return None
+
+        filename, parent_ref = self._extract_filename_and_parent(record)
+        if not filename:
+            return None
+
+        # Skip system files
+        if filename.startswith('$'):
+            return None
+
+        # Determine the target path in ext4
+        parent_record = parent_ref & 0xFFFFFFFFFFFF
+
+        if parent_record == 5:
+            # Direct child of root
+            rel_path = filename
+        elif parent_record in self.mft_record_to_dir:
+            parent_path = self.mft_record_to_dir[parent_record]
+            rel_path = os.path.join(parent_path, filename) if parent_path else filename
+        else:
+            # Unknown parent, put in root
+            rel_path = filename
+
+        source_path = os.path.join(self.source_dir, rel_path)
+
+        # Check if file already exists
+        if os.path.exists(source_path):
+            log(f"  File already exists: {rel_path}")
+            return None
+
+        # Create the file
+        try:
+            # Ensure parent directory exists
+            parent_dir = os.path.dirname(source_path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+
+            # Create empty file
+            with open(source_path, 'wb') as f:
+                pass
+
+            log(f"  NEW FILE created: {rel_path}")
+
+            # Track this file
+            self.mft_record_to_source[record_num] = source_path
+
+            # Check for data runs and map clusters
+            data_runs = self._extract_data_runs(record)
+            if data_runs:
+                self._map_clusters(data_runs, source_path)
+                log(f"    Mapped {len(data_runs)} data runs")
+
+            return source_path
+
+        except OSError as e:
+            log(f"  Failed to create file {rel_path}: {e}")
+            return None
 
     def _reparse_mft_record(self, record_num: int):
         """Re-parse an MFT record and update cluster mappings."""

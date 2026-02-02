@@ -56,6 +56,11 @@ class PartitionedSynthesizer:
         mbr = bytearray(512)
         mbr[0:2] = b'\xeb\xfe'
 
+        # Disk signature at offset 0x1B8 (required by Windows)
+        import random
+        disk_sig = random.randint(0x10000000, 0xFFFFFFFF)
+        struct.pack_into('<I', mbr, 0x1B8, disk_sig)
+
         part1_offset = 446
         start_sector = self.PARTITION_OFFSET // 512
         total_sectors = self.ntfs_size // 512
@@ -295,7 +300,7 @@ class PartitionedNBDServer:
         """Sync overlay data to source files for newly-mapped clusters."""
         with self.overlay_lock:
             synced_offsets = []
-            for ovl_offset, ovl_data in self.write_overlay.items():
+            for ovl_offset, ovl_data in list(self.write_overlay.items()):
                 if ovl_offset < self.synth.PARTITION_OFFSET:
                     continue
                 ntfs_offset = ovl_offset - self.synth.PARTITION_OFFSET
@@ -305,13 +310,31 @@ class PartitionedNBDServer:
                     source_path, file_offset = self.synth.cluster_map[cluster]
                     write_offset = file_offset + (ntfs_offset % self.synth.cluster_size)
                     try:
-                        with open(source_path, 'r+b') as f:
-                            f.seek(write_offset)
-                            f.write(ovl_data)
+                        # Use 'rb+' if file exists and has content, otherwise 'wb'
+                        # For new files or extending files, we need to handle sparse writes
+                        if os.path.exists(source_path):
+                            # Ensure file is large enough
+                            current_size = os.path.getsize(source_path)
+                            needed_size = write_offset + len(ovl_data)
+
+                            with open(source_path, 'r+b') as f:
+                                if current_size < needed_size:
+                                    # Extend file with zeros
+                                    f.seek(0, 2)  # End of file
+                                    f.write(b'\x00' * (needed_size - current_size))
+                                f.seek(write_offset)
+                                f.write(ovl_data)
+                        else:
+                            # File doesn't exist - create it
+                            with open(source_path, 'wb') as f:
+                                if write_offset > 0:
+                                    f.write(b'\x00' * write_offset)
+                                f.write(ovl_data)
+
                         log(f"  SYNC: overlay -> {os.path.basename(source_path)} @ {write_offset} ({len(ovl_data)} bytes)")
                         synced_offsets.append(ovl_offset)
                     except Exception as e:
-                        log(f"  SYNC error: {e}")
+                        log(f"  SYNC error for {source_path}: {e}")
 
             # Remove synced entries from overlay
             for off in synced_offsets:
