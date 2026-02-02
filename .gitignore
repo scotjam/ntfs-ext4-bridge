@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test artifacts
+*.raw
+*.qcow2
+*.img
+
+# Logs
+*.log
+
+# Temp files
+/tmp/
+*.tmp
