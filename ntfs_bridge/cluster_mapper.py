@@ -18,6 +18,7 @@ from typing import Dict, List, Tuple, Optional, Set, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .lazy_allocator import LazyAllocator
+    from .virtual_files import VirtualFileManager
 
 MFT_RECORD_SIZE = 1024
 CLUSTER_SIZE = 4096  # Standard NTFS cluster size
@@ -97,6 +98,9 @@ class ClusterMapper:
         self.bitmap_clusters: List[Tuple[int, int]] = []  # (start_cluster, count)
         self.total_clusters = len(self.image) // self.cluster_size
 
+        # Virtual file manager for live ext4→NTFS sync (set by bridge)
+        self.virtual_file_manager: Optional['VirtualFileManager'] = None
+
         # Scan MFT
         self._scan_mft()
 
@@ -121,6 +125,7 @@ class ClusterMapper:
         Metadata and unmapped regions are read from the image file.
         For resident files, ext4 content is injected into MFT reads.
         For sparse files, triggers lazy allocation on first access.
+        For virtual files (ext4 only), synthesizes MFT records and data on-the-fly.
         """
         # Debug: log reads when we have sparse files
         if length >= 4096 and self.sparse_files:
@@ -149,7 +154,19 @@ class ClusterMapper:
             cluster = byte_offset // self.cluster_size
             cluster_offset = byte_offset % self.cluster_size
 
-            if cluster in self.cluster_map:
+            # Check for virtual cluster first (from VirtualFileManager)
+            virtual_data = None
+            if self.virtual_file_manager:
+                virtual_data = self.virtual_file_manager.read_virtual_cluster(cluster)
+
+            if virtual_data:
+                # Read from virtual cluster (ext4 file via VirtualFileManager)
+                chunk_len = min(remaining, self.cluster_size - cluster_offset)
+                data = virtual_data[cluster_offset:cluster_offset + chunk_len]
+                result[pos:pos + len(data)] = data
+                pos += chunk_len
+
+            elif cluster in self.cluster_map:
                 mapping = self.cluster_map[cluster]
                 chunk_len = min(remaining, self.cluster_size - cluster_offset)
 
@@ -195,7 +212,28 @@ class ClusterMapper:
         # Inject ext4 content for resident files in the MFT area
         self._inject_resident_data(result, offset, length)
 
+        # Inject virtual MFT records and directory entries
+        if self.virtual_file_manager:
+            self._inject_virtual_entries(result, offset, length)
+
         return bytes(result)
+
+    def _inject_virtual_entries(self, result: bytearray, offset: int, length: int):
+        """Inject virtual MFT records and directory entries into read result.
+
+        This handles:
+        1. Virtual MFT records for files that exist only in ext4
+        2. Virtual directory entries in $INDEX_ROOT for those files
+        """
+        if not self.virtual_file_manager:
+            return
+
+        # Check if read is in MFT region
+        if self.is_mft_region(offset, length):
+            self._inject_virtual_mft_records(result, offset, length)
+
+        # Check if read might include directory indexes
+        self._inject_virtual_dir_entries(result, offset, length)
 
     def _check_sparse_file_read(self, offset: int, length: int):
         """Check if read is for a sparse file and trigger allocation if needed.
@@ -1166,6 +1204,235 @@ class ClusterMapper:
                         dst_off = zero_start - read_offset
                         zero_len = zero_end - zero_start
                         result[dst_off:dst_off + zero_len] = b'\x00' * zero_len
+
+    # =========================================================================
+    # Virtual file injection (ext4→NTFS live sync)
+    # =========================================================================
+
+    def _inject_virtual_mft_records(self, result: bytearray, offset: int, length: int):
+        """Inject virtual MFT records into read result.
+
+        When Windows reads the MFT, we inject synthesized FILE records
+        for virtual files (those that exist in ext4 but not in NTFS image).
+        """
+        if not self.virtual_file_manager:
+            return
+
+        vfm = self.virtual_file_manager
+        read_end = offset + length
+
+        # Calculate which MFT records this read covers
+        rel_offset = offset - self.mft_offset
+        if rel_offset < 0:
+            return
+
+        start_record = rel_offset // MFT_RECORD_SIZE
+        end_record = (rel_offset + length + MFT_RECORD_SIZE - 1) // MFT_RECORD_SIZE
+
+        # Check each virtual record to see if it falls in this read
+        for record_num in list(vfm.mft_to_virtual.keys()):
+            if start_record <= record_num < end_record:
+                # This virtual record is within our read range
+                record_data = vfm.get_virtual_mft_record(record_num)
+                if record_data:
+                    # Calculate where this record should go in the result
+                    record_abs_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+                    if record_abs_offset >= offset and record_abs_offset + MFT_RECORD_SIZE <= read_end:
+                        # Entire record fits in this read
+                        dst = record_abs_offset - offset
+                        result[dst:dst + MFT_RECORD_SIZE] = record_data
+                    else:
+                        # Partial overlap - handle carefully
+                        overlap_start = max(record_abs_offset, offset)
+                        overlap_end = min(record_abs_offset + MFT_RECORD_SIZE, read_end)
+                        if overlap_start < overlap_end:
+                            src_off = overlap_start - record_abs_offset
+                            dst_off = overlap_start - offset
+                            patch_len = overlap_end - overlap_start
+                            result[dst_off:dst_off + patch_len] = record_data[src_off:src_off + patch_len]
+
+    def _inject_virtual_dir_entries(self, result: bytearray, offset: int, length: int):
+        """Inject virtual directory entries into $INDEX_ROOT reads.
+
+        When Windows reads a directory's MFT record, we inject index entries
+        for virtual files that are children of that directory.
+
+        This is complex because $INDEX_ROOT has a specific format:
+        - Index root header (16 bytes)
+        - Index header (16 bytes)
+        - Index entries (variable)
+        - End entry (16 bytes)
+
+        We need to:
+        1. Find where the existing entries end
+        2. Insert our virtual entries before the end entry
+        3. Update the total/allocated size in the index header
+        """
+        if not self.virtual_file_manager:
+            return
+
+        # This is a simplified implementation that works for small directories
+        # with $INDEX_ROOT only (no $INDEX_ALLOCATION B+ tree)
+
+        vfm = self.virtual_file_manager
+
+        # Check if this read includes any directory MFT records
+        if not self.is_mft_region(offset, length):
+            return
+
+        rel_offset = offset - self.mft_offset
+        if rel_offset < 0:
+            return
+
+        start_record = rel_offset // MFT_RECORD_SIZE
+        end_record = (rel_offset + length + MFT_RECORD_SIZE - 1) // MFT_RECORD_SIZE
+
+        # Check each directory record
+        for record_num, dir_path in list(self.mft_record_to_dir.items()):
+            if start_record <= record_num < end_record:
+                # Get virtual children for this directory
+                virtual_children = vfm.get_virtual_children(record_num)
+                if not virtual_children:
+                    continue
+
+                # Find $INDEX_ROOT in this record and inject entries
+                record_abs_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+                if record_abs_offset >= offset and record_abs_offset + MFT_RECORD_SIZE <= offset + length:
+                    # Full record in result
+                    dst = record_abs_offset - offset
+                    record_data = bytearray(result[dst:dst + MFT_RECORD_SIZE])
+
+                    modified = self._inject_entries_into_index_root(record_data, virtual_children)
+                    if modified:
+                        result[dst:dst + MFT_RECORD_SIZE] = record_data
+
+    def _inject_entries_into_index_root(self, record: bytearray,
+                                         virtual_children: list) -> bool:
+        """Inject virtual entries into $INDEX_ROOT attribute in an MFT record.
+
+        Returns True if modifications were made.
+        """
+        if not self.virtual_file_manager:
+            return False
+
+        vfm = self.virtual_file_manager
+
+        # Find $INDEX_ROOT attribute
+        if record[0:4] != b'FILE':
+            return False
+
+        first_attr = struct.unpack('<H', record[20:22])[0]
+        off = first_attr
+
+        while off < MFT_RECORD_SIZE - 8:
+            attr_type = struct.unpack('<I', record[off:off + 4])[0]
+            if attr_type == 0xFFFFFFFF:
+                break
+
+            attr_len = struct.unpack('<I', record[off + 4:off + 8])[0]
+            if attr_len == 0 or attr_len > MFT_RECORD_SIZE:
+                break
+
+            if attr_type == 0x90:  # $INDEX_ROOT
+                # Found it! Now inject entries.
+                # Attribute structure:
+                # 0-3: Type (0x90)
+                # 4-7: Length
+                # 8: Non-resident flag (always 0 for INDEX_ROOT)
+                # 9: Name length
+                # 10-11: Name offset
+                # 16-19: Value length
+                # 20-21: Value offset
+
+                val_len = struct.unpack('<I', record[off + 16:off + 20])[0]
+                val_off = struct.unpack('<H', record[off + 20:off + 22])[0]
+
+                # Index root starts at off + val_off
+                idx_root_start = off + val_off
+
+                # Index root header: 16 bytes
+                # - 0-3: Attribute type (0x30 = $FILE_NAME)
+                # - 4-7: Collation rule
+                # - 8-11: Index block size
+                # - 12: Clusters per block
+
+                # Index header starts at idx_root_start + 16
+                idx_header_start = idx_root_start + 16
+
+                # Index header:
+                # - 0-3: Entries offset (from header start)
+                # - 4-7: Total size (from header start)
+                # - 8-11: Allocated size
+                # - 12: Flags
+
+                entries_off = struct.unpack('<I', record[idx_header_start:idx_header_start + 4])[0]
+                total_size = struct.unpack('<I', record[idx_header_start + 4:idx_header_start + 8])[0]
+                alloc_size = struct.unpack('<I', record[idx_header_start + 8:idx_header_start + 12])[0]
+
+                # Entries start at idx_header_start + entries_off
+                entries_start = idx_header_start + entries_off
+
+                # Find the end entry (flags & 0x02)
+                entry_off = entries_start
+                while entry_off < off + attr_len:
+                    if entry_off + 16 > MFT_RECORD_SIZE:
+                        break
+                    entry_len = struct.unpack('<H', record[entry_off + 8:entry_off + 10])[0]
+                    entry_flags = struct.unpack('<H', record[entry_off + 12:entry_off + 14])[0]
+
+                    if entry_flags & 0x02:  # LAST_ENTRY
+                        # Found end entry! Insert virtual entries before it.
+                        # Build all virtual entries
+                        all_entries = bytearray()
+                        for child in virtual_children:
+                            entry_data = vfm.synthesize_index_entry(child)
+                            all_entries.extend(entry_data)
+
+                        if len(all_entries) == 0:
+                            return False
+
+                        # Check if we have space
+                        space_needed = len(all_entries)
+                        space_available = alloc_size - total_size
+
+                        if space_needed > space_available:
+                            # Not enough space in $INDEX_ROOT
+                            # Would need $INDEX_ALLOCATION, which is complex
+                            log(f"Warning: Not enough space for {len(virtual_children)} virtual entries")
+                            return False
+
+                        # Insert entries before end entry
+                        # Shift end entry and everything after it
+                        end_entry_len = entry_len if entry_len > 0 else 16
+                        remaining = record[entry_off:off + attr_len]
+
+                        record[entry_off:entry_off + len(all_entries)] = all_entries
+                        new_pos = entry_off + len(all_entries)
+                        record[new_pos:new_pos + len(remaining)] = remaining
+
+                        # Update total size in index header
+                        new_total = total_size + len(all_entries)
+                        struct.pack_into('<I', record, idx_header_start + 4, new_total)
+
+                        # Update attribute length
+                        new_attr_len = attr_len + len(all_entries)
+                        struct.pack_into('<I', record, off + 4, new_attr_len)
+
+                        # Update value length
+                        new_val_len = val_len + len(all_entries)
+                        struct.pack_into('<I', record, off + 16, new_val_len)
+
+                        return True
+
+                    if entry_len == 0:
+                        break
+                    entry_off += entry_len
+
+                return False
+
+            off += attr_len
+
+        return False
 
     # =========================================================================
     # MFT write tracking (NTFS -> ext4 sync)

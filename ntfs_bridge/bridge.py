@@ -30,6 +30,8 @@ from .nbd_server import NBDServer
 from .sync_daemon import SyncDaemon
 from .lazy_allocator import LazyAllocator
 from .partition_wrapper import PartitionWrapper
+from .virtual_files import VirtualFileManager
+from .file_watcher import create_watcher, EVENT_CREATE, EVENT_DELETE
 
 
 def log(msg):
@@ -44,7 +46,8 @@ class NTFSBridge:
                  image_size_mb: int = 256,
                  lazy_alloc: bool = False,
                  dealloc_timeout: float = 60.0,
-                 partitioned: bool = False):
+                 partitioned: bool = False,
+                 virtual_mode: bool = False):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
         self.ntfs_mount = os.path.abspath(ntfs_mount)
@@ -53,12 +56,15 @@ class NTFSBridge:
         self.lazy_alloc = lazy_alloc
         self.dealloc_timeout = dealloc_timeout
         self.partitioned = partitioned
+        self.virtual_mode = virtual_mode
 
         self.mapper = None
         self.partition_wrapper = None
         self.nbd_server = None
         self.sync_daemon = None
         self.lazy_allocator = None
+        self.virtual_file_manager = None
+        self._file_watcher = None
         self._nbd_thread = None
         self._stopping = False
 
@@ -124,7 +130,16 @@ class NTFSBridge:
                 if rel_path not in self.mapper.sparse_files:
                     self.lazy_allocator.register_file(rel_path, source_path, is_allocated=True)
 
-        # Step 5: Create NBD server
+        # Step 5: Create VirtualFileManager if virtual mode enabled
+        if self.virtual_mode:
+            log("Enabling virtual file mode (live ext4→NTFS sync)")
+            self.virtual_file_manager = VirtualFileManager(
+                self.source_dir, self.mapper.cluster_size
+            )
+            self.virtual_file_manager.set_mapper(self.mapper)
+            self.mapper.virtual_file_manager = self.virtual_file_manager
+
+        # Step 6: Create NBD server
         # Use PartitionWrapper for Windows VM mode (adds MBR partition table)
         if self.partitioned:
             log("Enabling partitioned mode (MBR wrapper for Windows VM)")
@@ -139,7 +154,7 @@ class NTFSBridge:
             port=self.port
         )
 
-        # Step 6: Create mount point
+        # Step 7: Create mount point
         os.makedirs(self.ntfs_mount, exist_ok=True)
 
         log("Setup complete")
@@ -162,45 +177,87 @@ class NTFSBridge:
         if self.lazy_allocator:
             self.lazy_allocator.start()
 
-        # Connect nbd-client and mount
-        if self._connect_and_mount():
-            # Start sync daemon
-            self.sync_daemon = SyncDaemon(
-                self.source_dir, self.ntfs_mount, self.mapper,
-                lazy_allocator=self.lazy_allocator
-            )
-            self.sync_daemon.start()
-            log("Sync daemon started")
+        # Start virtual file watcher if virtual mode enabled
+        # This runs independently of ntfs-3g mount
+        if self.virtual_mode:
+            self._start_virtual_file_watcher()
+            log("Virtual file watcher started (live ext4→NTFS sync)")
 
-            log("="*60)
-            log("NTFS-ext4 Bridge is running")
+        # Connect nbd-client and mount (optional in virtual mode)
+        mount_success = self._connect_and_mount()
+
+        if mount_success:
+            # Start sync daemon for ntfs-3g based sync
+            if not self.virtual_mode:
+                self.sync_daemon = SyncDaemon(
+                    self.source_dir, self.ntfs_mount, self.mapper,
+                    lazy_allocator=self.lazy_allocator
+                )
+                self.sync_daemon.start()
+                log("Sync daemon started")
+
+        log("="*60)
+        log("NTFS-ext4 Bridge is running")
+        log(f"  ext4 source: {self.source_dir}")
+        log(f"  NBD port: {self.port}")
+        if mount_success:
             log(f"  NTFS mount: {self.ntfs_mount}")
-            log(f"  ext4 source: {self.source_dir}")
-            log(f"  NBD port: {self.port}")
-            if self.partitioned:
-                log(f"  Partitioned mode: ENABLED (for Windows VM)")
-            if self.lazy_alloc:
-                log(f"  Lazy allocation: ENABLED (timeout: {self.dealloc_timeout}s)")
-            log("  Press Ctrl+C to stop")
-            log("="*60)
+        if self.partitioned:
+            log(f"  Partitioned mode: ENABLED (for Windows VM)")
+        if self.lazy_alloc:
+            log(f"  Lazy allocation: ENABLED (timeout: {self.dealloc_timeout}s)")
+        if self.virtual_mode:
+            log(f"  Virtual mode: ENABLED (no ntfs-3g mount required)")
+        if not mount_success and not self.virtual_mode:
+            log("  WARNING: ntfs-3g mount failed, ext4→NTFS sync disabled")
+            log(f"  Connect manually: sudo nbd-client -N '' 127.0.0.1 {self.port} /dev/nbdX")
+        log("  Press Ctrl+C to stop")
+        log("="*60)
 
-            # Wait for shutdown
-            try:
-                while not self._stopping:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                pass
-        else:
-            log("Failed to connect/mount - running NBD server only")
-            log(f"Connect manually: sudo nbd-client -N '' 127.0.0.1 {self.port} /dev/nbdX")
-            log(f"Mount manually: sudo mount -t ntfs-3g /dev/nbdX {self.ntfs_mount}")
-
-            try:
-                self._nbd_thread.join()
-            except KeyboardInterrupt:
-                pass
+        # Wait for shutdown
+        try:
+            while not self._stopping:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
 
         self.stop()
+
+    def _start_virtual_file_watcher(self):
+        """Start file watcher for virtual file mode.
+
+        Watches ext4 source directory and adds/removes virtual files
+        when changes are detected.
+        """
+        def on_file_event(event_type: str, rel_path: str):
+            """Handle file events from watcher."""
+            if not self.virtual_file_manager:
+                return
+
+            # Skip hidden/system files
+            basename = os.path.basename(rel_path)
+            if basename.startswith('.') or basename.startswith('$'):
+                return
+
+            # Skip if this is already a real file in NTFS
+            if rel_path in self.mapper.path_to_mft_record:
+                return
+
+            source_path = os.path.join(self.source_dir, rel_path)
+
+            if event_type == EVENT_CREATE:
+                if os.path.isdir(source_path):
+                    self.virtual_file_manager.add_directory(rel_path)
+                elif os.path.isfile(source_path):
+                    self.virtual_file_manager.add_file(rel_path)
+
+            elif event_type == EVENT_DELETE:
+                # Remove virtual file/dir
+                self.virtual_file_manager.remove_file(rel_path)
+                self.virtual_file_manager.remove_directory(rel_path)
+
+        self._file_watcher = create_watcher(self.source_dir, on_file_event)
+        self._file_watcher.start()
 
     def stop(self):
         """Stop all components."""
@@ -209,6 +266,9 @@ class NTFSBridge:
         self._stopping = True
 
         log("Stopping bridge...")
+
+        if self._file_watcher:
+            self._file_watcher.stop()
 
         if self.sync_daemon:
             self.sync_daemon.stop()
@@ -462,6 +522,9 @@ def main():
                         help='Seconds after last read before deallocating (default: 60)')
     parser.add_argument('--partitioned', action='store_true',
                         help='Add MBR partition table (required for Windows VM)')
+    parser.add_argument('--virtual', action='store_true',
+                        help='Enable virtual file mode for live ext4→NTFS sync '
+                             '(synthesizes NTFS entries on-the-fly, no ntfs-3g mount needed)')
 
     args = parser.parse_args()
 
@@ -473,7 +536,8 @@ def main():
         image_size_mb=args.size,
         lazy_alloc=args.lazy,
         dealloc_timeout=args.dealloc_timeout,
-        partitioned=args.partitioned
+        partitioned=args.partitioned,
+        virtual_mode=args.virtual
     )
 
     # Handle signals

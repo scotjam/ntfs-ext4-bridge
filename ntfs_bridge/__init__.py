@@ -5,5 +5,6 @@ from .cluster_mapper import ClusterMapper
 from .nbd_server import NBDServer
 from .partition_wrapper import PartitionWrapper
 from .bridge import NTFSBridge
+from .virtual_files import VirtualFileManager
 
-__all__ = ['ClusterMapper', 'NBDServer', 'PartitionWrapper', 'NTFSBridge']
+__all__ = ['ClusterMapper', 'NBDServer', 'PartitionWrapper', 'NTFSBridge', 'VirtualFileManager']
