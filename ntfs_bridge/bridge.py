@@ -144,6 +144,14 @@ class NTFSBridge:
         if self.partitioned:
             log("Enabling partitioned mode (MBR wrapper for Windows VM)")
             self.partition_wrapper = PartitionWrapper(self.mapper)
+            # If virtual mode is enabled, advertise larger size for virtual clusters
+            if self.virtual_mode:
+                # Advertise size to accommodate highest possible virtual cluster
+                # VIRTUAL_CLUSTER_START (500000) + generous headroom for large files
+                max_virtual_cluster = 600000  # VirtualFileManager starts at 500000
+                self.partition_wrapper.set_virtual_size(
+                    max_virtual_cluster, self.mapper.cluster_size
+                )
             nbd_backend = self.partition_wrapper
         else:
             nbd_backend = self.mapper
@@ -183,18 +191,23 @@ class NTFSBridge:
             self._start_virtual_file_watcher()
             log("Virtual file watcher started (live ext4→NTFS sync)")
 
-        # Connect nbd-client and mount (optional in virtual mode)
-        mount_success = self._connect_and_mount()
+        # Connect nbd-client and mount
+        # Skip in partitioned+virtual mode (VM connects directly to NBD)
+        mount_success = False
+        if self.partitioned and self.virtual_mode:
+            log("VM mode: skipping local nbd-client/mount (VM connects directly)")
+        else:
+            mount_success = self._connect_and_mount()
 
-        if mount_success:
-            # Start sync daemon for ntfs-3g based sync
-            if not self.virtual_mode:
-                self.sync_daemon = SyncDaemon(
-                    self.source_dir, self.ntfs_mount, self.mapper,
-                    lazy_allocator=self.lazy_allocator
-                )
-                self.sync_daemon.start()
-                log("Sync daemon started")
+            if mount_success:
+                # Start sync daemon for ntfs-3g based sync
+                if not self.virtual_mode:
+                    self.sync_daemon = SyncDaemon(
+                        self.source_dir, self.ntfs_mount, self.mapper,
+                        lazy_allocator=self.lazy_allocator
+                    )
+                    self.sync_daemon.start()
+                    log("Sync daemon started")
 
         log("="*60)
         log("NTFS-ext4 Bridge is running")

@@ -36,6 +36,11 @@ NBD_INFO_NAME = 1
 NBD_INFO_DESCRIPTION = 2
 NBD_INFO_BLOCK_SIZE = 3
 
+# Handshake flags (server to client during initial handshake)
+NBD_FLAG_FIXED_NEWSTYLE = (1 << 0)  # Use fixed newstyle protocol
+NBD_FLAG_NO_ZEROES = (1 << 1)       # Client doesn't need to send 124 zeros
+
+# Transmission flags (in export info)
 NBD_FLAG_HAS_FLAGS = (1 << 0)
 NBD_FLAG_READ_ONLY = (1 << 1)
 NBD_FLAG_SEND_FLUSH = (1 << 2)
@@ -150,7 +155,8 @@ class NBDServer:
         sock.sendall(NBD_INIT_MAGIC)
         sock.sendall(struct.pack('>Q', NBD_OPTS_MAGIC))
 
-        handshake_flags = NBD_FLAG_HAS_FLAGS
+        # Send handshake flags: fixed newstyle + no zeros required
+        handshake_flags = NBD_FLAG_FIXED_NEWSTYLE | NBD_FLAG_NO_ZEROES
         sock.sendall(struct.pack('>H', handshake_flags))
 
         client_flags_data = sock.recv(4)

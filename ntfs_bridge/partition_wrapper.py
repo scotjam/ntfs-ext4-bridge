@@ -54,6 +54,10 @@ class PartitionWrapper:
         # This is all zeros (empty space before partition)
         self.gap_size = PARTITION_OFFSET_BYTES - SECTOR_SIZE
 
+        # Virtual size for NBD advertisement (may be larger than real size
+        # to accommodate virtual clusters with high cluster numbers)
+        self.advertised_size = self.total_size
+
         log(f"Initialized: partition={self.partition_size} bytes, "
             f"total={self.total_size} bytes, "
             f"offset={PARTITION_OFFSET_BYTES} bytes")
@@ -116,8 +120,20 @@ class PartitionWrapper:
         return bytes(mbr)
 
     def get_size(self) -> int:
-        """Get total disk size (partition + offset)."""
-        return self.total_size
+        """Get advertised disk size for NBD."""
+        return self.advertised_size
+
+    def set_virtual_size(self, max_cluster: int, cluster_size: int):
+        """Set advertised size to accommodate virtual clusters.
+
+        Args:
+            max_cluster: Highest virtual cluster number that may be accessed
+            cluster_size: Cluster size in bytes
+        """
+        needed_size = (max_cluster + 1) * cluster_size + PARTITION_OFFSET_BYTES
+        if needed_size > self.advertised_size:
+            self.advertised_size = needed_size
+            log(f"Advertised size increased to {needed_size} bytes for virtual clusters")
 
     @property
     def cluster_size(self) -> int:
@@ -158,16 +174,12 @@ class PartitionWrapper:
             else:
                 # Reading from partition - offset and pass to mapper
                 partition_offset = current_offset - PARTITION_OFFSET_BYTES
-                partition_remaining = self.partition_size - partition_offset
 
-                if partition_remaining <= 0:
-                    # Beyond partition end - return zeros
-                    pos += remaining
-                else:
-                    read_bytes = min(remaining, partition_remaining)
-                    data = self.mapper.read(partition_offset, read_bytes)
-                    result[pos:pos + len(data)] = data
-                    pos += len(data)
+                # Always pass to mapper - it handles virtual clusters beyond partition size
+                # The mapper will return zeros for truly out-of-range reads
+                data = self.mapper.read(partition_offset, remaining)
+                result[pos:pos + len(data)] = data
+                pos += len(data)
 
         return bytes(result)
 

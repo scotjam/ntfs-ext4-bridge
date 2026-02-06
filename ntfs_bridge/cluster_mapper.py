@@ -101,6 +101,31 @@ class ClusterMapper:
         # Virtual file manager for live ext4→NTFS sync (set by bridge)
         self.virtual_file_manager: Optional['VirtualFileManager'] = None
 
+        # Directory virtualization: synthesized directory data
+        # dir_record_num -> {
+        #   'entries': list of (filename, entry_bytes),
+        #   'index_root': synthesized INDEX_ROOT attribute bytes,
+        #   'indx_blocks': list of synthesized INDX block bytes,
+        #   'virtual_indx_clusters': list of virtual cluster numbers for INDX
+        # }
+        self.virtualized_dirs: Dict[int, dict] = {}
+
+        # Map virtual INDX cluster -> (dir_record_num, block_index)
+        self.virtual_indx_map: Dict[int, Tuple[int, int]] = {}
+
+        # Map real INDX cluster -> (dir_record_num, block_index, synthesized_data)
+        # Used to intercept reads to original INDX clusters and return virtualized content
+        self.virtualized_indx_clusters: Dict[int, Tuple[int, int, bytes]] = {}
+
+        # Next available virtual cluster number for INDX blocks
+        # Must be within valid cluster range (total_clusters - 1) to be readable
+        # Start high within the valid range to avoid conflicts with real data
+        total_clusters = len(self.image) // self.cluster_size
+        # Reserve last 1000 clusters for virtual INDX (or 10% of volume, whichever is smaller)
+        virtual_reserve = min(1000, total_clusters // 10)
+        self.next_virtual_indx_cluster = total_clusters - virtual_reserve
+        log(f"Virtual INDX cluster range: {self.next_virtual_indx_cluster}-{total_clusters-1}")
+
         # Scan MFT
         self._scan_mft()
 
@@ -127,21 +152,6 @@ class ClusterMapper:
         For sparse files, triggers lazy allocation on first access.
         For virtual files (ext4 only), synthesizes MFT records and data on-the-fly.
         """
-        # Debug: log reads when we have sparse files
-        if length >= 4096 and self.sparse_files:
-            cluster = offset // self.cluster_size
-            in_map = cluster in self.cluster_map
-            is_mft = self.is_mft_region(offset, length)
-            # Only log non-MFT, non-mapped reads
-            if not in_map and not is_mft:
-                # Check if this is in a zero region
-                if offset + 4096 <= len(self.image):
-                    sample = self.image[offset:offset+64]
-                    is_zeros = all(b == 0 for b in sample)
-                else:
-                    is_zeros = False
-                log(f"  READ: off={offset}, len={length}, clus={cluster}, zeros={is_zeros}")
-
         # Check if this read might be for a sparse file that needs allocation
         self._check_sparse_file_read(offset, length)
 
@@ -159,7 +169,32 @@ class ClusterMapper:
             if self.virtual_file_manager:
                 virtual_data = self.virtual_file_manager.read_virtual_cluster(cluster)
 
-            if virtual_data:
+            # Check for virtualized real INDX clusters (intercept original clusters)
+            virtual_indx_data = None
+            if cluster in self.virtualized_indx_clusters:
+                dir_record, block_idx, indx_data = self.virtualized_indx_clusters[cluster]
+                virtual_indx_data = indx_data
+
+            # Also check for virtual INDX clusters (fallback: new virtual cluster numbers)
+            if not virtual_indx_data and cluster in self.virtual_indx_map:
+                dir_record, block_idx = self.virtual_indx_map[cluster]
+                if dir_record in self.virtualized_dirs:
+                    vdir = self.virtualized_dirs[dir_record]
+                    if 'indx_blocks' in vdir and block_idx < len(vdir['indx_blocks']):
+                        virtual_indx_data = vdir['indx_blocks'][block_idx]
+                    else:
+                        log(f"  ERROR: indx_blocks not found or block_idx out of range")
+
+            if virtual_indx_data:
+                # Read from synthesized INDX block
+                chunk_len = min(remaining, self.cluster_size - cluster_offset)
+                data = virtual_indx_data[cluster_offset:cluster_offset + chunk_len]
+                if len(data) < chunk_len:
+                    data = data + b'\x00' * (chunk_len - len(data))
+                result[pos:pos + len(data)] = data
+                pos += chunk_len
+
+            elif virtual_data:
                 # Read from virtual cluster (ext4 file via VirtualFileManager)
                 chunk_len = min(remaining, self.cluster_size - cluster_offset)
                 data = virtual_data[cluster_offset:cluster_offset + chunk_len]
@@ -227,6 +262,11 @@ class ClusterMapper:
         """
         if not self.virtual_file_manager:
             return
+
+        # Log if we have virtual files
+        vfm = self.virtual_file_manager
+        if vfm.virtual_files and self.is_mft_region(offset, length):
+            log(f"_inject_virtual_entries MFT read: vfiles={list(vfm.virtual_files.keys())}")
 
         # Check if read is in MFT region
         if self.is_mft_region(offset, length):
@@ -1252,33 +1292,34 @@ class ClusterMapper:
                             result[dst_off:dst_off + patch_len] = record_data[src_off:src_off + patch_len]
 
     def _inject_virtual_dir_entries(self, result: bytearray, offset: int, length: int):
-        """Inject virtual directory entries into $INDEX_ROOT reads.
+        """Virtualize directory listings to include virtual files.
 
-        When Windows reads a directory's MFT record, we inject index entries
-        for virtual files that are children of that directory.
+        This implements full directory virtualization:
+        1. Parse all real entries from INDEX_ROOT and INDEX_ALLOCATION
+        2. Merge with virtual entries
+        3. Synthesize new INDEX structures
+        4. Return synthesized data
 
-        This is complex because $INDEX_ROOT has a specific format:
-        - Index root header (16 bytes)
-        - Index header (16 bytes)
-        - Index entries (variable)
-        - End entry (16 bytes)
-
-        We need to:
-        1. Find where the existing entries end
-        2. Insert our virtual entries before the end entry
-        3. Update the total/allocated size in the index header
+        Works for any directory size, including those with B+ tree indexes.
         """
         if not self.virtual_file_manager:
             return
 
-        # This is a simplified implementation that works for small directories
-        # with $INDEX_ROOT only (no $INDEX_ALLOCATION B+ tree)
-
         vfm = self.virtual_file_manager
 
         # Check if this read includes any directory MFT records
-        if not self.is_mft_region(offset, length):
+        if self.is_mft_region(offset, length):
+            self._virtualize_dir_mft_records(result, offset, length)
+
+        # Check if this read includes any virtual INDX clusters
+        self._inject_virtual_indx_clusters(result, offset, length)
+
+    def _virtualize_dir_mft_records(self, result: bytearray, offset: int, length: int):
+        """Virtualize directory MFT records in the read result."""
+        if not self.virtual_file_manager:
             return
+
+        vfm = self.virtual_file_manager
 
         rel_offset = offset - self.mft_offset
         if rel_offset < 0:
@@ -1287,40 +1328,285 @@ class ClusterMapper:
         start_record = rel_offset // MFT_RECORD_SIZE
         end_record = (rel_offset + length + MFT_RECORD_SIZE - 1) // MFT_RECORD_SIZE
 
+        # Log which directories we know about (first call only)
+        if not hasattr(self, '_logged_dirs'):
+            self._logged_dirs = True
+            log(f"Known dirs: {list(self.mft_record_to_dir.items())}")
+
         # Check each directory record
         for record_num, dir_path in list(self.mft_record_to_dir.items()):
             if start_record <= record_num < end_record:
                 # Get virtual children for this directory
                 virtual_children = vfm.get_virtual_children(record_num)
+                if virtual_children:
+                    log(f"Dir {record_num} ({dir_path}) has {len(virtual_children)} virtual children: {[c.rel_path for c in virtual_children]}")
+
                 if not virtual_children:
                     continue
 
-                # Find $INDEX_ROOT in this record and inject entries
+                # Virtualize this directory
                 record_abs_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
                 if record_abs_offset >= offset and record_abs_offset + MFT_RECORD_SIZE <= offset + length:
-                    # Full record in result
                     dst = record_abs_offset - offset
                     record_data = bytearray(result[dst:dst + MFT_RECORD_SIZE])
 
-                    modified = self._inject_entries_into_index_root(record_data, virtual_children)
-                    if modified:
-                        result[dst:dst + MFT_RECORD_SIZE] = record_data
+                    # Build or update virtualized directory
+                    self._ensure_dir_virtualized(record_num, record_data, virtual_children)
 
-    def _inject_entries_into_index_root(self, record: bytearray,
-                                         virtual_children: list) -> bool:
-        """Inject virtual entries into $INDEX_ROOT attribute in an MFT record.
+                    # Get the virtualized MFT record
+                    if record_num in self.virtualized_dirs:
+                        virt_record = self._build_virtualized_mft_record(record_num, record_data)
+                        if virt_record and len(virt_record) == MFT_RECORD_SIZE:
+                            result[dst:dst + MFT_RECORD_SIZE] = virt_record
+                        elif virt_record:
+                            log(f"Virtualized record size mismatch: {len(virt_record)} != {MFT_RECORD_SIZE}")
+                        else:
+                            log(f"Failed to build virtualized record for dir {record_num}")
 
-        Returns True if modifications were made.
-        """
+    def _inject_virtual_indx_clusters(self, result: bytearray, offset: int, length: int):
+        """Inject synthesized INDX blocks for virtual clusters."""
         if not self.virtual_file_manager:
-            return False
+            return
+
+        read_end = offset + length
+        start_cluster = offset // self.cluster_size
+        end_cluster = (offset + length + self.cluster_size - 1) // self.cluster_size
+
+        for cluster in range(start_cluster, end_cluster):
+            if cluster in self.virtual_indx_map:
+                dir_record, block_idx = self.virtual_indx_map[cluster]
+                if dir_record in self.virtualized_dirs:
+                    vdir = self.virtualized_dirs[dir_record]
+                    if 'indx_blocks' in vdir and block_idx < len(vdir['indx_blocks']):
+                        indx_data = vdir['indx_blocks'][block_idx]
+                        cluster_offset = cluster * self.cluster_size
+                        if cluster_offset >= offset and cluster_offset + self.cluster_size <= read_end:
+                            dst = cluster_offset - offset
+                            result[dst:dst + len(indx_data)] = indx_data
+
+    def _ensure_dir_virtualized(self, record_num: int, record_data: bytearray,
+                                 virtual_children: list):
+        """Ensure a directory is virtualized with current entries."""
+        if not self.virtual_file_manager:
+            return
 
         vfm = self.virtual_file_manager
 
-        # Find $INDEX_ROOT attribute
-        if record[0:4] != b'FILE':
-            return False
+        # Check if we need to rebuild (new virtual children or not yet built)
+        current_virtual = set(c.rel_path for c in virtual_children)
+        if record_num in self.virtualized_dirs:
+            cached_virtual = self.virtualized_dirs[record_num].get('virtual_paths', set())
+            if current_virtual == cached_virtual:
+                return  # Already up to date
 
+        # Parse all real entries from this directory
+        real_entries = self._parse_all_dir_entries(record_num, record_data)
+
+        # Build virtual index entries
+        virtual_entries = []
+        for child in virtual_children:
+            entry_data = vfm.synthesize_index_entry(child)
+            # Extract filename for sorting
+            if len(entry_data) >= 82:
+                name_len = entry_data[80]
+                name_bytes = entry_data[82:82 + name_len * 2]
+                try:
+                    filename = name_bytes.decode('utf-16-le')
+                except:
+                    filename = ''
+            else:
+                filename = child.rel_path
+            virtual_entries.append((filename.upper(), entry_data))
+
+        # Merge entries sorted by filename (NTFS uses uppercase comparison)
+        all_entries = []
+        for filename, entry_data in real_entries:
+            all_entries.append((filename.upper(), entry_data))
+        all_entries.extend(virtual_entries)
+        all_entries.sort(key=lambda x: x[0])
+
+        # Extract original INDX clusters from MFT record (for real cluster interception)
+        original_indx_clusters = self._extract_original_indx_clusters(record_data)
+
+        # Synthesize INDEX structures, reusing original clusters if available
+        self._synthesize_dir_index_inplace(record_num, record_data, all_entries, original_indx_clusters)
+
+        # Store virtual paths for cache invalidation
+        self.virtualized_dirs[record_num]['virtual_paths'] = current_virtual
+
+    def _parse_all_dir_entries(self, record_num: int, record_data: bytearray) -> List[Tuple[str, bytes]]:
+        """Parse all index entries from a directory (INDEX_ROOT + INDEX_ALLOCATION)."""
+        entries = []
+
+        # Undo fixups
+        record = self._undo_fixups(bytearray(record_data))
+
+        if record[0:4] != b'FILE':
+            return entries
+
+        # Find INDEX_ROOT and INDEX_ALLOCATION
+        first_attr = struct.unpack('<H', record[20:22])[0]
+        off = first_attr
+        index_root_off = None
+        index_alloc_info = None
+
+        while off < MFT_RECORD_SIZE - 8:
+            attr_type = struct.unpack('<I', record[off:off + 4])[0]
+            if attr_type == 0xFFFFFFFF:
+                break
+
+            attr_len = struct.unpack('<I', record[off + 4:off + 8])[0]
+            if attr_len == 0 or attr_len > MFT_RECORD_SIZE:
+                break
+
+            if attr_type == 0x90:  # INDEX_ROOT
+                index_root_off = off
+            elif attr_type == 0xA0:  # INDEX_ALLOCATION (non-resident)
+                # Parse data runs to find INDX clusters
+                if record[off + 8] == 1:  # Non-resident
+                    run_off = struct.unpack('<H', record[off + 32:off + 34])[0]
+                    alloc_size = struct.unpack('<Q', record[off + 40:off + 48])[0]
+                    data_runs = self._parse_data_runs(record[off + run_off:off + attr_len], alloc_size)
+                    index_alloc_info = {'data_runs': data_runs, 'size': alloc_size}
+
+            off += attr_len
+
+        # Parse INDEX_ROOT entries
+        if index_root_off is not None:
+            entries.extend(self._parse_index_root_entries(record, index_root_off))
+
+        # Parse INDEX_ALLOCATION entries (INDX blocks)
+        if index_alloc_info:
+            entries.extend(self._parse_index_alloc_entries(index_alloc_info))
+
+        return entries
+
+    def _parse_index_root_entries(self, record: bytearray, attr_off: int) -> List[Tuple[str, bytes]]:
+        """Parse entries from INDEX_ROOT attribute."""
+        entries = []
+
+        attr_len = struct.unpack('<I', record[attr_off + 4:attr_off + 8])[0]
+        val_off = struct.unpack('<H', record[attr_off + 20:attr_off + 22])[0]
+
+        idx_root_start = attr_off + val_off
+        idx_header_start = idx_root_start + 16
+        entries_off = struct.unpack('<I', record[idx_header_start:idx_header_start + 4])[0]
+
+        entry_off = idx_header_start + entries_off
+        while entry_off < attr_off + attr_len:
+            if entry_off + 16 > MFT_RECORD_SIZE:
+                break
+
+            entry_len = struct.unpack('<H', record[entry_off + 8:entry_off + 10])[0]
+            entry_flags = struct.unpack('<H', record[entry_off + 12:entry_off + 14])[0]
+
+            if entry_flags & 0x02:  # LAST_ENTRY
+                break
+
+            if entry_len == 0 or entry_len > 512:
+                break
+
+            # Extract filename for sorting
+            entry_data = bytes(record[entry_off:entry_off + entry_len])
+            filename = self._extract_entry_filename(entry_data)
+            entries.append((filename, entry_data))
+
+            entry_off += entry_len
+
+        return entries
+
+    def _parse_index_alloc_entries(self, alloc_info: dict) -> List[Tuple[str, bytes]]:
+        """Parse entries from INDEX_ALLOCATION (INDX blocks)."""
+        entries = []
+        data_runs = alloc_info['data_runs']
+
+        # Read each INDX block
+        current_vcn = 0
+        for start_cluster, count in data_runs:
+            for i in range(count):
+                cluster = start_cluster + i
+                cluster_offset = cluster * self.cluster_size
+
+                if cluster_offset + self.cluster_size <= len(self.image):
+                    indx_data = bytearray(self.image[cluster_offset:cluster_offset + self.cluster_size])
+
+                    # Check for INDX signature
+                    if indx_data[0:4] == b'INDX':
+                        # Undo fixups on INDX block
+                        indx_data = self._undo_indx_fixups(indx_data)
+                        entries.extend(self._parse_indx_block_entries(indx_data))
+
+                current_vcn += 1
+
+        return entries
+
+    def _undo_indx_fixups(self, indx: bytearray) -> bytearray:
+        """Undo USA fixups on an INDX block."""
+        usa_offset = struct.unpack('<H', indx[4:6])[0]
+        usa_count = struct.unpack('<H', indx[6:8])[0]
+
+        for i in range(1, usa_count):
+            sector_end = i * 512 - 2
+            if usa_offset + i * 2 + 2 <= len(indx) and sector_end + 2 <= len(indx):
+                original = struct.unpack('<H', indx[usa_offset + i * 2:usa_offset + i * 2 + 2])[0]
+                struct.pack_into('<H', indx, sector_end, original)
+
+        return indx
+
+    def _parse_indx_block_entries(self, indx: bytearray) -> List[Tuple[str, bytes]]:
+        """Parse entries from a single INDX block."""
+        entries = []
+
+        # INDX header: entries start at offset 24 + entries_offset
+        entries_off = struct.unpack('<I', indx[24:28])[0]
+        entry_off = 24 + entries_off
+
+        while entry_off < len(indx) - 16:
+            entry_len = struct.unpack('<H', indx[entry_off + 8:entry_off + 10])[0]
+            entry_flags = struct.unpack('<H', indx[entry_off + 12:entry_off + 14])[0]
+
+            if entry_flags & 0x02:  # LAST_ENTRY
+                break
+
+            if entry_len == 0 or entry_len > 512 or entry_off + entry_len > len(indx):
+                break
+
+            entry_data = bytes(indx[entry_off:entry_off + entry_len])
+            filename = self._extract_entry_filename(entry_data)
+            entries.append((filename, entry_data))
+
+            entry_off += entry_len
+
+        return entries
+
+    def _extract_entry_filename(self, entry_data: bytes) -> str:
+        """Extract filename from an index entry."""
+        if len(entry_data) < 82:
+            return ''
+
+        name_len = entry_data[80]
+        if len(entry_data) < 82 + name_len * 2:
+            return ''
+
+        name_bytes = entry_data[82:82 + name_len * 2]
+        try:
+            return name_bytes.decode('utf-16-le')
+        except:
+            return ''
+
+    def _extract_original_indx_clusters(self, record_data: bytearray) -> List[int]:
+        """Extract the original INDX cluster numbers from a directory MFT record.
+
+        These are the real clusters that contain INDX blocks for the directory.
+        We'll intercept reads to these clusters and return synthesized content.
+        """
+        clusters = []
+        record = self._undo_fixups(bytearray(record_data))
+
+        if record[0:4] != b'FILE':
+            return clusters
+
+        # Find INDEX_ALLOCATION attribute
         first_attr = struct.unpack('<H', record[20:22])[0]
         off = first_attr
 
@@ -1333,115 +1619,664 @@ class ClusterMapper:
             if attr_len == 0 or attr_len > MFT_RECORD_SIZE:
                 break
 
-            if attr_type == 0x90:  # $INDEX_ROOT
-                # Found it! Now inject entries.
-                # Attribute structure:
-                # 0-3: Type (0x90)
-                # 4-7: Length
-                # 8: Non-resident flag (always 0 for INDEX_ROOT)
-                # 9: Name length
-                # 10-11: Name offset
-                # 16-19: Value length
-                # 20-21: Value offset
+            if attr_type == 0xA0:  # INDEX_ALLOCATION (non-resident)
+                if record[off + 8] == 1:  # Non-resident flag
+                    run_off = struct.unpack('<H', record[off + 32:off + 34])[0]
+                    alloc_size = struct.unpack('<Q', record[off + 40:off + 48])[0]
+                    data_runs = self._parse_data_runs(record[off + run_off:off + attr_len], alloc_size)
 
-                val_len = struct.unpack('<I', record[off + 16:off + 20])[0]
-                val_off = struct.unpack('<H', record[off + 20:off + 22])[0]
-
-                # Index root starts at off + val_off
-                idx_root_start = off + val_off
-
-                # Index root header: 16 bytes
-                # - 0-3: Attribute type (0x30 = $FILE_NAME)
-                # - 4-7: Collation rule
-                # - 8-11: Index block size
-                # - 12: Clusters per block
-
-                # Index header starts at idx_root_start + 16
-                idx_header_start = idx_root_start + 16
-
-                # Index header:
-                # - 0-3: Entries offset (from header start)
-                # - 4-7: Total size (from header start)
-                # - 8-11: Allocated size
-                # - 12: Flags
-
-                entries_off = struct.unpack('<I', record[idx_header_start:idx_header_start + 4])[0]
-                total_size = struct.unpack('<I', record[idx_header_start + 4:idx_header_start + 8])[0]
-                alloc_size = struct.unpack('<I', record[idx_header_start + 8:idx_header_start + 12])[0]
-
-                # Entries start at idx_header_start + entries_off
-                entries_start = idx_header_start + entries_off
-
-                # Find the end entry (flags & 0x02)
-                entry_off = entries_start
-                while entry_off < off + attr_len:
-                    if entry_off + 16 > MFT_RECORD_SIZE:
-                        break
-                    entry_len = struct.unpack('<H', record[entry_off + 8:entry_off + 10])[0]
-                    entry_flags = struct.unpack('<H', record[entry_off + 12:entry_off + 14])[0]
-
-                    if entry_flags & 0x02:  # LAST_ENTRY
-                        # Found end entry! Insert virtual entries before it.
-                        # Build all virtual entries
-                        all_entries = bytearray()
-                        for child in virtual_children:
-                            entry_data = vfm.synthesize_index_entry(child)
-                            all_entries.extend(entry_data)
-
-                        if len(all_entries) == 0:
-                            return False
-
-                        # Check if we have space
-                        space_needed = len(all_entries)
-                        space_available = alloc_size - total_size
-
-                        if space_needed > space_available:
-                            # Not enough space in $INDEX_ROOT
-                            # Would need $INDEX_ALLOCATION, which is complex
-                            log(f"Warning: Not enough space for {len(virtual_children)} virtual entries")
-                            return False
-
-                        # Insert entries before end entry
-                        # Shift end entry and everything after it
-                        end_entry_len = entry_len if entry_len > 0 else 16
-                        remaining = record[entry_off:off + attr_len]
-
-                        record[entry_off:entry_off + len(all_entries)] = all_entries
-                        new_pos = entry_off + len(all_entries)
-                        record[new_pos:new_pos + len(remaining)] = remaining
-
-                        # Update total size in index header
-                        new_total = total_size + len(all_entries)
-                        struct.pack_into('<I', record, idx_header_start + 4, new_total)
-
-                        # Update attribute length
-                        new_attr_len = attr_len + len(all_entries)
-                        struct.pack_into('<I', record, off + 4, new_attr_len)
-
-                        # Update value length
-                        new_val_len = val_len + len(all_entries)
-                        struct.pack_into('<I', record, off + 16, new_val_len)
-
-                        return True
-
-                    if entry_len == 0:
-                        break
-                    entry_off += entry_len
-
-                return False
+                    # Flatten data runs to get all cluster numbers
+                    for start_cluster, count in data_runs:
+                        for i in range(count):
+                            clusters.append(start_cluster + i)
+                    break  # Found INDEX_ALLOCATION, done
 
             off += attr_len
 
-        return False
+        return clusters
+
+    def _synthesize_dir_index_inplace(self, record_num: int, record_data: bytearray,
+                                       all_entries: List[Tuple[str, bytes]],
+                                       original_clusters: List[int]):
+        """Synthesize INDEX structures for a virtualized directory.
+
+        When original_clusters is provided and has enough clusters, we intercept reads
+        to those real INDX clusters and return synthesized content. This preserves the
+        original INDEX_ALLOCATION data runs in the MFT record, which is critical for
+        ntfs-3g compatibility during mount validation.
+        """
+        # Clean up any previous virtualized_indx_clusters entries for this directory
+        # This is needed when re-virtualizing after adding more files
+        if record_num in self.virtualized_dirs:
+            old_vdir = self.virtualized_dirs[record_num]
+            for cluster in old_vdir.get('original_clusters', []):
+                if cluster in self.virtualized_indx_clusters:
+                    del self.virtualized_indx_clusters[cluster]
+            # Also clean up old virtual_indx_map entries
+            for cluster in old_vdir.get('virtual_indx_clusters', []):
+                if cluster in self.virtual_indx_map:
+                    del self.virtual_indx_map[cluster]
+
+        INDX_BLOCK_SIZE = self.cluster_size  # Usually 4096
+        MAX_INDEX_ROOT_ENTRIES_SIZE = 400  # Leave room for other attributes
+
+        # Calculate total entries size
+        total_entries_size = sum(len(e[1]) for e in all_entries)
+        total_entries_size += 16  # End entry
+
+        # Decide if we need INDEX_ALLOCATION
+        if total_entries_size <= MAX_INDEX_ROOT_ENTRIES_SIZE:
+            # Fits in INDEX_ROOT only
+            log(f"Dir {record_num} virtualized inline: {len(all_entries)} entries, {total_entries_size} bytes")
+            self.virtualized_dirs[record_num] = {
+                'use_indx': False,
+                'entries': all_entries,
+                'indx_blocks': [],
+                'virtual_indx_clusters': [],
+                'original_clusters': []
+            }
+        else:
+            # Need INDEX_ALLOCATION with INDX blocks
+            # Build INDX blocks
+
+            # Calculate actual overhead per INDX block:
+            # - Index node header starts at offset 24
+            # - USA at offset 40, takes (sectors + 1) * 2 bytes
+            # - Entries start after USA, aligned to 8
+            SECTOR_SIZE = 512
+            usa_offset = 40
+            usa_count = INDX_BLOCK_SIZE // SECTOR_SIZE + 1  # 9 for 4KB
+            usa_size = usa_count * 2  # 18 bytes
+            entries_start = (usa_offset + usa_size + 7) & ~7  # 64 for 4KB
+            indx_overhead = entries_start + 16  # +16 for end entry reserve
+
+            indx_blocks = []
+            current_block_entries = []
+            current_block_size = indx_overhead
+
+            for filename, entry_data in all_entries:
+                entry_size = len(entry_data)
+
+                # Check if entry fits in current block
+                if current_block_size + entry_size > INDX_BLOCK_SIZE:
+                    # Finalize current block and start new one
+                    if current_block_entries:
+                        indx_blocks.append(self._build_indx_block(current_block_entries, len(indx_blocks)))
+                    current_block_entries = []
+                    current_block_size = indx_overhead
+
+                current_block_entries.append((filename, entry_data))
+                current_block_size += entry_size
+
+            # Finalize last block
+            if current_block_entries:
+                indx_blocks.append(self._build_indx_block(current_block_entries, len(indx_blocks)))
+
+            # Decide whether to use original clusters (inplace) or allocate virtual clusters
+            if original_clusters and len(original_clusters) >= len(indx_blocks):
+                # Use original real clusters - intercept reads to them
+                # This preserves the MFT INDEX_ALLOCATION data runs
+                for i, indx_data in enumerate(indx_blocks):
+                    cluster = original_clusters[i]
+                    self.virtualized_indx_clusters[cluster] = (record_num, i, indx_data)
+
+                log(f"Dir {record_num} virtualized inplace: {len(indx_blocks)} blocks at original clusters {original_clusters[:len(indx_blocks)]}")
+                self.virtualized_dirs[record_num] = {
+                    'use_indx': True,
+                    'entries': all_entries,
+                    'indx_blocks': indx_blocks,
+                    'virtual_indx_clusters': [],  # Empty - not using virtual clusters
+                    'original_clusters': original_clusters[:len(indx_blocks)]  # Track which real clusters we're intercepting
+                }
+            else:
+                # Fallback: allocate virtual cluster numbers for INDX blocks
+                # This approach modifies MFT data runs (may not be compatible with ntfs-3g)
+                virtual_clusters = []
+                for i in range(len(indx_blocks)):
+                    vcluster = self.next_virtual_indx_cluster
+                    self.next_virtual_indx_cluster += 1
+                    virtual_clusters.append(vcluster)
+                    self.virtual_indx_map[vcluster] = (record_num, i)
+
+                log(f"Dir {record_num} virtualized with virtual clusters: {len(indx_blocks)} blocks at {virtual_clusters}")
+                self.virtualized_dirs[record_num] = {
+                    'use_indx': True,
+                    'entries': all_entries,
+                    'indx_blocks': indx_blocks,
+                    'virtual_indx_clusters': virtual_clusters,
+                    'original_clusters': []
+                }
+
+    def _build_indx_block(self, entries: List[Tuple[str, bytes]], block_num: int) -> bytes:
+        """Build an INDX block from entries.
+
+        INDX block layout (for 4KB cluster):
+        - 0x00-0x03: "INDX" signature
+        - 0x04-0x05: USA offset (40)
+        - 0x06-0x07: USA count (9 for 4KB = 8 sectors + 1)
+        - 0x10-0x17: VCN of this block
+        - 0x18-0x1B: Index node header: entries offset (relative to 0x18)
+        - 0x1C-0x1F: Index node header: total size of entries
+        - 0x20-0x23: Index node header: allocated size
+        - 0x24-0x27: Index node header: flags
+        - 0x28-0x39: USA (18 bytes for 4KB)
+        - 0x40+: Index entries (aligned to 8)
+        """
+        INDX_BLOCK_SIZE = self.cluster_size
+        SECTOR_SIZE = 512
+
+        indx = bytearray(INDX_BLOCK_SIZE)
+
+        # INDX signature
+        indx[0:4] = b'INDX'
+
+        # USA: offset 40, count = sectors + 1
+        usa_offset = 40
+        num_sectors = INDX_BLOCK_SIZE // SECTOR_SIZE  # 8 for 4KB
+        usa_count = num_sectors + 1  # 9
+        usa_size = usa_count * 2  # 18 bytes
+
+        struct.pack_into('<H', indx, 4, usa_offset)
+        struct.pack_into('<H', indx, 6, usa_count)
+
+        # VCN of this block
+        struct.pack_into('<Q', indx, 16, block_num)
+
+        # Calculate entries start: after USA, aligned to 8
+        # USA ends at 40 + 18 = 58, aligned to 8 = 64
+        entries_start = (usa_offset + usa_size + 7) & ~7  # = 64
+
+        # Index node header at offset 24 (0x18)
+        # Entries offset is RELATIVE to the node header start (offset 24)
+        node_entries_offset = entries_start - 24  # = 40
+
+        # Build entries
+        entries_data = bytearray()
+        for filename, entry_data in entries:
+            entries_data.extend(entry_data)
+
+        # Add end entry
+        end_entry = bytearray(16)
+        struct.pack_into('<H', end_entry, 8, 16)  # Length
+        struct.pack_into('<H', end_entry, 12, 2)  # Flags: LAST_ENTRY
+        entries_data.extend(end_entry)
+
+        # Node header fields at offset 24
+        struct.pack_into('<I', indx, 24, node_entries_offset)  # Entries offset from header
+        struct.pack_into('<I', indx, 28, node_entries_offset + len(entries_data))  # Total size
+        struct.pack_into('<I', indx, 32, INDX_BLOCK_SIZE - 24)  # Allocated size
+        struct.pack_into('<I', indx, 36, 0)  # Flags (leaf node)
+
+        # Write entries at correct position (AFTER USA)
+        indx[entries_start:entries_start + len(entries_data)] = entries_data
+
+        # Apply fixups
+        self._apply_indx_fixups(indx)
+
+        return bytes(indx)
+
+    def _apply_indx_fixups(self, indx: bytearray):
+        """Apply USA fixups to an INDX block."""
+        usa_offset = struct.unpack('<H', indx[4:6])[0]
+        usa_count = struct.unpack('<H', indx[6:8])[0]
+
+        # Generate sequence value
+        seq_val = 1
+
+        # Write sequence value
+        struct.pack_into('<H', indx, usa_offset, seq_val)
+
+        # Apply to each sector end
+        for i in range(1, usa_count):
+            sector_end = i * 512 - 2
+            if sector_end + 2 <= len(indx) and usa_offset + i * 2 + 2 <= len(indx):
+                # Save original bytes
+                struct.pack_into('<H', indx, usa_offset + i * 2,
+                               struct.unpack('<H', indx[sector_end:sector_end + 2])[0])
+                # Write sequence value
+                struct.pack_into('<H', indx, sector_end, seq_val)
+
+    def _build_virtualized_mft_record(self, record_num: int, original_record: bytearray) -> Optional[bytes]:
+        """Build a virtualized MFT record for a directory.
+
+        This function:
+        1. Preserves attributes before INDEX_ROOT (STANDARD_INFO, FILE_NAME, etc.)
+        2. Rebuilds INDEX_ROOT with virtual entries
+        3. Adds INDEX_ALLOCATION and BITMAP if needed for large directories
+        4. Preserves attributes AFTER the $I30 BITMAP (REPARSE_POINT, EA, etc.)
+        5. Uses proper instance numbers to avoid conflicts
+        """
+        if record_num not in self.virtualized_dirs:
+            return None
+
+        vdir = self.virtualized_dirs[record_num]
+        record = self._undo_fixups(bytearray(original_record))
+
+        if record[0:4] != b'FILE':
+            return None
+
+        # Find and modify INDEX_ROOT, possibly add/modify INDEX_ALLOCATION
+        first_attr = struct.unpack('<H', record[20:22])[0]
+        off = first_attr
+
+        # Check if we're using original clusters (inplace approach)
+        # When using original clusters, we preserve INDEX_ALLOCATION and BITMAP
+        use_original_clusters = bool(vdir.get('original_clusters'))
+
+        # Collect attributes before INDEX_ROOT and after $I30 BITMAP
+        attrs_before = bytearray()
+        attrs_after = bytearray()
+        original_index_alloc = None  # Preserved when using original clusters
+        original_i30_bitmap = None   # Preserved when using original clusters
+        index_root_off = None
+        i30_bitmap_off = None
+        max_instance = 0
+
+        while off < MFT_RECORD_SIZE - 8:
+            attr_type = struct.unpack('<I', record[off:off + 4])[0]
+            if attr_type == 0xFFFFFFFF:
+                break
+
+            attr_len = struct.unpack('<I', record[off + 4:off + 8])[0]
+            if attr_len == 0 or attr_len > MFT_RECORD_SIZE:
+                break
+
+            # Track max instance number
+            attr_instance = struct.unpack('<H', record[off + 14:off + 16])[0]
+            max_instance = max(max_instance, attr_instance)
+
+            if attr_type == 0x90:  # INDEX_ROOT
+                index_root_off = off
+            elif attr_type == 0xA0:  # INDEX_ALLOCATION
+                if use_original_clusters:
+                    # Preserve original INDEX_ALLOCATION when using real clusters
+                    original_index_alloc = bytes(record[off:off + attr_len])
+                # Otherwise skip - we'll rebuild it with virtual clusters
+            elif attr_type == 0xB0:  # BITMAP
+                # Check if this is the $I30 bitmap (name length 4)
+                name_len = record[off + 9]
+                if name_len == 4:
+                    i30_bitmap_off = off
+                    if use_original_clusters:
+                        # Preserve original $I30 bitmap when using real clusters
+                        original_i30_bitmap = bytes(record[off:off + attr_len])
+                    # Otherwise skip - we'll rebuild it
+                else:
+                    # Different bitmap, preserve it
+                    if i30_bitmap_off is not None:
+                        attrs_after.extend(record[off:off + attr_len])
+                    elif index_root_off is None:
+                        attrs_before.extend(record[off:off + attr_len])
+            elif i30_bitmap_off is not None:
+                # Attribute after $I30 BITMAP - preserve it
+                attrs_after.extend(record[off:off + attr_len])
+            elif index_root_off is None:
+                # Attribute before INDEX_ROOT - preserve it
+                attrs_before.extend(record[off:off + attr_len])
+
+            off += attr_len
+
+        if index_root_off is None:
+            return None
+
+        # Assign new instance numbers sequentially after max
+        next_instance = max_instance + 1
+
+        # Build new INDEX_ROOT
+        new_index_root = self._build_virtual_index_root(record, index_root_off, vdir, next_instance)
+        if new_index_root is None:
+            return None
+        next_instance += 1
+
+        # Build new record - calculate sizes first to avoid overflow
+        max_usable = MFT_RECORD_SIZE - 8  # Leave room for fixups and end marker
+
+        needed = first_attr + len(attrs_before) + len(new_index_root) + 4  # +4 for end marker
+
+        if vdir['use_indx']:
+            if use_original_clusters:
+                # Use preserved original INDEX_ALLOCATION and BITMAP
+                # These point to the real clusters we're intercepting
+                index_alloc = original_index_alloc
+                bitmap = original_i30_bitmap
+            else:
+                # Build new INDEX_ALLOCATION pointing to virtual clusters
+                index_alloc = self._build_virtual_index_allocation(vdir, next_instance)
+                next_instance += 1
+                bitmap = self._build_virtual_bitmap(vdir, next_instance)
+                next_instance += 1
+
+            if index_alloc:
+                needed += len(index_alloc)
+            if bitmap:
+                needed += len(bitmap)
+        else:
+            index_alloc = None
+            bitmap = None
+
+        # Add space for attrs_after
+        if attrs_after:
+            needed += len(attrs_after)
+
+        if needed > max_usable:
+            log(f"Warning: virtualized record {record_num} too large ({needed} > {max_usable}), skipping")
+            return None
+
+        new_record = bytearray(MFT_RECORD_SIZE)
+        new_record[0:first_attr] = record[0:first_attr]
+
+        pos = first_attr
+        # Copy attributes before INDEX_ROOT
+        new_record[pos:pos + len(attrs_before)] = attrs_before
+        pos += len(attrs_before)
+
+        # Add new INDEX_ROOT
+        new_record[pos:pos + len(new_index_root)] = new_index_root
+        pos += len(new_index_root)
+
+        # If using INDX blocks, add INDEX_ALLOCATION and BITMAP
+        if vdir['use_indx']:
+            if index_alloc:
+                new_record[pos:pos + len(index_alloc)] = index_alloc
+                pos += len(index_alloc)
+
+            if bitmap:
+                new_record[pos:pos + len(bitmap)] = bitmap
+                pos += len(bitmap)
+
+        # Add preserved attributes after $I30 BITMAP
+        if attrs_after:
+            new_record[pos:pos + len(attrs_after)] = attrs_after
+            pos += len(attrs_after)
+
+        # Add end marker
+        struct.pack_into('<I', new_record, pos, 0xFFFFFFFF)
+        pos += 4
+
+        # Update used size
+        struct.pack_into('<I', new_record, 24, pos)
+
+        # Update next_attribute_instance in record header (offset 40)
+        struct.pack_into('<H', new_record, 40, next_instance)
+
+        # Apply fixups
+        self._apply_fixups_to_record(new_record)
+
+        return bytes(new_record)
+
+    def _build_virtual_index_root(self, record: bytearray, attr_off: int, vdir: dict,
+                                    instance: int) -> Optional[bytes]:
+        """Build a virtualized INDEX_ROOT attribute."""
+        # Parse original attribute header
+        orig_attr_len = struct.unpack('<I', record[attr_off + 4:attr_off + 8])[0]
+        name_len = record[attr_off + 9]
+        name_off = struct.unpack('<H', record[attr_off + 10:attr_off + 12])[0]
+        val_off = struct.unpack('<H', record[attr_off + 20:attr_off + 22])[0]
+
+        attr_name = b''
+        if name_len > 0:
+            attr_name = bytes(record[attr_off + name_off:attr_off + name_off + name_len * 2])
+
+        # Parse original index root header
+        idx_root_start = attr_off + val_off
+        idx_attr_type = struct.unpack('<I', record[idx_root_start:idx_root_start + 4])[0]
+        collation_rule = struct.unpack('<I', record[idx_root_start + 4:idx_root_start + 8])[0]
+        idx_block_size = struct.unpack('<I', record[idx_root_start + 8:idx_root_start + 12])[0]
+        clusters_per_block = record[idx_root_start + 12]
+
+        # Build entries for INDEX_ROOT
+        if vdir['use_indx']:
+            # INDEX_ROOT for large directory: contains root node of B+ tree
+            # The end entry must have HAS_SUBNODES flag and VCN pointer to first INDX block
+            # Entry structure:
+            #   0-7: MFT reference (0 for end entry)
+            #   8-9: Entry length (24 = 16 base + 8 VCN)
+            #   10-11: Key length (0 for end entry)
+            #   12-13: Flags (0x03 = LAST_ENTRY | HAS_SUBNODES)
+            #   14-15: Padding
+            #   16-23: Sub-node VCN (0 = first INDX block)
+            entries_data = bytearray(24)  # End entry with VCN pointer
+            struct.pack_into('<H', entries_data, 8, 24)  # Length (includes VCN)
+            struct.pack_into('<H', entries_data, 12, 0x03)  # Flags: LAST_ENTRY | HAS_SUBNODES
+            struct.pack_into('<Q', entries_data, 16, 0)  # VCN of first INDX block
+            idx_flags = 0x01  # Large index
+        else:
+            # All entries in INDEX_ROOT
+            entries_data = bytearray()
+            for filename, entry_data in vdir['entries']:
+                entries_data.extend(entry_data)
+            # Add end entry
+            end_entry = bytearray(16)
+            struct.pack_into('<H', end_entry, 8, 16)
+            struct.pack_into('<H', end_entry, 12, 2)
+            entries_data.extend(end_entry)
+            idx_flags = 0x00  # Small index
+
+        # Build attribute
+        header_size = 24
+        if name_len > 0:
+            header_size = (24 + name_len * 2 + 7) & ~7
+
+        index_data_size = 16 + 16 + len(entries_data)
+        new_attr_len = header_size + index_data_size
+        new_attr_len = (new_attr_len + 7) & ~7
+
+        new_attr = bytearray(new_attr_len)
+        struct.pack_into('<I', new_attr, 0, 0x90)  # Type
+        struct.pack_into('<I', new_attr, 4, new_attr_len)
+        new_attr[8] = 0  # Resident
+        new_attr[9] = name_len
+
+        if name_len > 0:
+            struct.pack_into('<H', new_attr, 10, 24)
+            new_attr[24:24 + len(attr_name)] = attr_name
+            val_start = (24 + name_len * 2 + 7) & ~7
+        else:
+            struct.pack_into('<H', new_attr, 10, 0)
+            val_start = 24
+
+        struct.pack_into('<H', new_attr, 12, 0)  # Flags
+        struct.pack_into('<H', new_attr, 14, instance)  # Instance
+        struct.pack_into('<I', new_attr, 16, index_data_size)
+        struct.pack_into('<H', new_attr, 20, val_start)
+
+        # Index root header
+        irh = val_start
+        struct.pack_into('<I', new_attr, irh, idx_attr_type)
+        struct.pack_into('<I', new_attr, irh + 4, collation_rule)
+        struct.pack_into('<I', new_attr, irh + 8, idx_block_size)
+        new_attr[irh + 12] = clusters_per_block
+
+        # Index header
+        ihdr = irh + 16
+        struct.pack_into('<I', new_attr, ihdr, 16)  # Entries offset
+        struct.pack_into('<I', new_attr, ihdr + 4, 16 + len(entries_data))
+        struct.pack_into('<I', new_attr, ihdr + 8, 16 + len(entries_data))
+        new_attr[ihdr + 12] = idx_flags
+
+        # Entries
+        new_attr[irh + 32:irh + 32 + len(entries_data)] = entries_data
+
+        return bytes(new_attr)
+
+    def _build_virtual_index_allocation(self, vdir: dict, instance: int) -> Optional[bytes]:
+        """Build a virtualized INDEX_ALLOCATION attribute."""
+        if not vdir['use_indx'] or not vdir['virtual_indx_clusters']:
+            return None
+
+        # Build data runs pointing to virtual clusters
+        clusters = vdir['virtual_indx_clusters']
+        data_runs = self._encode_data_runs_simple(clusters)
+
+        # Calculate sizes
+        num_clusters = len(clusters)
+        alloc_size = num_clusters * self.cluster_size
+        data_size = alloc_size
+
+        # Build non-resident attribute
+        header_size = 72  # Non-resident header with name
+        name = b'$\x00I\x003\x000\x00'  # "$I30" in UTF-16LE
+        name_len = 4
+
+        attr_len = header_size + len(data_runs)
+        attr_len = (attr_len + 7) & ~7
+
+        attr = bytearray(attr_len)
+        struct.pack_into('<I', attr, 0, 0xA0)  # Type
+        struct.pack_into('<I', attr, 4, attr_len)
+        attr[8] = 1  # Non-resident
+        attr[9] = name_len
+        struct.pack_into('<H', attr, 10, 64)  # Name offset
+        struct.pack_into('<H', attr, 12, 0)  # Flags
+        struct.pack_into('<H', attr, 14, instance)  # Instance
+
+        # Non-resident specific
+        struct.pack_into('<Q', attr, 16, 0)  # Start VCN
+        struct.pack_into('<Q', attr, 24, num_clusters - 1)  # End VCN
+        struct.pack_into('<H', attr, 32, 64 + name_len * 2)  # Data runs offset
+        struct.pack_into('<Q', attr, 40, alloc_size)  # Allocated size
+        struct.pack_into('<Q', attr, 48, data_size)  # Data size
+        struct.pack_into('<Q', attr, 56, data_size)  # Initialized size
+
+        # Name
+        attr[64:64 + len(name)] = name
+
+        # Data runs
+        run_off = 64 + name_len * 2
+        attr[run_off:run_off + len(data_runs)] = data_runs
+
+        return bytes(attr)
+
+    def _build_virtual_bitmap(self, vdir: dict, instance: int) -> Optional[bytes]:
+        """Build a virtualized BITMAP attribute for directory index."""
+        if not vdir['use_indx']:
+            return None
+
+        num_blocks = len(vdir['indx_blocks'])
+        # Bitmap: 1 bit per block, all set to 1
+        bitmap_bytes = (num_blocks + 7) // 8
+        bitmap_data = bytes([0xFF] * bitmap_bytes)
+
+        # Resident attribute
+        name = b'$\x00I\x003\x000\x00'  # "$I30"
+        name_len = 4
+
+        header_size = 24 + name_len * 2
+        header_size = (header_size + 7) & ~7
+        val_off = header_size
+
+        attr_len = header_size + len(bitmap_data)
+        attr_len = (attr_len + 7) & ~7
+
+        attr = bytearray(attr_len)
+        struct.pack_into('<I', attr, 0, 0xB0)  # Type
+        struct.pack_into('<I', attr, 4, attr_len)
+        attr[8] = 0  # Resident
+        attr[9] = name_len
+        struct.pack_into('<H', attr, 10, 24)  # Name offset
+        struct.pack_into('<H', attr, 12, 0)  # Flags
+        struct.pack_into('<H', attr, 14, instance)  # Instance
+        struct.pack_into('<I', attr, 16, len(bitmap_data))  # Value length
+        struct.pack_into('<H', attr, 20, val_off)  # Value offset
+
+        # Name
+        attr[24:24 + len(name)] = name
+
+        # Bitmap data
+        attr[val_off:val_off + len(bitmap_data)] = bitmap_data
+
+        return bytes(attr)
+
+    def _encode_data_runs_simple(self, clusters: List[int]) -> bytes:
+        """Encode a simple list of clusters as NTFS data runs."""
+        if not clusters:
+            return b'\x00'
+
+        runs = bytearray()
+        prev_cluster = 0
+
+        i = 0
+        while i < len(clusters):
+            # Find contiguous run
+            start = clusters[i]
+            count = 1
+            while i + count < len(clusters) and clusters[i + count] == start + count:
+                count += 1
+
+            # Encode run
+            offset = start - prev_cluster
+
+            # Determine sizes needed
+            count_bytes = (count.bit_length() + 7) // 8
+            if offset >= 0:
+                offset_bytes = (offset.bit_length() + 8) // 8  # +1 for sign
+            else:
+                offset_bytes = ((-offset).bit_length() + 8) // 8
+
+            count_bytes = max(1, min(count_bytes, 4))
+            offset_bytes = max(1, min(offset_bytes, 4))
+
+            header = (offset_bytes << 4) | count_bytes
+            runs.append(header)
+
+            # Count (little-endian)
+            for b in range(count_bytes):
+                runs.append((count >> (b * 8)) & 0xFF)
+
+            # Offset (little-endian, signed)
+            if offset < 0:
+                offset = (1 << (offset_bytes * 8)) + offset
+            for b in range(offset_bytes):
+                runs.append((offset >> (b * 8)) & 0xFF)
+
+            prev_cluster = start  # Next offset is relative to this run's start
+            i += count
+
+        runs.append(0)  # End marker
+        return bytes(runs)
+
+    def _apply_fixups_to_record(self, record: bytearray):
+        """Apply NTFS fixups to an MFT record."""
+        usa_offset = struct.unpack('<H', record[4:6])[0]
+        usa_count = struct.unpack('<H', record[6:8])[0]
+
+        if usa_count < 2 or usa_offset + usa_count * 2 > MFT_RECORD_SIZE:
+            return
+
+        # Increment update sequence value
+        seq_val = struct.unpack('<H', record[usa_offset:usa_offset + 2])[0]
+        seq_val = (seq_val + 1) & 0xFFFF
+        if seq_val == 0:
+            seq_val = 1
+        struct.pack_into('<H', record, usa_offset, seq_val)
+
+        # Apply to each sector end
+        for i in range(1, usa_count):
+            sector_end = i * 512 - 2
+            if sector_end + 2 <= MFT_RECORD_SIZE:
+                # Save original bytes to USA
+                struct.pack_into('<H', record, usa_offset + i * 2,
+                               struct.unpack('<H', record[sector_end:sector_end + 2])[0])
+                # Write sequence value
+                struct.pack_into('<H', record, sector_end, seq_val)
 
     # =========================================================================
     # MFT write tracking (NTFS -> ext4 sync)
     # =========================================================================
 
     def is_mft_region(self, offset: int, length: int) -> bool:
-        """Check if a write affects the MFT region."""
+        """Check if an offset affects the MFT region (including virtual MFT records)."""
         max_tracked = max(self.mft_record_to_source.keys()) if self.mft_record_to_source else 64
         mft_end = self.mft_offset + max(256, max_tracked + 64) * MFT_RECORD_SIZE
+
+        # Also consider virtual MFT records (which may be at higher record numbers)
+        if self.virtual_file_manager:
+            vfm = self.virtual_file_manager
+            if vfm.mft_to_virtual:
+                max_virtual = max(vfm.mft_to_virtual.keys())
+                virtual_mft_end = self.mft_offset + (max_virtual + 1) * MFT_RECORD_SIZE
+                mft_end = max(mft_end, virtual_mft_end)
+
         write_end = offset + length
         return not (write_end <= self.mft_offset or offset >= mft_end)
 

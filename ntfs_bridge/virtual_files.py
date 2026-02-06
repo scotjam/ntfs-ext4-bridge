@@ -76,9 +76,11 @@ class VirtualFileManager:
     virtual MFT records and directory entries.
     """
 
-    # Start virtual MFT records at a high number to avoid conflicts
-    # Real MFT records typically start at 0 and grow upward
-    VIRTUAL_MFT_START = 10000
+    # Start virtual MFT records just after the expected real files.
+    # System files use 0-23, user files start at 24. For small volumes, the MFT
+    # may only have ~66 records allocated. We start at 30 to leave room for a few
+    # real files while staying within the allocated MFT range.
+    VIRTUAL_MFT_START = 30
 
     # Start virtual clusters at a high number
     VIRTUAL_CLUSTER_START = 500000
@@ -443,26 +445,46 @@ class VirtualFileManager:
         return bytes(record)
 
     def _add_standard_info(self, record: bytearray, off: int, creation_time: int) -> int:
-        """Add $STANDARD_INFORMATION attribute."""
+        """Add $STANDARD_INFORMATION attribute (NTFS 3.0+ extended version)."""
+        # NTFS 3.0+ STANDARD_INFORMATION has 72 bytes:
+        # 0-7: Creation time
+        # 8-15: Modified time
+        # 16-23: MFT modified time
+        # 24-31: Access time
+        # 32-35: Flags
+        # 36-39: Max versions
+        # 40-43: Version
+        # 44-47: Class ID
+        # 48-51: Owner ID
+        # 52-55: Security ID (index into $Secure)
+        # 56-63: Quota charged
+        # 64-71: USN
+
         # Attribute header (resident)
         struct.pack_into('<I', record, off, 0x10)      # Type
-        struct.pack_into('<I', record, off + 4, 96)    # Length (header + 48 bytes data)
+        struct.pack_into('<I', record, off + 4, 96)    # Length (24 header + 72 data = 96)
         record[off + 8] = 0                             # Non-resident flag (resident)
         record[off + 9] = 0                             # Name length
         struct.pack_into('<H', record, off + 10, 0)    # Name offset
         struct.pack_into('<H', record, off + 12, 0)    # Flags
         struct.pack_into('<H', record, off + 14, 0)    # Instance
-        struct.pack_into('<I', record, off + 16, 48)   # Value length
+        struct.pack_into('<I', record, off + 16, 72)   # Value length (extended)
         struct.pack_into('<H', record, off + 20, 24)   # Value offset
 
-        # $STANDARD_INFORMATION data (48 bytes minimum)
+        # $STANDARD_INFORMATION data (72 bytes for NTFS 3.0+)
         data_off = off + 24
         struct.pack_into('<Q', record, data_off, creation_time)       # Creation time
         struct.pack_into('<Q', record, data_off + 8, creation_time)   # Modified time
         struct.pack_into('<Q', record, data_off + 16, creation_time)  # MFT modified
         struct.pack_into('<Q', record, data_off + 24, creation_time)  # Access time
         struct.pack_into('<I', record, data_off + 32, 0x20)           # Flags (ARCHIVE)
-        # Rest is zeros (max versions, version, class ID, etc.)
+        struct.pack_into('<I', record, data_off + 36, 0)              # Max versions
+        struct.pack_into('<I', record, data_off + 40, 0)              # Version
+        struct.pack_into('<I', record, data_off + 44, 0)              # Class ID
+        struct.pack_into('<I', record, data_off + 48, 0)              # Owner ID
+        struct.pack_into('<I', record, data_off + 52, 0x100)          # Security ID (256 = default)
+        struct.pack_into('<Q', record, data_off + 56, 0)              # Quota charged
+        struct.pack_into('<Q', record, data_off + 64, 0)              # USN
 
         return off + 96
 
