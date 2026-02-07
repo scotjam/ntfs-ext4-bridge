@@ -844,6 +844,7 @@ class ClusterMapper:
 
         if record_num == 5:
             self.mft_record_to_dir[5] = ''
+            self.path_to_mft_record[''] = 5
             return
 
         parent_record = parent_ref & 0xFFFFFFFFFFFF
@@ -856,6 +857,7 @@ class ClusterMapper:
             dir_path = filename
 
         self.mft_record_to_dir[record_num] = dir_path
+        self.path_to_mft_record[dir_path] = record_num
 
     def _process_file_record(self, record: bytearray, record_num: int):
         """Process a file MFT record - handles both resident and non-resident files."""
@@ -2309,18 +2311,24 @@ class ClusterMapper:
                     tpl_start = template_offset + rec_start
                     self.image[tpl_start:tpl_start + (rec_end - rec_start)] = data[rec_start:rec_end]
 
-        # Process affected records
+        # Two-pass processing: directories first, then files
+        # This ensures parent paths are up-to-date before processing child files
+
+        # Pass 1: Directory operations (renames and new directories)
+        for record_num in range(start_record, end_record):
+            if record_num in self.mft_record_to_dir:
+                self._check_directory_rename(record_num)
+            elif record_num not in self.mft_record_to_source:
+                self._check_new_directory(record_num)
+
+        # Pass 2: File operations (deletions, renames, new files, content updates)
         for record_num in range(start_record, end_record):
             if record_num in self.mft_record_to_source:
                 # Known file - check for deletion first, then reparse
                 if not self._check_file_deleted(record_num):
                     self._reparse_mft_record(record_num)
-            elif record_num in self.mft_record_to_dir:
-                self._check_directory_rename(record_num)
-            else:
-                new_path = self._check_new_file(record_num)
-                if not new_path:
-                    self._check_new_directory(record_num)
+            elif record_num not in self.mft_record_to_dir:
+                self._check_new_file(record_num)
 
     def _check_file_deleted(self, record_num: int) -> bool:
         """Check if a tracked file's MFT record was marked as deleted.
@@ -2347,11 +2355,13 @@ class ClusterMapper:
                     # Still clean up tracking
                     del self.mft_record_to_source[record_num]
                     self.resident_file_data.pop(record_num, None)
+                    self.path_to_mft_record.pop(rel_path, None)
                     return True
 
                 # Remove tracking
                 del self.mft_record_to_source[record_num]
                 self.resident_file_data.pop(record_num, None)
+                self.path_to_mft_record.pop(rel_path, None)
                 if source_path in self.source_to_clusters:
                     for cluster in self.source_to_clusters[source_path]:
                         if cluster in self.cluster_map:
@@ -2407,6 +2417,8 @@ class ClusterMapper:
             if new_rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping dir rename (ext4 sync in progress): {new_rel_path}")
                 self.mft_record_to_dir[record_num] = new_rel_path
+                self.path_to_mft_record.pop(old_rel_path, None)
+                self.path_to_mft_record[new_rel_path] = record_num
                 return
 
             old_path = os.path.join(self.source_dir, old_rel_path)
@@ -2422,9 +2434,55 @@ class ClusterMapper:
                     finally:
                         self.ntfs_sync_in_progress.discard(new_rel_path)
                         self.ntfs_sync_in_progress.discard(old_rel_path)
+
+                # Update all child paths in tracking structures
+                self._update_child_paths_on_dir_rename(old_rel_path, new_rel_path)
+
                 self.mft_record_to_dir[record_num] = new_rel_path
+                self.path_to_mft_record.pop(old_rel_path, None)
+                self.path_to_mft_record[new_rel_path] = record_num
             except OSError as e:
                 log(f"  Failed to rename dir {old_rel_path}: {e}")
+
+    def _update_child_paths_on_dir_rename(self, old_dir_path: str, new_dir_path: str):
+        """Update all child file/dir paths when a parent directory is renamed."""
+        old_prefix = old_dir_path + os.sep
+        new_prefix = new_dir_path + os.sep
+
+        # Update mft_record_to_source (file paths)
+        for record_num, source_path in list(self.mft_record_to_source.items()):
+            rel_path = os.path.relpath(source_path, self.source_dir)
+            if rel_path.startswith(old_prefix) or rel_path == old_dir_path:
+                new_rel = new_dir_path + rel_path[len(old_dir_path):]
+                new_source = os.path.join(self.source_dir, new_rel)
+                self.mft_record_to_source[record_num] = new_source
+
+                # Update source_to_clusters
+                if source_path in self.source_to_clusters:
+                    clusters = self.source_to_clusters.pop(source_path)
+                    self.source_to_clusters[new_source] = clusters
+                    # Update cluster_map entries
+                    for cluster in clusters:
+                        if cluster in self.cluster_map:
+                            _, offset = self.cluster_map[cluster]
+                            self.cluster_map[cluster] = (new_source, offset)
+
+                # Update resident_file_data
+                if record_num in self.resident_file_data:
+                    self.resident_file_data[record_num]['source_path'] = new_source
+
+        # Update path_to_mft_record
+        for rel_path, record_num in list(self.path_to_mft_record.items()):
+            if rel_path.startswith(old_prefix) or rel_path == old_dir_path:
+                new_rel = new_dir_path + rel_path[len(old_dir_path):]
+                del self.path_to_mft_record[rel_path]
+                self.path_to_mft_record[new_rel] = record_num
+
+        # Update mft_record_to_dir (child directories)
+        for record_num, dir_path in list(self.mft_record_to_dir.items()):
+            if dir_path.startswith(old_prefix):
+                new_rel = new_dir_path + dir_path[len(old_dir_path):]
+                self.mft_record_to_dir[record_num] = new_rel
 
     def _check_new_directory(self, record_num: int):
         """Check if an MFT record is a new directory."""
@@ -2462,6 +2520,7 @@ class ClusterMapper:
         if rel_path in self.ext4_sync_in_progress:
             log(f"  Skipping new dir (ext4 sync in progress): {rel_path}")
             self.mft_record_to_dir[record_num] = rel_path
+            self.path_to_mft_record[rel_path] = record_num
             return
 
         source_path = os.path.join(self.source_dir, rel_path)
@@ -2475,6 +2534,7 @@ class ClusterMapper:
                     self.ntfs_sync_in_progress.discard(rel_path)
 
             self.mft_record_to_dir[record_num] = rel_path
+            self.path_to_mft_record[rel_path] = record_num
         except OSError as e:
             log(f"  Failed to create dir {rel_path}: {e}")
 
@@ -2540,6 +2600,7 @@ class ClusterMapper:
                 self.ntfs_sync_in_progress.discard(rel_path)
 
             self.mft_record_to_source[record_num] = source_path
+            self.path_to_mft_record[rel_path] = record_num
             self._track_file_data(record, record_num, source_path)
 
             return source_path
@@ -2594,36 +2655,56 @@ class ClusterMapper:
 
             new_path = os.path.join(self.source_dir, new_rel_path)
 
-            if new_path != source_path and os.path.exists(source_path):
-                if new_rel_path not in self.ext4_sync_in_progress:
-                    try:
-                        parent_dir = os.path.dirname(new_path)
-                        if parent_dir and not os.path.exists(parent_dir):
-                            os.makedirs(parent_dir, exist_ok=True)
+            if new_path != source_path:
+                old_rel = os.path.relpath(source_path, self.source_dir)
 
-                        if not os.path.exists(new_path):
-                            old_rel = os.path.relpath(source_path, self.source_dir)
-                            self.ntfs_sync_in_progress.add(new_rel_path)
-                            self.ntfs_sync_in_progress.add(old_rel)
-                            try:
-                                os.rename(source_path, new_path)
-                                log(f"  FILE RENAMED: {os.path.basename(source_path)} -> {filename}")
-                            finally:
-                                self.ntfs_sync_in_progress.discard(new_rel_path)
-                                self.ntfs_sync_in_progress.discard(old_rel)
+                if os.path.exists(source_path):
+                    # File exists at old path - need to rename it
+                    if new_rel_path not in self.ext4_sync_in_progress:
+                        try:
+                            parent_dir = os.path.dirname(new_path)
+                            if parent_dir and not os.path.exists(parent_dir):
+                                os.makedirs(parent_dir, exist_ok=True)
 
-                            source_path = new_path
-                            self.mft_record_to_source[record_num] = new_path
+                            if not os.path.exists(new_path):
+                                self.ntfs_sync_in_progress.add(new_rel_path)
+                                self.ntfs_sync_in_progress.add(old_rel)
+                                try:
+                                    os.rename(source_path, new_path)
+                                    log(f"  FILE RENAMED: {os.path.basename(source_path)} -> {filename}")
+                                finally:
+                                    self.ntfs_sync_in_progress.discard(new_rel_path)
+                                    self.ntfs_sync_in_progress.discard(old_rel)
 
-                            if source_path in self.source_to_clusters:
-                                clusters = self.source_to_clusters.pop(source_path)
-                                self.source_to_clusters[new_path] = clusters
-                                for cluster in clusters:
-                                    if cluster in self.cluster_map:
-                                        self.cluster_map[cluster] = (new_path, self.cluster_map[cluster][1])
-                    except OSError as e:
-                        log(f"  Failed to rename file: {e}")
+                                # Update path_to_mft_record
+                                if old_rel in self.path_to_mft_record:
+                                    del self.path_to_mft_record[old_rel]
+                                self.path_to_mft_record[new_rel_path] = record_num
+
+                                source_path = new_path
+                                self.mft_record_to_source[record_num] = new_path
+
+                                if source_path in self.source_to_clusters:
+                                    clusters = self.source_to_clusters.pop(source_path)
+                                    self.source_to_clusters[new_path] = clusters
+                                    for cluster in clusters:
+                                        if cluster in self.cluster_map:
+                                            self.cluster_map[cluster] = (new_path, self.cluster_map[cluster][1])
+                        except OSError as e:
+                            log(f"  Failed to rename file: {e}")
+                    else:
+                        # Update tracking even if not doing fs rename
+                        if old_rel in self.path_to_mft_record:
+                            del self.path_to_mft_record[old_rel]
+                        self.path_to_mft_record[new_rel_path] = record_num
+                        source_path = new_path
+                        self.mft_record_to_source[record_num] = new_path
                 else:
+                    # File doesn't exist at old path - parent dir may have been renamed
+                    # Just update tracking to new path
+                    if old_rel in self.path_to_mft_record:
+                        del self.path_to_mft_record[old_rel]
+                    self.path_to_mft_record[new_rel_path] = record_num
                     source_path = new_path
                     self.mft_record_to_source[record_num] = new_path
 

@@ -252,6 +252,10 @@ class NTFSBridge:
             if basename.startswith('.') or basename.startswith('$'):
                 return
 
+            # Skip if this file was just created by Windows (NTFS→ext4 sync)
+            if rel_path in self.mapper.ntfs_sync_in_progress:
+                return
+
             # Skip if this is already a real file in NTFS
             if rel_path in self.mapper.path_to_mft_record:
                 return

@@ -1,4 +1,9 @@
-"""NBD server that presents NTFS with MBR partition table."""
+"""NBD server that presents NTFS with MBR partition table.
+
+Supports bidirectional synchronization:
+- Windows -> ext4: MFT writes detected and synced to ext4 files
+- ext4 -> Windows: FileWatcher detects changes and updates NTFS view
+"""
 
 import struct
 import os
@@ -9,6 +14,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ntfs_bridge.template_synth import TemplateSynthesizer
+from ntfs_bridge.file_watcher import create_watcher, EVENT_CREATE, EVENT_DELETE, EVENT_MODIFY
 
 def log(msg):
     print(f"[Partitioned] {msg}", flush=True)
@@ -37,7 +43,7 @@ class PartitionedSynthesizer:
     PARTITION_OFFSET = 1048576  # 1MB in bytes
     MBR_SIZE = 512
 
-    def __init__(self, template_path: str, source_dir: str):
+    def __init__(self, template_path: str, source_dir: str, enable_watcher: bool = True):
         self.source_dir = source_dir
         self.inner = TemplateSynthesizer(template_path, source_dir)
         self.cluster_size = self.inner.cluster_size
@@ -51,6 +57,34 @@ class PartitionedSynthesizer:
         self.mft_record_to_source = self.inner.mft_record_to_source
         self.source_to_clusters = self.inner.source_to_clusters
         self.mft_offset = self.inner.mft_offset
+
+        # Expose inner lock for thread safety
+        self.lock = self.inner.lock
+
+        # File watcher for ext4 -> NTFS sync
+        self.watcher = None
+        if enable_watcher:
+            self.watcher = create_watcher(source_dir, self._on_file_change)
+            self.watcher.start()
+            log(f"FileWatcher started for {source_dir}")
+
+    def _on_file_change(self, event_type: str, rel_path: str):
+        """Handle file system change events from ext4."""
+        log(f"FileWatcher event: {event_type} {rel_path}")
+
+        with self.inner.lock:
+            if event_type == EVENT_CREATE or event_type == EVENT_MODIFY:
+                # File or directory created/modified on ext4
+                self.inner.add_file(rel_path)
+            elif event_type == EVENT_DELETE:
+                # File or directory deleted on ext4
+                self.inner.remove_file(rel_path)
+
+    def stop_watcher(self):
+        """Stop the file watcher."""
+        if self.watcher:
+            self.watcher.stop()
+            self.watcher = None
 
     def _create_mbr(self) -> bytes:
         mbr = bytearray(512)
@@ -223,6 +257,7 @@ class PartitionedNBDServer:
             return False
 
         if cmd == NBD_CMD_READ:
+            log(f"NBD_READ offset={offset} len={length}")
             data = self._do_read(offset, length)
             # Log important reads
             if offset == 0:
@@ -231,6 +266,13 @@ class PartitionedNBDServer:
                 log(f"READ NTFS boot sector offset={offset} len={length}")
             elif self.synth.is_mft_region(offset, length):
                 log(f"READ MFT offset={offset} len={length}")
+            else:
+                # Log cluster reads for debugging
+                if offset >= self.synth.PARTITION_OFFSET:
+                    ntfs_offset = offset - self.synth.PARTITION_OFFSET
+                    cluster = ntfs_offset // self.synth.cluster_size
+                    if cluster in self.synth.cluster_map:
+                        log(f"READ cluster {cluster} (in cluster_map) offset={offset} len={length}")
             reply = struct.pack('>IIQ', NBD_REPLY_MAGIC, 0, handle)
             sock.sendall(reply + data)
 
@@ -258,7 +300,28 @@ class PartitionedNBDServer:
         # Start with synthesizer data
         result = bytearray(self.synth.read(offset, length))
 
-        # Apply any overlapping overlay data
+        # Check if this read overlaps with synthesized regions (MFT or cluster_map)
+        # If so, skip overlay to ensure our synthesized data takes precedence
+        if offset >= self.synth.PARTITION_OFFSET:
+            ntfs_offset = offset - self.synth.PARTITION_OFFSET
+
+            # Skip overlay for MFT region (pass full disk offset, not ntfs_offset!)
+            if self.synth.is_mft_region(offset, length):
+                log(f"MFT region read - returning synth data (no overlay)")
+                return bytes(result)
+
+            # Skip overlay for any clusters in our cluster_map (includes INDX blocks)
+            start_cluster = ntfs_offset // self.synth.cluster_size
+            end_cluster = (ntfs_offset + length - 1) // self.synth.cluster_size
+            # Check which INDX clusters are in cluster_map
+            bytes_clusters = [c for c, v in self.synth.cluster_map.items() if isinstance(v, tuple) and len(v) == 2 and v[0] == 'bytes']
+            for cluster in range(start_cluster, end_cluster + 1):
+                if cluster in self.synth.cluster_map:
+                    # This read touches a synthesized cluster - return without overlay
+                    log(f"  Skipping overlay for cluster {cluster} (in cluster_map, {len(bytes_clusters)} INDX clusters total)")
+                    return bytes(result)
+
+        # Apply any overlapping overlay data (for non-synthesized regions)
         with self.overlay_lock:
             for ovl_offset, ovl_data in self.write_overlay.items():
                 ovl_end = ovl_offset + len(ovl_data)
@@ -284,16 +347,21 @@ class PartitionedNBDServer:
             cluster = ntfs_offset // self.synth.cluster_size
 
             if cluster in self.synth.cluster_map:
-                source_path, file_offset = self.synth.cluster_map[cluster]
-                write_offset = file_offset + (ntfs_offset % self.synth.cluster_size)
-                try:
-                    with open(source_path, 'r+b') as f:
-                        f.seek(write_offset)
-                        f.write(data)
-                    log(f"  -> Written to {os.path.basename(source_path)} @ {write_offset}")
-                    return
-                except Exception as e:
-                    log(f"  -> Write error: {e}")
+                mapping = self.synth.cluster_map[cluster]
+                if isinstance(mapping, tuple) and mapping[0] == 'bytes':
+                    # INDX block data - store write in overlay instead
+                    log(f"  -> INDX cluster {cluster} write, storing in overlay")
+                else:
+                    source_path, file_offset = mapping
+                    write_offset = file_offset + (ntfs_offset % self.synth.cluster_size)
+                    try:
+                        with open(source_path, 'r+b') as f:
+                            f.seek(write_offset)
+                            f.write(data)
+                        log(f"  -> Written to {os.path.basename(source_path)} @ {write_offset}")
+                        return
+                    except Exception as e:
+                        log(f"  -> Write error: {e}")
 
             # Check MFT region
             if self.synth.is_mft_region(offset, len(data)):
@@ -318,7 +386,10 @@ class PartitionedNBDServer:
                 cluster = ntfs_offset // self.synth.cluster_size
 
                 if cluster in self.synth.cluster_map:
-                    source_path, file_offset = self.synth.cluster_map[cluster]
+                    mapping = self.synth.cluster_map[cluster]
+                    if isinstance(mapping, tuple) and mapping[0] == 'bytes':
+                        continue  # Skip INDX block clusters
+                    source_path, file_offset = mapping
                     write_offset = file_offset + (ntfs_offset % self.synth.cluster_size)
                     try:
                         # Use 'rb+' if file exists and has content, otherwise 'wb'
@@ -358,15 +429,31 @@ def main():
     parser.add_argument('template', help='NTFS template file')
     parser.add_argument('source', help='Source directory')
     parser.add_argument('-p', '--port', type=int, default=10809, help='Port')
+    parser.add_argument('--no-watch', action='store_true',
+                        help='Disable file watcher (ext4 -> NTFS sync)')
     args = parser.parse_args()
 
     log("Creating partitioned synthesizer...")
-    synth = PartitionedSynthesizer(args.template, args.source)
+    synth = PartitionedSynthesizer(args.template, args.source,
+                                    enable_watcher=not args.no_watch)
     log(f"  NTFS size: {synth.ntfs_size}")
     log(f"  Total size: {synth.get_size()} ({synth.get_size() // 1048576} MB)")
+    log(f"  File watcher: {'disabled' if args.no_watch else 'enabled'}")
+
+    # Show cluster_map summary for debugging
+    bytes_clusters = [c for c, v in synth.cluster_map.items() if isinstance(v, tuple) and v[0] == 'bytes']
+    file_clusters = [c for c, v in synth.cluster_map.items() if isinstance(v, tuple) and len(v) == 2 and isinstance(v[0], str) and v[0] != 'bytes']
+    log(f"  cluster_map: {len(synth.cluster_map)} entries")
+    if bytes_clusters:
+        log(f"    INDX block clusters: {sorted(bytes_clusters)}")
+    if file_clusters:
+        log(f"    File data clusters: {len(file_clusters)} clusters")
 
     server = PartitionedNBDServer(synth, port=args.port)
-    server.run()
+    try:
+        server.run()
+    finally:
+        synth.stop_watcher()
 
 
 if __name__ == '__main__':

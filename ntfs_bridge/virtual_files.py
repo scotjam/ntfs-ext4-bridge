@@ -429,8 +429,9 @@ class VirtualFileManager:
         off = self._add_file_name(record, off, vd.rel_path, vd.parent_mft_record,
                                    0, vd.creation_time, is_dir=True)
 
-        # $INDEX_ROOT (empty for now - directory entries injected on read)
-        off = self._add_empty_index_root(record, off)
+        # $INDEX_ROOT with children
+        children = self.get_virtual_children(vd.mft_record_num)
+        off = self._add_index_root_with_children(record, off, children)
 
         # End marker
         struct.pack_into('<I', record, off, 0xFFFFFFFF)
@@ -672,6 +673,79 @@ class VirtualFileManager:
         struct.pack_into('<I', record, end_off + 8, 16)     # Entry length
         struct.pack_into('<H', record, end_off + 12, 0)     # Key length
         struct.pack_into('<H', record, end_off + 14, 2)     # Flags: LAST_ENTRY
+
+        return off + attr_len
+
+    def _add_index_root_with_children(self, record: bytearray, off: int,
+                                       children: list) -> int:
+        """Add $INDEX_ROOT attribute with child entries for virtual directories."""
+        # Build all child entries first
+        entries_data = bytearray()
+        for child in sorted(children, key=lambda c: os.path.basename(c.rel_path).upper()):
+            entry = self.synthesize_index_entry(child)
+            entries_data.extend(entry)
+
+        # Add end entry (16 bytes)
+        end_entry = bytearray(16)
+        struct.pack_into('<H', end_entry, 8, 16)    # Entry length
+        struct.pack_into('<H', end_entry, 12, 0)    # Key length
+        struct.pack_into('<H', end_entry, 14, 2)    # Flags: LAST_ENTRY
+        entries_data.extend(end_entry)
+
+        # Index root header: 16 bytes
+        # Index header: 16 bytes
+        # Entries: variable
+        index_header_size = 16
+        entries_offset = 16  # Relative to index header start
+        total_entries_size = len(entries_data)
+        index_data_size = index_header_size + total_entries_size
+
+        # Total data: index root header (16) + index header (16) + entries
+        data_len = 16 + index_data_size
+
+        # Check if it fits in MFT record (leave room for other attrs)
+        max_index_size = 400  # Conservative limit for inline index
+        if data_len > max_index_size:
+            # Too large - fall back to empty index (would need INDEX_ALLOCATION)
+            return self._add_empty_index_root(record, off)
+
+        attr_len = 24 + 8 + data_len  # header + name ($I30) + data
+        attr_len = (attr_len + 7) & ~7
+
+        # Attribute header
+        struct.pack_into('<I', record, off, 0x90)           # Type ($INDEX_ROOT)
+        struct.pack_into('<I', record, off + 4, attr_len)   # Length
+        record[off + 8] = 0                                  # Resident
+        record[off + 9] = 4                                  # Name length ($I30)
+        struct.pack_into('<H', record, off + 10, 24)        # Name offset
+        struct.pack_into('<H', record, off + 12, 0)         # Flags
+        struct.pack_into('<H', record, off + 14, 3)         # Instance
+        struct.pack_into('<I', record, off + 16, data_len)  # Value length
+        struct.pack_into('<H', record, off + 20, 32)        # Value offset (after name)
+
+        # Attribute name: $I30
+        record[off + 24:off + 32] = '$I30'.encode('utf-16-le')
+
+        data_off = off + 32
+
+        # Index root header (16 bytes)
+        struct.pack_into('<I', record, data_off, 0x30)      # Attribute type ($FILE_NAME)
+        struct.pack_into('<I', record, data_off + 4, 1)     # Collation rule (filename)
+        struct.pack_into('<I', record, data_off + 8, 4096)  # Index block size
+        record[data_off + 12] = 1                            # Clusters per index block
+        # 3 bytes padding
+
+        # Index header (at data_off + 16)
+        idx_off = data_off + 16
+        struct.pack_into('<I', record, idx_off, entries_offset)          # Entries offset
+        struct.pack_into('<I', record, idx_off + 4, index_data_size)     # Total size
+        struct.pack_into('<I', record, idx_off + 8, index_data_size)     # Allocated size
+        record[idx_off + 12] = 0                             # Flags (small index)
+        # 3 bytes padding
+
+        # Copy entries
+        entries_start = data_off + 32
+        record[entries_start:entries_start + len(entries_data)] = entries_data
 
         return off + attr_len
 
