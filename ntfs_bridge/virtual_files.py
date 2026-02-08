@@ -113,9 +113,45 @@ class VirtualFileManager:
         # Reference to ClusterMapper (set after construction)
         self.mapper: Optional['ClusterMapper'] = None
 
+        # Available MFT slots (populated by set_mapper)
+        self._available_mft_slots: List[int] = []
+
+    def _allocate_mft_record(self) -> Optional[int]:
+        """Allocate the next available MFT record number.
+
+        Returns None if no slots are available.
+        """
+        if self._available_mft_slots:
+            return self._available_mft_slots.pop(0)
+        return None
+
     def set_mapper(self, mapper: 'ClusterMapper'):
         """Set reference to ClusterMapper for directory lookups."""
         self.mapper = mapper
+
+        # Find available MFT slots by scanning for unused records
+        used_records = set()
+        if mapper.mft_record_to_source:
+            used_records.update(mapper.mft_record_to_source.keys())
+        if mapper.mft_record_to_dir:
+            used_records.update(mapper.mft_record_to_dir.keys())
+
+        # System records 0-23 are always reserved
+        used_records.update(range(24))
+
+        # Find first available slot starting from record 24
+        # MFT typically has ~100-120 records allocated for small volumes
+        self._available_mft_slots = []
+        for i in range(24, 120):  # Check reasonable range
+            if i not in used_records:
+                self._available_mft_slots.append(i)
+
+        if self._available_mft_slots:
+            self._next_mft_record = self._available_mft_slots[0]
+            log(f"Virtual MFT: {len(self._available_mft_slots)} slots available, starting at {self._next_mft_record}")
+        else:
+            self._next_mft_record = 36  # Fallback
+            log(f"Virtual MFT: no slots found, starting at {self._next_mft_record}")
 
     def add_file(self, rel_path: str) -> Optional[VirtualFile]:
         """Add a virtual file for an ext4 file.
@@ -146,9 +182,11 @@ class VirtualFileManager:
             # Find parent directory's MFT record
             parent_mft = self._get_parent_mft_record(rel_path)
 
-            # Allocate virtual MFT record
-            mft_record = self._next_mft_record
-            self._next_mft_record += 1
+            # Allocate virtual MFT record from available slots
+            mft_record = self._allocate_mft_record()
+            if mft_record is None:
+                log(f"No available MFT slots for virtual file: {rel_path}")
+                return None
 
             # Allocate virtual clusters for non-resident files
             virtual_clusters = []
@@ -196,8 +234,11 @@ class VirtualFileManager:
 
             parent_mft = self._get_parent_mft_record(rel_path)
 
-            mft_record = self._next_mft_record
-            self._next_mft_record += 1
+            # Allocate virtual MFT record from available slots
+            mft_record = self._allocate_mft_record()
+            if mft_record is None:
+                log(f"No available MFT slots for virtual directory: {rel_path}")
+                return None
 
             vd = VirtualDirectory(
                 rel_path=rel_path,

@@ -334,7 +334,14 @@ def create_watcher(watch_dir: str, callback: Callable[[str, str], None]) -> 'Fil
     """Create the best available file watcher for the platform.
 
     Returns an inotify-based watcher on Linux, or a polling watcher elsewhere.
+    For WSL /mnt paths (Windows filesystem), always use polling since inotify
+    doesn't work across the 9p/drvfs mount boundary.
     """
+    # Use polling for WSL /mnt paths (Windows filesystem doesn't trigger inotify)
+    if watch_dir.startswith('/mnt/'):
+        log("Using polling watcher (WSL /mnt path - inotify doesn't work)")
+        return PollingFileWatcher(watch_dir, callback)
+
     if INOTIFY_AVAILABLE:
         return FileWatcher(watch_dir, callback)
     else:
