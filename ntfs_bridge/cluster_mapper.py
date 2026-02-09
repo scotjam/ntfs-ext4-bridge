@@ -1017,6 +1017,40 @@ class ClusterMapper:
 
         return None
 
+    def _extract_file_size(self, record: bytearray) -> Optional[int]:
+        """Extract file size from $DATA attribute (resident or non-resident)."""
+        first_attr = struct.unpack('<H', record[20:22])[0]
+        off = first_attr
+
+        while off < MFT_RECORD_SIZE - 8:
+            attr_type = struct.unpack('<I', record[off:off + 4])[0]
+            if attr_type == 0xFFFFFFFF:
+                break
+
+            attr_len = struct.unpack('<I', record[off + 4:off + 8])[0]
+            if attr_len == 0 or attr_len > MFT_RECORD_SIZE:
+                break
+
+            name_len = record[off + 9]
+            attr_name = ''
+            if name_len > 0:
+                name_offset = struct.unpack('<H', record[off + 10:off + 12])[0]
+                attr_name = record[off + name_offset:off + name_offset + name_len * 2].decode(
+                    'utf-16-le', errors='ignore')
+
+            if attr_type == 0x80 and not attr_name:  # $DATA (unnamed)
+                non_res = record[off + 8]
+                if non_res:
+                    # Non-resident: real size at offset 48
+                    return struct.unpack('<Q', record[off + 48:off + 56])[0]
+                else:
+                    # Resident: content length at offset 16
+                    return struct.unpack('<I', record[off + 16:off + 20])[0]
+
+            off += attr_len
+
+        return None
+
     def _extract_resident_data(self, record: bytearray) -> Optional[bytes]:
         """Extract resident data from $DATA attribute."""
         first_attr = struct.unpack('<H', record[20:22])[0]
@@ -2590,12 +2624,30 @@ class ClusterMapper:
 
             self.ntfs_sync_in_progress.add(rel_path)
             try:
-                # Extract resident data if present to write to ext4
-                resident_data = self._extract_resident_data(record)
-                with open(source_path, 'wb') as f:
-                    if resident_data:
-                        f.write(resident_data)
-                log(f"  NEW FILE: {rel_path}")
+                # Check for non-resident data first - need to copy from image
+                data_runs = self._extract_data_runs(record)
+                if data_runs:
+                    # Non-resident file: copy data from image clusters to ext4
+                    with open(source_path, 'wb') as f:
+                        for start_cluster, num_clusters in data_runs:
+                            for i in range(num_clusters):
+                                cluster = start_cluster + i
+                                cluster_offset = cluster * self.cluster_size
+                                if cluster_offset + self.cluster_size <= len(self.image):
+                                    f.write(self.image[cluster_offset:cluster_offset + self.cluster_size])
+                    # Get actual file size from MFT and truncate
+                    file_size = self._extract_file_size(record)
+                    if file_size is not None and file_size > 0:
+                        with open(source_path, 'r+b') as f:
+                            f.truncate(file_size)
+                    log(f"  NEW FILE (non-resident): {rel_path} ({file_size} bytes)")
+                else:
+                    # Resident file: extract inline data
+                    resident_data = self._extract_resident_data(record)
+                    with open(source_path, 'wb') as f:
+                        if resident_data:
+                            f.write(resident_data)
+                    log(f"  NEW FILE: {rel_path}")
             finally:
                 self.ntfs_sync_in_progress.discard(rel_path)
 
