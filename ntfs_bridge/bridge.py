@@ -79,12 +79,25 @@ class NTFSBridge:
             log(f"ERROR: Source directory does not exist: {self.source_dir}")
             sys.exit(1)
 
-        # Calculate image size: at least 2x source size, minimum 64MB
-        source_size = self._get_dir_size(self.source_dir)
-        min_size_mb = max(64, (source_size * 3) // (1024 * 1024))
-        if self.image_size_mb < min_size_mb:
-            self.image_size_mb = min_size_mb
-            log(f"Adjusted image size to {self.image_size_mb}MB (source is {source_size // 1024 // 1024}MB)")
+        # Image only needs to hold NTFS metadata (MFT, directories, bitmap).
+        # File data is served from ext4 source via cluster_map, not stored in image.
+        # With lazy allocation, the image must be virtually large enough to represent
+        # all file clusters in the bitmap. Since we use truncate (sparse file), the
+        # actual disk usage stays small — only metadata is written.
+        if self.lazy_alloc:
+            total_bytes = 0
+            for dirpath, dirnames, filenames in os.walk(self.source_dir):
+                for f in filenames:
+                    total_bytes += os.path.getsize(os.path.join(dirpath, f))
+            # Add 10% overhead for NTFS metadata + round up to nearest 64MB
+            needed_mb = int((total_bytes * 1.1) / (1024 * 1024)) + 64
+            if needed_mb > self.image_size_mb:
+                log(f"Auto-sizing image: {total_bytes/(1024**3):.1f}GB of files -> {needed_mb}MB virtual image")
+                self.image_size_mb = needed_mb
+
+        if self.image_size_mb < 64:
+            self.image_size_mb = 64
+            log(f"Adjusted image size to minimum {self.image_size_mb}MB")
 
         # Step 1: Create NTFS image if it doesn't exist
         if not os.path.exists(self.image_path):
@@ -328,7 +341,7 @@ class NTFSBridge:
 
         # Format as NTFS
         result = subprocess.run(
-            ['mkfs.ntfs', '-F', '-Q', self.image_path],
+            ['mkfs.ntfs', '-F', '-Q', '-c', '65536', self.image_path],
             capture_output=True, text=True
         )
         if result.returncode != 0:
@@ -340,7 +353,8 @@ class NTFSBridge:
     def _populate_image(self):
         """Populate the NTFS image with files from ext4 source."""
         # Mount image directly and copy directory structure + sparse files
-        tmp_mount = tempfile.mkdtemp(prefix='ntfs-init-')
+        # Use /root for temp mount to avoid tmpfs space issues with large files
+        tmp_mount = tempfile.mkdtemp(prefix='ntfs-init-', dir='/root')
 
         try:
             # Mount the image with ntfs-3g

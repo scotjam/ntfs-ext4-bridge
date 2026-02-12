@@ -92,6 +92,12 @@ class SyncDaemon:
             log(f"  Skipping (NTFS sync in progress): {rel_path}")
             return
 
+        # Time-based loop prevention: skip if NTFS→ext4 sync recently wrote
+        # this file (the instant flag above is cleared before FileWatcher fires)
+        ntfs_ts = self.mapper.ntfs_sync_timestamps.get(rel_path, 0)
+        if time.time() - ntfs_ts < 2.0:
+            return
+
         # Debounce check
         with self._recent_lock:
             last_sync = self._recent_syncs.get(rel_path, 0)

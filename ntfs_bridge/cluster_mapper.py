@@ -10,6 +10,7 @@ resident files (data in MFT record → injected from ext4 on reads).
 Supports lazy allocation: large files can start as sparse (no clusters),
 get allocated on first read, and deallocated after a timeout.
 """
+import mmap
 import os
 import struct
 import threading
@@ -43,9 +44,10 @@ class ClusterMapper:
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
 
-        # Load the image
-        with open(image_path, 'rb') as f:
-            self.image = bytearray(f.read())
+        # Memory-map the image file for efficient large file handling
+        # This avoids loading the entire image into RAM
+        self._image_file = open(image_path, 'r+b')
+        self.image = mmap.mmap(self._image_file.fileno(), 0)
 
         # Parse boot sector
         boot = self.image[0:512]
@@ -79,6 +81,13 @@ class ClusterMapper:
         # Loop prevention sets (shared with SyncDaemon)
         self.ext4_sync_in_progress: Set[str] = set()
         self.ntfs_sync_in_progress: Set[str] = set()
+
+        # Time-based loop prevention: records when NTFS→ext4 sync last wrote
+        # each file.  The instant set (ntfs_sync_in_progress) is cleared as
+        # soon as the write finishes, but the FileWatcher fires asynchronously
+        # later.  SyncDaemon checks these timestamps to suppress cascade events
+        # for a grace period after the sync.
+        self.ntfs_sync_timestamps: Dict[str, float] = {}
 
         # Lazy allocator (set by bridge after construction)
         self.lazy_allocator: Optional['LazyAllocator'] = None
@@ -138,6 +147,19 @@ class ClusterMapper:
         log(f"Initialized: {len(self.cluster_map)} clusters mapped, "
             f"{len(self.mft_record_to_source)} files tracked "
             f"({len(self.resident_file_data)} resident)")
+
+    def close(self):
+        """Close the memory-mapped image file."""
+        if hasattr(self, 'image') and self.image:
+            self.image.close()
+            self.image = None
+        if hasattr(self, '_image_file') and self._image_file:
+            self._image_file.close()
+            self._image_file = None
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        self.close()
 
     # =========================================================================
     # Public interface
@@ -433,8 +455,8 @@ class ClusterMapper:
 
     def flush(self):
         """Flush image changes to disk."""
-        with open(self.image_path, 'r+b') as f:
-            f.write(self.image)
+        if self.image:
+            self.image.flush()
 
     def rescan_mft(self):
         """Rescan the MFT to pick up changes made through ntfs-3g.
@@ -503,30 +525,62 @@ class ClusterMapper:
         """Find 'count' free clusters in the bitmap.
 
         Returns list of cluster numbers, or None if not enough free space.
-        Tries to find contiguous clusters for efficiency.
+        Prefers contiguous blocks to minimize data run fragmentation.
         """
         if not self.bitmap_clusters:
             return None
 
         bitmap = self._read_bitmap()
-        free_clusters = []
-        cluster = 0
 
         # Skip system clusters (first ~16 clusters are usually reserved)
         start_search = max(16, self.mft_cluster + 100)  # Start after MFT region
+
+        # Find all contiguous free runs in the bitmap
+        free_runs = []  # (start_cluster, length)
+        run_start = -1
+        run_length = 0
+        total_free = 0
 
         for byte_idx in range(start_search // 8, len(bitmap)):
             byte_val = bitmap[byte_idx]
             for bit in range(8):
                 cluster = byte_idx * 8 + bit
+                if cluster < start_search:
+                    continue
                 if cluster >= self.total_clusters:
                     break
                 if not (byte_val & (1 << bit)):  # Bit 0 = free
-                    free_clusters.append(cluster)
-                    if len(free_clusters) >= count:
-                        return free_clusters
+                    if run_length == 0:
+                        run_start = cluster
+                    run_length += 1
+                    total_free += 1
+                    # Fast path: single contiguous block large enough
+                    if run_length >= count:
+                        return list(range(run_start, run_start + count))
+                else:
+                    if run_length > 0:
+                        free_runs.append((run_start, run_length))
+                        run_length = 0
+            if cluster >= self.total_clusters:
+                break
 
-        return None if len(free_clusters) < count else free_clusters
+        # Don't forget last run
+        if run_length > 0:
+            free_runs.append((run_start, run_length))
+
+        if total_free < count:
+            return None
+
+        # Use largest runs first to minimize data run fragmentation
+        free_runs.sort(key=lambda x: x[1], reverse=True)
+        result = []
+        for start, length in free_runs:
+            take = min(length, count - len(result))
+            result.extend(range(start, start + take))
+            if len(result) >= count:
+                return sorted(result)
+
+        return None
 
     def _mark_clusters_used(self, clusters: List[int]):
         """Mark clusters as used in the bitmap."""
@@ -624,17 +678,24 @@ class ClusterMapper:
                 old_attr_len = attr_len
                 remaining = record[off + old_attr_len:]
 
-                # Fit new attribute
-                record[off:off + len(new_attr)] = new_attr
-                record[off + len(new_attr):off + len(new_attr) + len(remaining)] = remaining
+                # Check if new content fits in MFT_RECORD_SIZE
+                new_used = off + len(new_attr) + len(remaining)
+                if new_used > MFT_RECORD_SIZE:
+                    log(f"  ERROR: Data runs too large for MFT record ({new_used} > {MFT_RECORD_SIZE})")
+                    return False
+
+                # Build new record at fixed MFT_RECORD_SIZE
+                new_record = bytearray(MFT_RECORD_SIZE)
+                new_record[:off] = record[:off]
+                new_record[off:off + len(new_attr)] = new_attr
+                new_record[off + len(new_attr):off + len(new_attr) + len(remaining)] = remaining
 
                 # Update used size in record header
-                new_used = off + len(new_attr) + len(remaining)
-                struct.pack_into('<I', record[24:28], 0, new_used)
+                struct.pack_into('<I', new_record, 24, new_used)
 
                 # Apply fixups and write back
-                self._apply_fixups(record)
-                self.image[record_offset:record_offset + MFT_RECORD_SIZE] = record
+                self._apply_fixups(new_record)
+                self.image[record_offset:record_offset + MFT_RECORD_SIZE] = new_record
 
                 return True
 
@@ -1245,10 +1306,10 @@ class ClusterMapper:
             if read_end <= val_len_abs or read_offset >= data_end:
                 continue
 
-            # Read current ext4 content
+            # Read current ext4 content (cap to available space in MFT record)
             try:
                 with open(source_path, 'rb') as f:
-                    ext4_data = f.read()
+                    ext4_data = f.read(available)
             except OSError:
                 continue
 
@@ -2405,6 +2466,7 @@ class ClusterMapper:
                 # Delete from ext4
                 if os.path.exists(source_path):
                     self.ntfs_sync_in_progress.add(rel_path)
+                    self.ntfs_sync_timestamps[rel_path] = time.time()
                     try:
                         os.remove(source_path)
                         log(f"  FILE DELETED: {rel_path}")
@@ -2462,6 +2524,9 @@ class ClusterMapper:
                 if os.path.exists(old_path) and not os.path.exists(new_path):
                     self.ntfs_sync_in_progress.add(new_rel_path)
                     self.ntfs_sync_in_progress.add(old_rel_path)
+                    now = time.time()
+                    self.ntfs_sync_timestamps[new_rel_path] = now
+                    self.ntfs_sync_timestamps[old_rel_path] = now
                     try:
                         os.rename(old_path, new_path)
                         log(f"  DIR RENAMED: {old_rel_path} -> {new_rel_path}")
@@ -2561,6 +2626,7 @@ class ClusterMapper:
         try:
             if not os.path.exists(source_path):
                 self.ntfs_sync_in_progress.add(rel_path)
+                self.ntfs_sync_timestamps[rel_path] = time.time()
                 try:
                     os.makedirs(source_path, exist_ok=True)
                     log(f"  NEW DIR: {rel_path}")
@@ -2623,6 +2689,7 @@ class ClusterMapper:
                 os.makedirs(parent_dir, exist_ok=True)
 
             self.ntfs_sync_in_progress.add(rel_path)
+            self.ntfs_sync_timestamps[rel_path] = time.time()
             try:
                 # Check for non-resident data first - need to copy from image
                 data_runs = self._extract_data_runs(record)
@@ -2721,6 +2788,9 @@ class ClusterMapper:
                             if not os.path.exists(new_path):
                                 self.ntfs_sync_in_progress.add(new_rel_path)
                                 self.ntfs_sync_in_progress.add(old_rel)
+                                now = time.time()
+                                self.ntfs_sync_timestamps[new_rel_path] = now
+                                self.ntfs_sync_timestamps[old_rel] = now
                                 try:
                                     os.rename(source_path, new_path)
                                     log(f"  FILE RENAMED: {os.path.basename(source_path)} -> {filename}")
@@ -2786,9 +2856,10 @@ class ClusterMapper:
                     current_data = b''
                     if os.path.exists(source_path):
                         with open(source_path, 'rb') as f:
-                            current_data = f.read()
+                            current_data = f.read(len(resident_data) + 1)
                     if current_data != resident_data:
                         self.ntfs_sync_in_progress.add(rel_path)
+                        self.ntfs_sync_timestamps[rel_path] = time.time()
                         try:
                             with open(source_path, 'wb') as f:
                                 f.write(resident_data)
