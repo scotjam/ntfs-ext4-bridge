@@ -92,10 +92,16 @@ def decode_data_runs(data: bytes) -> List[Tuple[int, int]]:
 
 
 def _min_bytes_unsigned(value: int) -> int:
-    """Calculate minimum bytes needed to represent unsigned value."""
+    """Calculate minimum bytes needed to represent unsigned value.
+
+    NTFS data run decoders (including ntfs-3g) sign-extend the most
+    significant byte, so we must add an extra byte when the MSB has
+    bit 7 set to prevent the value being interpreted as negative.
+    """
     if value == 0:
         return 1
-    return (value.bit_length() + 7) // 8
+    # Use same formula as signed-positive: reserve a bit for sign
+    return (value.bit_length() + 8) // 8
 
 
 def _min_bytes_signed(value: int) -> int:

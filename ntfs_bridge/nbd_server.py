@@ -287,7 +287,11 @@ class NBDServer:
 
         try:
             if cmd == NBD_CMD_READ:
+                if length > 16 * 1024 * 1024:
+                    log(f"Large read: off={offset} len={length}")
                 data = self.mapper.read(offset, length)
+                if len(data) != length:
+                    log(f"Read size mismatch: expected {length}, got {len(data)}")
 
             elif cmd == NBD_CMD_WRITE:
                 try:
@@ -317,7 +321,8 @@ class NBDServer:
                 error = 22  # EINVAL
 
         except Exception as e:
-            log(f"Command error: {e}")
+            log(f"Command error (cmd={cmd} off={offset} len={length}): {e}")
+            traceback.print_exc()
             error = 5  # EIO
 
         # Send reply
@@ -326,7 +331,8 @@ class NBDServer:
             sock.sendall(reply)
             if data:
                 sock.sendall(data)
-        except Exception:
+        except Exception as e:
+            log(f"Send error (cmd={cmd} off={offset} len={length} datalen={len(data)}): {e}")
             return False
 
         return True

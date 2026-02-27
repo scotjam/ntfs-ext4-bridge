@@ -79,31 +79,40 @@ class NTFSBridge:
             log(f"ERROR: Source directory does not exist: {self.source_dir}")
             sys.exit(1)
 
-        # Image only needs to hold NTFS metadata (MFT, directories, bitmap).
-        # File data is served from ext4 source via cluster_map, not stored in image.
-        # With lazy allocation, the image must be virtually large enough to represent
-        # all file clusters in the bitmap. Since we use truncate (sparse file), the
-        # actual disk usage stays small — only metadata is written.
-        if self.lazy_alloc:
-            total_bytes = 0
-            for dirpath, dirnames, filenames in os.walk(self.source_dir):
-                for f in filenames:
+        # Dynamically calculate image size from ext4 source content.
+        # The image must be large enough to represent all file clusters in the
+        # NTFS bitmap. Since we use truncate (sparse file), the actual disk
+        # usage stays small — only metadata is written.
+        total_bytes = 0
+        file_count = 0
+        for dirpath, dirnames, filenames in os.walk(self.source_dir):
+            for f in filenames:
+                try:
                     total_bytes += os.path.getsize(os.path.join(dirpath, f))
-            # Add 10% overhead for NTFS metadata + round up to nearest 64MB
-            needed_mb = int((total_bytes * 1.1) / (1024 * 1024)) + 64
-            if needed_mb > self.image_size_mb:
-                log(f"Auto-sizing image: {total_bytes/(1024**3):.1f}GB of files -> {needed_mb}MB virtual image")
-                self.image_size_mb = needed_mb
+                    file_count += 1
+                except OSError:
+                    pass
+        # Add 10% overhead for NTFS metadata + round up to nearest 64MB
+        needed_mb = int((total_bytes * 1.1) / (1024 * 1024)) + 64
+        if needed_mb > self.image_size_mb:
+            log(f"Auto-sizing image: {total_bytes/(1024**3):.1f}GB in {file_count} files -> {needed_mb}MB virtual image")
+            self.image_size_mb = needed_mb
 
         if self.image_size_mb < 64:
             self.image_size_mb = 64
             log(f"Adjusted image size to minimum {self.image_size_mb}MB")
 
-        # Step 1: Create NTFS image if it doesn't exist
-        if not os.path.exists(self.image_path):
-            self._create_ntfs_image()
+        # Step 1: Create NTFS image if it doesn't exist or is too small
+        if os.path.exists(self.image_path):
+            existing_size_mb = os.path.getsize(self.image_path) // (1024 * 1024)
+            if existing_size_mb < self.image_size_mb:
+                log(f"Existing image too small ({existing_size_mb}MB < {self.image_size_mb}MB), recreating...")
+                os.remove(self.image_path)
+                self._create_ntfs_image()
+            else:
+                log(f"Using existing image: {self.image_path} ({existing_size_mb}MB)")
         else:
-            log(f"Using existing image: {self.image_path}")
+            self._create_ntfs_image()
 
         # Step 2: Populate image from ext4 source
         self._populate_image()
@@ -546,7 +555,7 @@ def main():
     parser.add_argument('--port', type=int, default=10809,
                         help='NBD server port (default: 10809)')
     parser.add_argument('--size', type=int, default=256,
-                        help='Image size in MB (default: 256)')
+                        help='Minimum image size in MB; auto-increased based on source content (default: 256)')
     parser.add_argument('--lazy', action='store_true',
                         help='Enable lazy allocation for large files (saves disk space)')
     parser.add_argument('--dealloc-timeout', type=float, default=60.0,
