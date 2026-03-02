@@ -126,16 +126,23 @@ class NBDServer:
         try:
             sock.settimeout(300)
             self._do_handshake(sock)
+            log(f"Handshake done for {addr}, entering I/O loop")
 
+            # Remove timeout for main I/O loop - nbd clients may be idle
+            sock.settimeout(None)
+
+            req_count = 0
             while True:
                 try:
                     if not self._handle_request(sock):
+                        log(f"Client {addr}: clean disconnect after {req_count} requests")
                         break
+                    req_count += 1
                 except socket.timeout:
-                    log("Socket timeout")
+                    log(f"Socket timeout after {req_count} requests")
                     break
                 except Exception as e:
-                    log(f"Request error: {type(e).__name__}: {e}")
+                    log(f"Request error after {req_count} requests: {type(e).__name__}: {e}")
                     break
         except socket.timeout:
             log("Handshake timeout")
@@ -152,6 +159,7 @@ class NBDServer:
 
     def _do_handshake(self, sock: socket.socket):
         """Perform NBD newstyle handshake."""
+        log("Handshake: sending init magic")
         sock.sendall(NBD_INIT_MAGIC)
         sock.sendall(struct.pack('>Q', NBD_OPTS_MAGIC))
 
@@ -163,12 +171,13 @@ class NBDServer:
         if len(client_flags_data) < 4:
             raise ValueError(f"Short client flags: {len(client_flags_data)} bytes")
         client_flags = struct.unpack('>I', client_flags_data)[0]
+        log(f"Handshake: client flags={client_flags:#x}")
 
         # Option haggling
         while True:
             opt_magic_data = sock.recv(8)
             if len(opt_magic_data) < 8:
-                raise ValueError(f"Short option magic")
+                raise ValueError(f"Short option magic ({len(opt_magic_data)} bytes)")
             opt_magic = struct.unpack('>Q', opt_magic_data)[0]
 
             if opt_magic != NBD_OPTS_MAGIC:
@@ -178,6 +187,7 @@ class NBDServer:
             opt_len_data = sock.recv(4)
             opt_type = struct.unpack('>I', opt_type_data)[0]
             opt_len = struct.unpack('>I', opt_len_data)[0]
+            log(f"Handshake: option type={opt_type} len={opt_len}")
 
             opt_data = b''
             if opt_len > 0:
@@ -234,6 +244,7 @@ class NBDServer:
                 self._send_option_reply(sock, opt_type, NBD_REP_ACK, b'')
 
                 if opt_type == NBD_OPT_GO:
+                    log(f"Handshake complete: size={self.size}, flags={export_flags:#x}")
                     return
 
             elif opt_type == NBD_OPT_ABORT:

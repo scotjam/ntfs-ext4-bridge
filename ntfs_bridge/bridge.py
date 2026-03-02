@@ -85,7 +85,7 @@ class NTFSBridge:
         # usage stays small — only metadata is written.
         total_bytes = 0
         file_count = 0
-        for dirpath, dirnames, filenames in os.walk(self.source_dir):
+        for dirpath, dirnames, filenames in os.walk(self.source_dir, followlinks=True):
             for f in filenames:
                 try:
                     total_bytes += os.path.getsize(os.path.join(dirpath, f))
@@ -103,19 +103,22 @@ class NTFSBridge:
             log(f"Adjusted image size to minimum {self.image_size_mb}MB")
 
         # Step 1: Create NTFS image if it doesn't exist or is too small
+        image_is_fresh = False
         if os.path.exists(self.image_path):
             existing_size_mb = os.path.getsize(self.image_path) // (1024 * 1024)
             if existing_size_mb < self.image_size_mb:
                 log(f"Existing image too small ({existing_size_mb}MB < {self.image_size_mb}MB), recreating...")
                 os.remove(self.image_path)
                 self._create_ntfs_image()
+                image_is_fresh = True
             else:
                 log(f"Using existing image: {self.image_path} ({existing_size_mb}MB)")
         else:
             self._create_ntfs_image()
+            image_is_fresh = True
 
         # Step 2: Populate image from ext4 source
-        self._populate_image()
+        self._populate_image(needs_fsfix=not image_is_fresh)
 
         # Step 3: Initialize ClusterMapper
         log("Initializing ClusterMapper...")
@@ -359,13 +362,37 @@ class NTFSBridge:
 
         log("NTFS image created")
 
-    def _populate_image(self):
+    def _populate_image(self, needs_fsfix: bool = False):
         """Populate the NTFS image with files from ext4 source."""
+        # Clean up any stale ntfs-init mounts from previous runs
+        # (if the bridge was killed, the finally block may not have run)
+        import glob as globmod
+        for stale_dir in globmod.glob('/root/ntfs-init-*'):
+            subprocess.run(['umount', stale_dir], capture_output=True)
+            subprocess.run(['fusermount', '-u', stale_dir], capture_output=True)
+            try:
+                os.rmdir(stale_dir)
+                log(f"Cleaned up stale mount: {stale_dir}")
+            except OSError:
+                pass
+
         # Mount image directly and copy directory structure + sparse files
         # Use /root for temp mount to avoid tmpfs space issues with large files
         tmp_mount = tempfile.mkdtemp(prefix='ntfs-init-', dir='/root')
 
         try:
+            if needs_fsfix:
+                # Fix dirty NTFS filesystem before mounting.
+                # allocate_file_direct() modifies MFT outside ntfs-3g's journal,
+                # which makes ntfs-3g consider the filesystem dirty and mount
+                # read-only. ntfsfix clears the dirty flag so we can mount rw.
+                fix_result = subprocess.run(
+                    ['ntfsfix', '-d', self.image_path],
+                    capture_output=True, text=True
+                )
+                if fix_result.returncode != 0:
+                    log(f"ntfsfix warning: {fix_result.stderr.strip()}")
+
             # Mount the image with ntfs-3g
             result = subprocess.run(
                 ['mount', '-t', 'ntfs-3g', '-o', 'rw,big_writes',
@@ -381,7 +408,7 @@ class NTFSBridge:
             files_created = 0
             dirs_created = 0
 
-            for root, dirs, files in os.walk(self.source_dir):
+            for root, dirs, files in os.walk(self.source_dir, followlinks=True):
                 rel_root = os.path.relpath(root, self.source_dir)
 
                 # Create directories
@@ -533,7 +560,7 @@ class NTFSBridge:
     def _get_dir_size(path: str) -> int:
         """Get total size of files in a directory."""
         total = 0
-        for root, dirs, files in os.walk(path):
+        for root, dirs, files in os.walk(path, followlinks=True):
             for f in files:
                 try:
                     total += os.path.getsize(os.path.join(root, f))

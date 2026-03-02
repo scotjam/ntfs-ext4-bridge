@@ -265,7 +265,7 @@ class PollingFileWatcher:
         """Scan directory and return dict of rel_path -> mtime."""
         files = {}
         try:
-            for root, dirs, filenames in os.walk(self.watch_dir):
+            for root, dirs, filenames in os.walk(self.watch_dir, followlinks=True):
                 # Skip hidden directories
                 dirs[:] = [d for d in dirs if not d.startswith('.')]
 

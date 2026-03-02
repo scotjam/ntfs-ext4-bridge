@@ -734,7 +734,6 @@ class ClusterMapper:
 
                     # Check if new content fits in MFT_RECORD_SIZE
                     new_used = off + len(new_attr) + len(remaining)
-                    log(f"  MFT update: off={off} new_attr={len(new_attr)} remaining={len(remaining)} new_used={new_used} used_size={used_size}")
                     if new_used > MFT_RECORD_SIZE:
                         if attempt == 0:
                             break  # Try again after stripping attrs
@@ -829,8 +828,13 @@ class ClusterMapper:
         self._clear_stdinfo_sparse_flag(record_num)
 
         # Update cluster_map to route these clusters to ext4 file
+        sorted_clusters = sorted(clusters)
+        log(f"  Mapping clusters {sorted_clusters[0]}-{sorted_clusters[-1]} to {os.path.basename(source_path)}")
         offset = 0
-        for cluster in sorted(clusters):
+        for cluster in sorted_clusters:
+            existing = self.cluster_map.get(cluster)
+            if existing and existing != (source_path, offset):
+                log(f"  WARNING: cluster {cluster} already mapped to {existing}, overwriting with ({os.path.basename(source_path)}, {offset})")
             self.cluster_map[cluster] = (source_path, offset)
             offset += self.cluster_size
 
@@ -1070,13 +1074,16 @@ class ClusterMapper:
         # Check for non-resident data (clusters)
         data_runs = self._extract_data_runs(record)
         if data_runs:
-            cluster_count = sum(count for _, count in data_runs)
+            # Count only real clusters (lcn != -1), not sparse holes
+            real_cluster_count = sum(count for lcn, count in data_runs if lcn != -1)
+            has_sparse_runs = any(lcn == -1 for lcn, _ in data_runs)
 
-            # Check if this is a sparse file (allocated clusters << expected clusters)
+            # Check if this is a sparse file (allocated clusters < expected clusters)
             try:
                 file_size = os.path.getsize(source_path)
                 expected_clusters = (file_size + self.cluster_size - 1) // self.cluster_size
-                is_sparse = cluster_count < expected_clusters // 2  # Less than half expected = sparse
+                # Sparse if: has any sparse holes, OR real clusters < half expected
+                is_sparse = has_sparse_runs or real_cluster_count < expected_clusters // 2
             except OSError:
                 is_sparse = False
 
@@ -1086,14 +1093,14 @@ class ClusterMapper:
                 self.mft_record_to_source[record_num] = source_path
                 # Record the allocated clusters so we can detect reads to them
                 for start_cluster, count in data_runs:
-                    if start_cluster > 0:  # Skip sparse runs (cluster 0)
+                    if start_cluster > 0:  # Skip sparse runs
                         for c in range(start_cluster, start_cluster + count):
                             self.sparse_file_clusters[c] = rel_path
-                log(f"  Sparse file: {rel_path} ({cluster_count}/{expected_clusters} clusters, {file_size} bytes)")
+                log(f"  Sparse file: {rel_path} ({real_cluster_count}/{expected_clusters} clusters, {file_size} bytes)")
             else:
                 # Fully allocated file - map clusters
                 if record_num not in self.mft_record_to_source:
-                    log(f"  Mapping new file: {rel_path} (record {record_num}, {cluster_count} clusters)")
+                    log(f"  Mapping new file: {rel_path} (record {record_num}, {real_cluster_count} clusters)")
                 self._map_clusters(data_runs, source_path)
                 self.mft_record_to_source[record_num] = source_path
                 # Remove from sparse tracking if it was there
@@ -1308,7 +1315,11 @@ class ClusterMapper:
         return None
 
     def _parse_data_runs(self, runs: bytes, real_size: int) -> List[Tuple[int, int]]:
-        """Parse data runs into list of (cluster, count) tuples."""
+        """Parse data runs into list of (cluster, count) tuples.
+
+        Sparse runs (holes) are included with cluster=-1 so that
+        _map_clusters can correctly calculate file offsets.
+        """
         result = []
         pos = 0
         current_lcn = 0
@@ -1333,6 +1344,9 @@ class ClusterMapper:
                 pos += off_size
                 current_lcn += run_offset
                 result.append((current_lcn, run_length))
+            else:
+                # Sparse run (hole) - no offset field means no physical allocation
+                result.append((-1, run_length))
 
         return result
 
@@ -1342,19 +1356,27 @@ class ClusterMapper:
         if os.path.isfile(path):
             return path
 
-        for root, dirs, files in os.walk(self.source_dir):
+        for root, dirs, files in os.walk(self.source_dir, followlinks=True):
             if filename in files:
                 return os.path.join(root, filename)
 
         return None
 
     def _map_clusters(self, data_runs: List[Tuple[int, int]], source_path: str):
-        """Map clusters from data runs to source file offsets."""
+        """Map clusters from data runs to source file offsets.
+
+        Sparse runs (lcn=-1) advance file_offset but don't create mappings,
+        so real clusters get the correct offset into the source file.
+        """
         if source_path not in self.source_to_clusters:
             self.source_to_clusters[source_path] = set()
 
         file_offset = 0
         for lcn, count in data_runs:
+            if lcn == -1:
+                # Sparse run - advance offset but don't map
+                file_offset += count * self.cluster_size
+                continue
             for i in range(count):
                 cluster = lcn + i
                 self.cluster_map[cluster] = (source_path, file_offset)
@@ -1738,6 +1760,9 @@ class ClusterMapper:
         # Read each INDX block
         current_vcn = 0
         for start_cluster, count in data_runs:
+            if start_cluster == -1:  # Skip sparse runs
+                current_vcn += count
+                continue
             for i in range(count):
                 cluster = start_cluster + i
                 cluster_offset = cluster * self.cluster_size
@@ -1842,6 +1867,8 @@ class ClusterMapper:
 
                     # Flatten data runs to get all cluster numbers
                     for start_cluster, count in data_runs:
+                        if start_cluster == -1:  # Skip sparse runs
+                            continue
                         for i in range(count):
                             clusters.append(start_cluster + i)
                     break  # Found INDEX_ALLOCATION, done
@@ -2820,6 +2847,10 @@ class ClusterMapper:
                     # Non-resident file: copy data from image clusters to ext4
                     with open(source_path, 'wb') as f:
                         for start_cluster, num_clusters in data_runs:
+                            if start_cluster == -1:
+                                # Sparse run - write zeros to maintain offsets
+                                f.write(b'\x00' * num_clusters * self.cluster_size)
+                                continue
                             for i in range(num_clusters):
                                 cluster = start_cluster + i
                                 cluster_offset = cluster * self.cluster_size
