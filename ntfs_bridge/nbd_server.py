@@ -131,6 +131,7 @@ class NBDServer:
             # Remove timeout for main I/O loop - nbd clients may be idle
             sock.settimeout(None)
 
+            self._req_count = 0
             req_count = 0
             while True:
                 try:
@@ -293,6 +294,11 @@ class NBDServer:
             log(f"Bad magic: {magic:x}")
             return False
 
+        cmd_names = {0: 'READ', 1: 'WRITE', 2: 'DISC', 3: 'FLUSH', 4: 'TRIM'}
+        cmd_name = cmd_names.get(cmd, f'UNKNOWN({cmd})')
+
+        self._req_count += 1
+
         error = 0
         data = b''
 
@@ -320,6 +326,7 @@ class NBDServer:
                         error = 5  # EIO
 
             elif cmd == NBD_CMD_DISC:
+                log(f"Client sent DISC command")
                 return False
 
             elif cmd == NBD_CMD_FLUSH:
@@ -337,6 +344,8 @@ class NBDServer:
             error = 5  # EIO
 
         # Send reply
+        if error:
+            log(f"Sending error {error} for {cmd_name} off={offset} len={length}")
         try:
             reply = struct.pack('>IIQ', NBD_REPLY_MAGIC, error, handle)
             sock.sendall(reply)

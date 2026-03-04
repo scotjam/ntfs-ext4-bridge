@@ -47,7 +47,8 @@ class NTFSBridge:
                  lazy_alloc: bool = False,
                  dealloc_timeout: float = 60.0,
                  partitioned: bool = False,
-                 virtual_mode: bool = False):
+                 virtual_mode: bool = False,
+                 overflow_dir=None):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
         self.ntfs_mount = os.path.abspath(ntfs_mount)
@@ -56,6 +57,7 @@ class NTFSBridge:
         self.lazy_alloc = lazy_alloc
         self.dealloc_timeout = dealloc_timeout
         self.partitioned = partitioned
+        self.overflow_dir = overflow_dir
         self.virtual_mode = virtual_mode
 
         self.mapper = None
@@ -106,13 +108,19 @@ class NTFSBridge:
         image_is_fresh = False
         if os.path.exists(self.image_path):
             existing_size_mb = os.path.getsize(self.image_path) // (1024 * 1024)
-            if existing_size_mb < self.image_size_mb:
-                log(f"Existing image too small ({existing_size_mb}MB < {self.image_size_mb}MB), recreating...")
+            # Allow 5% tolerance to avoid recreating on minor source changes
+            min_acceptable = int(self.image_size_mb * 0.95)
+            if existing_size_mb < min_acceptable:
+                log(f"Existing image too small ({existing_size_mb}MB < {min_acceptable}MB needed), recreating...")
                 os.remove(self.image_path)
                 self._create_ntfs_image()
                 image_is_fresh = True
             else:
-                log(f"Using existing image: {self.image_path} ({existing_size_mb}MB)")
+                if existing_size_mb < self.image_size_mb:
+                    log(f"Using existing image (close enough): {existing_size_mb}MB "
+                        f"(ideal: {self.image_size_mb}MB)")
+                else:
+                    log(f"Using existing image: {self.image_path} ({existing_size_mb}MB)")
         else:
             self._create_ntfs_image()
             image_is_fresh = True
@@ -122,7 +130,8 @@ class NTFSBridge:
 
         # Step 3: Initialize ClusterMapper
         log("Initializing ClusterMapper...")
-        self.mapper = ClusterMapper(self.image_path, self.source_dir)
+        self.mapper = ClusterMapper(self.image_path, self.source_dir,
+                                     overflow_dir=self.overflow_dir)
 
         # Step 4: Create LazyAllocator if enabled
         if self.lazy_alloc:
@@ -406,6 +415,7 @@ class NTFSBridge:
 
             log("Populating NTFS image from ext4 source...")
             files_created = 0
+            files_skipped = 0
             dirs_created = 0
 
             for root, dirs, files in os.walk(self.source_dir, followlinks=True):
@@ -431,6 +441,12 @@ class NTFSBridge:
                     source_file = os.path.join(root, f)
                     ntfs_file = os.path.join(tmp_mount, rel_file)
 
+                    # Skip files that already exist on the NTFS mount
+                    # (avoids re-creating sparse files that were already allocated)
+                    if os.path.exists(ntfs_file):
+                        files_skipped += 1
+                        continue
+
                     try:
                         file_size = os.path.getsize(source_file)
 
@@ -447,7 +463,8 @@ class NTFSBridge:
                     except OSError as e:
                         log(f"  Warning: could not create file {rel_file}: {e}")
 
-            log(f"Populated: {dirs_created} dirs, {files_created} files")
+            log(f"Populated: {dirs_created} dirs, {files_created} files"
+                f"{f', {files_skipped} skipped (existing)' if files_skipped else ''}")
 
             # Sync and unmount
             subprocess.run(['sync'], capture_output=True)
@@ -592,6 +609,10 @@ def main():
     parser.add_argument('--virtual', action='store_true',
                         help='Enable virtual file mode for live ext4→NTFS sync '
                              '(synthesizes NTFS entries on-the-fly, no ntfs-3g mount needed)')
+    parser.add_argument('--overflow-dir',
+                        help='Directory for root-level files created by Windows '
+                             '(e.g. System Volume Information). Should be on the data disk. '
+                             'Default: source directory')
 
     args = parser.parse_args()
 
@@ -604,7 +625,8 @@ def main():
         lazy_alloc=args.lazy,
         dealloc_timeout=args.dealloc_timeout,
         partitioned=args.partitioned,
-        virtual_mode=args.virtual
+        virtual_mode=args.virtual,
+        overflow_dir=args.overflow_dir
     )
 
     # Handle signals

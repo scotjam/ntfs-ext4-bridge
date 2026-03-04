@@ -40,9 +40,27 @@ class ClusterMapper:
     of truth for file content.
     """
 
-    def __init__(self, image_path: str, source_dir: str):
+    def __init__(self, image_path: str, source_dir: str,
+                 overflow_dir: Optional[str] = None):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
+
+        # Overflow directory for root-level items not in the source tree
+        # (e.g. System Volume Information, Windows SID folders)
+        if overflow_dir:
+            self.overflow_dir = os.path.abspath(overflow_dir)
+        else:
+            self.overflow_dir = self.source_dir
+        if self.overflow_dir != self.source_dir:
+            os.makedirs(self.overflow_dir, exist_ok=True)
+            log(f"Overflow directory: {self.overflow_dir}")
+
+        # Known top-level entries in the source directory (for root path resolution)
+        self.known_root_entries: Set[str] = set()
+        try:
+            self.known_root_entries = set(os.listdir(self.source_dir))
+        except OSError:
+            pass
 
         # Memory-map the image file for efficient large file handling
         # This avoids loading the entire image into RAM
@@ -247,7 +265,7 @@ class ClusterMapper:
                             result[pos:pos + len(data)] = data
                         # Record read for lazy allocator deallocation timeout
                         if self.lazy_allocator:
-                            rel_path = os.path.relpath(source_path, self.source_dir)
+                            rel_path = self._get_rel_path(source_path)
                             self.lazy_allocator.record_read(rel_path)
                     except OSError:
                         pass  # Keep zeros on error
@@ -970,10 +988,18 @@ class ClusterMapper:
         offset = self.mft_offset
         record_num = 0
 
+        # Determine total MFT records from $MFT $DATA size
+        total_mft_records = self._get_mft_record_count()
+
         # First pass: find all directories
-        while offset + MFT_RECORD_SIZE <= len(self.image):
+        while record_num < total_mft_records and offset + MFT_RECORD_SIZE <= len(self.image):
             record = self.image[offset:offset + MFT_RECORD_SIZE]
-            if record[0:4] != b'FILE':
+            sig = record[0:4]
+            if sig != b'FILE':
+                if sig == b'BAAD' or sig == b'\x00\x00\x00\x00':
+                    offset += MFT_RECORD_SIZE
+                    record_num += 1
+                    continue
                 break
 
             record = self._undo_fixups(bytearray(record))
@@ -989,9 +1015,14 @@ class ClusterMapper:
         offset = self.mft_offset
         record_num = 0
 
-        while offset + MFT_RECORD_SIZE <= len(self.image):
+        while record_num < total_mft_records and offset + MFT_RECORD_SIZE <= len(self.image):
             record = self.image[offset:offset + MFT_RECORD_SIZE]
-            if record[0:4] != b'FILE':
+            sig = record[0:4]
+            if sig != b'FILE':
+                if sig == b'BAAD' or sig == b'\x00\x00\x00\x00':
+                    offset += MFT_RECORD_SIZE
+                    record_num += 1
+                    continue
                 break
 
             record = self._undo_fixups(bytearray(record))
@@ -1002,6 +1033,44 @@ class ClusterMapper:
 
             offset += MFT_RECORD_SIZE
             record_num += 1
+
+    def _get_mft_record_count(self) -> int:
+        """Get total MFT record count from $MFT record 0 $DATA attribute."""
+        record0 = bytearray(self.image[self.mft_offset:self.mft_offset + MFT_RECORD_SIZE])
+        record0 = self._undo_fixups_raw(record0)
+        attr_offset = struct.unpack('<H', record0[20:22])[0]
+        while attr_offset < MFT_RECORD_SIZE - 4:
+            attr_type = struct.unpack('<I', record0[attr_offset:attr_offset + 4])[0]
+            if attr_type == 0xFFFFFFFF:
+                break
+            attr_len = struct.unpack('<I', record0[attr_offset + 4:attr_offset + 8])[0]
+            if attr_len == 0:
+                break
+            if attr_type == 0x80:  # $DATA
+                non_resident = record0[attr_offset + 8]
+                if non_resident:
+                    data_size = struct.unpack('<Q', record0[attr_offset + 48:attr_offset + 56])[0]
+                    count = data_size // MFT_RECORD_SIZE
+                    log(f"MFT has {count} records ({data_size} bytes)")
+                    return count
+            attr_offset += attr_len
+        # Fallback: estimate from image size
+        count = (len(self.image) - self.mft_offset) // MFT_RECORD_SIZE
+        log(f"MFT record count fallback: {count}")
+        return count
+
+    def _undo_fixups_raw(self, record: bytearray) -> bytearray:
+        """Undo USA fixups without logging (for bootstrap use)."""
+        usa_offset = struct.unpack('<H', record[4:6])[0]
+        usa_count = struct.unpack('<H', record[6:8])[0]
+        for i in range(1, usa_count):
+            sector_end = i * 512 - 2
+            if (usa_offset + i * 2 + 2 <= MFT_RECORD_SIZE and
+                    sector_end + 2 <= MFT_RECORD_SIZE):
+                original = struct.unpack('<H',
+                    record[usa_offset + i * 2:usa_offset + i * 2 + 2])[0]
+                struct.pack_into('<H', record, sector_end, original)
+        return record
 
     def _undo_fixups(self, record: bytearray) -> bytearray:
         """Undo USA fixups in an MFT record."""
@@ -1062,7 +1131,7 @@ class ClusterMapper:
         else:
             rel_path = filename
 
-        source_path = os.path.join(self.source_dir, rel_path)
+        source_path = self._resolve_source_path(rel_path)
 
         # Find source file
         if not os.path.isfile(source_path):
@@ -1350,6 +1419,37 @@ class ClusterMapper:
 
         return result
 
+    def _resolve_root_path(self, filename: str) -> str:
+        """Resolve a root-level filename to a base directory.
+
+        Known entries (those present in the source directory at startup)
+        resolve to source_dir. Unknown entries (e.g. System Volume
+        Information, Windows SID folders) resolve to overflow_dir.
+        """
+        if filename in self.known_root_entries:
+            return os.path.join(self.source_dir, filename)
+        return os.path.join(self.overflow_dir, filename)
+
+    def _resolve_source_path(self, rel_path: str) -> str:
+        """Resolve a relative path to a full source path.
+
+        Checks the top-level directory component to determine whether
+        the path belongs in source_dir or overflow_dir.
+        """
+        top_level = rel_path.split(os.sep)[0] if os.sep in rel_path else rel_path
+        if top_level in self.known_root_entries:
+            return os.path.join(self.source_dir, rel_path)
+        return os.path.join(self.overflow_dir, rel_path)
+
+    def _get_rel_path(self, source_path: str) -> str:
+        """Get the relative path from a full source path.
+
+        Handles paths in either source_dir or overflow_dir.
+        """
+        if self.overflow_dir != self.source_dir and source_path.startswith(self.overflow_dir + os.sep):
+            return os.path.relpath(source_path, self.overflow_dir)
+        return os.path.relpath(source_path, self.source_dir)
+
     def _find_source_file(self, filename: str) -> Optional[str]:
         """Find matching file in source directory."""
         path = os.path.join(self.source_dir, filename)
@@ -1389,7 +1489,7 @@ class ClusterMapper:
         self.dir_children.clear()
 
         for record_num, path in self.mft_record_to_source.items():
-            rel_path = os.path.relpath(path, self.source_dir)
+            rel_path = self._get_rel_path(path)
             self.path_to_mft_record[rel_path] = record_num
 
         for record_num, rel_path in self.mft_record_to_dir.items():
@@ -1398,7 +1498,7 @@ class ClusterMapper:
 
         # Build directory children
         for record_num, source_path in self.mft_record_to_source.items():
-            rel_path = os.path.relpath(source_path, self.source_dir)
+            rel_path = self._get_rel_path(source_path)
             parent_path = os.path.dirname(rel_path)
             parent_record = self._get_parent_record(parent_path)
             if parent_record not in self.dir_children:
@@ -2559,6 +2659,8 @@ class ClusterMapper:
             if record_num in self.mft_record_to_dir:
                 self._check_directory_rename(record_num)
             elif record_num not in self.mft_record_to_source:
+                if record_num >= 24:  # Skip system records
+                    log(f"  Pass1: record {record_num} -> _check_new_directory")
                 self._check_new_directory(record_num)
 
         # Pass 2: File operations (deletions, renames, new files, content updates)
@@ -2592,7 +2694,7 @@ class ClusterMapper:
         if not (flags & 0x01):  # Not in use = deleted
             source_path = self.mft_record_to_source.get(record_num)
             if source_path:
-                rel_path = os.path.relpath(source_path, self.source_dir)
+                rel_path = self._get_rel_path(source_path)
 
                 # Check loop prevention
                 if rel_path in self.ext4_sync_in_progress:
@@ -2667,8 +2769,9 @@ class ClusterMapper:
                 self.path_to_mft_record[new_rel_path] = record_num
                 return
 
-            old_path = os.path.join(self.source_dir, old_rel_path)
-            new_path = os.path.join(self.source_dir, new_rel_path)
+            # Resolve old/new paths (may be in overflow_dir for root-level items)
+            old_path = self._resolve_source_path(old_rel_path)
+            new_path = self._resolve_source_path(new_rel_path)
 
             try:
                 if os.path.exists(old_path) and not os.path.exists(new_path):
@@ -2700,7 +2803,7 @@ class ClusterMapper:
 
         # Update mft_record_to_source (file paths)
         for record_num, source_path in list(self.mft_record_to_source.items()):
-            rel_path = os.path.relpath(source_path, self.source_dir)
+            rel_path = self._get_rel_path(source_path)
             if rel_path.startswith(old_prefix) or rel_path == old_dir_path:
                 new_rel = new_dir_path + rel_path[len(old_dir_path):]
                 new_source = os.path.join(self.source_dir, new_rel)
@@ -2737,6 +2840,7 @@ class ClusterMapper:
         """Check if an MFT record is a new directory."""
         record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
         if record_offset + MFT_RECORD_SIZE > len(self.image):
+            log(f"  _check_new_dir({record_num}): beyond image")
             return
 
         record = self._undo_fixups(bytearray(
@@ -2755,6 +2859,7 @@ class ClusterMapper:
         filename, parent_ref = self._extract_filename_and_parent(record)
         if not filename or filename.startswith('$'):
             return
+        log(f"  _check_new_dir({record_num}): {filename} parent={parent_ref & 0xFFFFFFFFFFFF}")
 
         parent_record = parent_ref & 0xFFFFFFFFFFFF
         if parent_record == 5:
@@ -2772,14 +2877,14 @@ class ClusterMapper:
             self.path_to_mft_record[rel_path] = record_num
             return
 
-        source_path = os.path.join(self.source_dir, rel_path)
+        source_path = self._resolve_source_path(rel_path)
         try:
             if not os.path.exists(source_path):
                 self.ntfs_sync_in_progress.add(rel_path)
                 self.ntfs_sync_timestamps[rel_path] = time.time()
                 try:
                     os.makedirs(source_path, exist_ok=True)
-                    log(f"  NEW DIR: {rel_path}")
+                    log(f"  NEW DIR: {rel_path} -> {source_path}")
                 finally:
                     self.ntfs_sync_in_progress.discard(rel_path)
 
@@ -2792,6 +2897,7 @@ class ClusterMapper:
         """Check if an MFT record is a new file."""
         record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
         if record_offset + MFT_RECORD_SIZE > len(self.image):
+            log(f"  _check_new_file({record_num}): beyond image")
             return None
 
         record = self._undo_fixups(bytearray(
@@ -2807,6 +2913,7 @@ class ClusterMapper:
         filename, parent_ref = self._extract_filename_and_parent(record)
         if not filename or filename.startswith('$'):
             return None
+        log(f"  _check_new_file({record_num}): {filename} parent={parent_ref & 0xFFFFFFFFFFFF}")
 
         parent_record = parent_ref & 0xFFFFFFFFFFFF
         if parent_record == 5:
@@ -2817,7 +2924,7 @@ class ClusterMapper:
         else:
             rel_path = filename
 
-        source_path = os.path.join(self.source_dir, rel_path)
+        source_path = self._resolve_source_path(rel_path)
 
         # Check loop prevention
         if rel_path in self.ext4_sync_in_progress:
@@ -2926,10 +3033,10 @@ class ClusterMapper:
             else:
                 new_rel_path = filename
 
-            new_path = os.path.join(self.source_dir, new_rel_path)
+            new_path = self._resolve_source_path(new_rel_path)
 
             if new_path != source_path:
-                old_rel = os.path.relpath(source_path, self.source_dir)
+                old_rel = self._get_rel_path(source_path)
 
                 if os.path.exists(source_path):
                     # File exists at old path - need to rename it
@@ -3000,7 +3107,7 @@ class ClusterMapper:
             self.resident_file_data.pop(record_num, None)
         else:
             # Resident data - extract and write to ext4 if changed
-            rel_path = os.path.relpath(source_path, self.source_dir)
+            rel_path = self._get_rel_path(source_path)
             resident_data = self._extract_resident_data(record)
 
             if resident_data is not None and rel_path not in self.ext4_sync_in_progress:
