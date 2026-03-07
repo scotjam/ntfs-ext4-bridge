@@ -204,6 +204,27 @@ Items redirected to overflow:
 Items that stay in source:
 - Top-level entries that existed when the bridge started (e.g. `Documents`, `KidsMovies`, `KidsTV`)
 
+## Adding Folders to an Existing Volume
+
+### Adding new source folders
+
+Add a symlink in the source directory and restart the bridge:
+
+```bash
+ln -s /srv/.../newdata /export/bridge-source/NewData
+sudo python3 -m ntfs_bridge.bridge --source /export/bridge-source ...
+```
+
+On restart, the bridge checks whether the existing image is large enough (within 5% of the required size). If it is, the image is reused and only the new files are added to NTFS — existing files are skipped, so restart is fast and non-destructive.
+
+If the source has grown beyond 5% of the current image size, the image is recreated from scratch (takes a few minutes for ntfs-3g to populate). All file **data** is safe — it lives on ext4. Only the NTFS metadata image is rebuilt.
+
+### Files written by Windows (overflow directory)
+
+When Windows creates files or folders at the root of the drive (e.g. `System Volume Information`, SID folders, or user-created root-level items), they are stored in the overflow directory on ext4 — not in the source directory.
+
+On restart (image reuse) and on image recreation, the overflow directory is re-populated into the NTFS volume at the root level, so these items survive both scenarios. Windows system files are also recreated automatically by Windows when the drive reconnects.
+
 ## How It Works
 
 1. **Image creation**: ntfs-3g creates an NTFS filesystem with all source files (sparse, no data copied)
