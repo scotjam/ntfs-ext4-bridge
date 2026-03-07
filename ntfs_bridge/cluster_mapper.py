@@ -10,6 +10,7 @@ resident files (data in MFT record → injected from ext4 on reads).
 Supports lazy allocation: large files can start as sparse (no clusters),
 get allocated on first read, and deallocated after a timeout.
 """
+import bisect
 import mmap
 import os
 import struct
@@ -24,9 +25,60 @@ if TYPE_CHECKING:
 MFT_RECORD_SIZE = 1024
 CLUSTER_SIZE = 4096  # Standard NTFS cluster size
 
+# Files with more than this many clusters use run-based mapping to avoid
+# per-cluster dict entries that consume hundreds of MB for large files.
+RUN_MAP_THRESHOLD = 10000  # ~40MB at 4096-byte clusters
+
 
 def log(msg):
     print(f"[ClusterMapper] {msg}", flush=True)
+
+
+def _set_bitmap_bits(bitmap: bytearray, start: int, count: int, value: bool):
+    """Set a range of bitmap bits efficiently using byte-level operations."""
+    if count <= 0 or not bitmap:
+        return
+    end = start + count
+    first_byte = start // 8
+    first_bit = start % 8
+    last_byte = min((end - 1) // 8, len(bitmap) - 1)
+    last_bit = (end - 1) % 8
+
+    if first_byte >= len(bitmap):
+        return
+
+    if first_byte == last_byte:
+        mask = ((1 << count) - 1) << first_bit
+        if value:
+            bitmap[first_byte] |= mask & 0xFF
+        else:
+            bitmap[first_byte] &= (~mask) & 0xFF
+        return
+
+    # First partial byte
+    mid_start = first_byte
+    if first_bit != 0:
+        mask = (0xFF << first_bit) & 0xFF
+        if value:
+            bitmap[first_byte] |= mask
+        else:
+            bitmap[first_byte] &= (~mask) & 0xFF
+        mid_start = first_byte + 1
+
+    # Middle full bytes
+    if last_byte > mid_start:
+        mid_count = last_byte - mid_start
+        if value:
+            bitmap[mid_start:last_byte] = b'\xff' * mid_count
+        else:
+            bitmap[mid_start:last_byte] = b'\x00' * mid_count
+
+    # Last byte
+    mask = (1 << (last_bit + 1)) - 1
+    if value:
+        bitmap[last_byte] |= mask & 0xFF
+    else:
+        bitmap[last_byte] &= (~mask) & 0xFF
 
 
 class ClusterMapper:
@@ -121,9 +173,19 @@ class ClusterMapper:
         # Pending allocation: set of rel_paths currently being allocated
         self._allocating: Set[str] = set()
 
+        # Run-based cluster map for large files (avoids per-cluster dict entries).
+        # Sorted list of (start_cluster, end_cluster_exclusive, source_path, base_file_offset).
+        # Used instead of cluster_map for files with >RUN_MAP_THRESHOLD clusters.
+        self._direct_run_map: List[Tuple[int, int, str, int]] = []
+
         # Bitmap location (found during MFT scan)
         self.bitmap_clusters: List[Tuple[int, int]] = []  # (start_cluster, count)
         self.total_clusters = len(self.image) // self.cluster_size
+
+        # Allocation watermark: highest cluster known to be used + 1.
+        # New allocations start here to avoid fragmented earlier regions.
+        # Set properly after _scan_mft via _map_clusters calls.
+        self._alloc_watermark = max(16, self.mft_cluster + 100)
 
         # Virtual file manager for live ext4→NTFS sync (set by bridge)
         self.virtual_file_manager: Optional['VirtualFileManager'] = None
@@ -179,6 +241,30 @@ class ClusterMapper:
         """Cleanup on deletion."""
         self.close()
 
+    def _run_map_lookup(self, cluster: int) -> Optional[Tuple[str, int]]:
+        """Binary search in _direct_run_map for a cluster.
+
+        Returns (source_path, file_offset) or None.
+        O(log n) in number of runs, not clusters.
+        """
+        if not self._direct_run_map:
+            return None
+        # Find rightmost entry with start <= cluster
+        lo, hi = 0, len(self._direct_run_map)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._direct_run_map[mid][0] <= cluster:
+                lo = mid + 1
+            else:
+                hi = mid
+        idx = lo - 1
+        if idx < 0:
+            return None
+        start, end, path, base_offset = self._direct_run_map[idx]
+        if cluster < end:
+            return (path, base_offset + (cluster - start) * self.cluster_size)
+        return None
+
     # =========================================================================
     # Public interface
     # =========================================================================
@@ -192,6 +278,14 @@ class ClusterMapper:
         For sparse files, triggers lazy allocation on first access.
         For virtual files (ext4 only), synthesizes MFT records and data on-the-fly.
         """
+        # Lock MFT-region reads to prevent torn reads during concurrent writes
+        if self.is_mft_region(offset, length):
+            with self.lock:
+                return self._read_inner(offset, length)
+        return self._read_inner(offset, length)
+
+    def _read_inner(self, offset: int, length: int) -> bytes:
+        """Inner read implementation (caller handles MFT locking)."""
         # Check if this read might be for a sparse file that needs allocation
         self._check_sparse_file_read(offset, length)
 
@@ -272,6 +366,25 @@ class ClusterMapper:
 
                 pos += chunk_len
 
+            elif (run_mapping := self._run_map_lookup(cluster)) is not None:
+                # Read from ext4 source file via run-based map (large files)
+                source_path, file_offset = run_mapping
+                chunk_len = min(remaining, self.cluster_size - cluster_offset)
+                read_offset = file_offset + cluster_offset
+                try:
+                    with open(source_path, 'rb') as f:
+                        f.seek(read_offset)
+                        data = f.read(chunk_len)
+                        if len(data) < chunk_len:
+                            data += b'\x00' * (chunk_len - len(data))
+                        result[pos:pos + len(data)] = data
+                    if self.lazy_allocator:
+                        rel_path = self._get_rel_path(source_path)
+                        self.lazy_allocator.record_read(rel_path)
+                except OSError:
+                    pass  # Keep zeros on error
+                pos += chunk_len
+
             elif byte_offset < len(self.image):
                 # Read from image (metadata)
                 chunk_len = min(remaining, self.cluster_size - cluster_offset,
@@ -350,7 +463,7 @@ class ClusterMapper:
             return
 
         # Check if this read is to a cluster that's not in our cluster_map
-        if cluster in self.cluster_map:
+        if cluster in self.cluster_map or self._run_map_lookup(cluster) is not None:
             return  # Already mapped to a file
 
         # Check if the image has zeros at this location (sparse indicator)
@@ -418,6 +531,14 @@ class ClusterMapper:
         Data cluster writes go to ext4 source files.
         Other metadata writes go to the image.
         """
+        # Lock MFT-region writes to prevent torn writes during concurrent reads
+        if self.is_mft_region(offset, len(data)):
+            with self.lock:
+                return self._write_inner(offset, data)
+        return self._write_inner(offset, data)
+
+    def _write_inner(self, offset: int, data: bytes):
+        """Inner write implementation (caller handles MFT locking)."""
         cluster_size = self.cluster_size
 
         # Check if write affects MFT
@@ -626,6 +747,153 @@ class ClusterMapper:
                 bitmap[byte_idx] &= ~(1 << bit)
         self._write_bitmap(bitmap)
 
+    def _find_free_cluster_runs(self, needed: int, max_runs: int = 60) -> Optional[List[Tuple[int, int]]]:
+        """Find free clusters as runs. Returns list of (start_cluster, count) tuples.
+
+        Args:
+            needed: Total number of clusters needed
+            max_runs: Maximum number of runs (must fit in MFT record)
+
+        Returns:
+            List of (start_cluster, count) tuples, or None if not enough space
+        """
+        if not self.bitmap_clusters:
+            return None
+
+        bitmap = self._read_bitmap()
+
+        # Start search from alloc watermark to skip fragmented earlier regions.
+        # Fall back to beginning if watermark is too close to end of volume.
+        min_start = max(16, self.mft_cluster + 100)
+        if self._alloc_watermark + needed < self.total_clusters:
+            start_search = max(min_start, self._alloc_watermark)
+        else:
+            start_search = min_start  # Not enough room at watermark; scan from start
+
+        # Scan bitmap for free runs
+        free_runs = []  # (start_cluster, length)
+        run_start = -1
+        run_length = 0
+        total_free = 0
+
+        for byte_idx in range(start_search // 8, len(bitmap)):
+            byte_val = bitmap[byte_idx]
+            for bit in range(8):
+                cluster = byte_idx * 8 + bit
+                if cluster < start_search:
+                    continue
+                if cluster >= self.total_clusters:
+                    break
+                if not (byte_val & (1 << bit)):  # Bit 0 = free
+                    if run_length == 0:
+                        run_start = cluster
+                    run_length += 1
+                    total_free += 1
+                    # Fast path: single contiguous block large enough
+                    if run_length >= needed:
+                        return [(run_start, needed)]
+                else:
+                    if run_length > 0:
+                        free_runs.append((run_start, run_length))
+                        run_length = 0
+            if cluster >= self.total_clusters:
+                break
+
+        # Don't forget last run
+        if run_length > 0:
+            free_runs.append((run_start, run_length))
+
+        if total_free < needed:
+            return None
+
+        # Use largest runs first to minimize fragmentation
+        free_runs.sort(key=lambda x: x[1], reverse=True)
+        result = []
+        remaining = needed
+        for start, length in free_runs:
+            if remaining <= 0:
+                break
+            take = min(length, remaining)
+            result.append((start, take))
+            remaining -= take
+            if len(result) >= max_runs and remaining > 0:
+                # Can't fit within max_runs limit
+                log(f"  ERROR: Need more than {max_runs} runs for {needed} clusters")
+                return None
+
+        if remaining > 0:
+            return None
+
+        # Sort by start cluster for sequential I/O
+        result.sort()
+        return result
+
+    def _mark_cluster_runs_used(self, runs: List[Tuple[int, int]]):
+        """Mark runs of clusters as used in the bitmap."""
+        if not self.bitmap_clusters:
+            return
+
+        bitmap = self._read_bitmap()
+        for start, count in runs:
+            _set_bitmap_bits(bitmap, start, count, True)
+        self._write_bitmap(bitmap)
+
+    def _mark_cluster_runs_free(self, runs: List[Tuple[int, int]]):
+        """Mark runs of clusters as free in the bitmap."""
+        if not self.bitmap_clusters:
+            return
+
+        bitmap = self._read_bitmap()
+        for start, count in runs:
+            _set_bitmap_bits(bitmap, start, count, False)
+        self._write_bitmap(bitmap)
+
+    def _max_data_runs_in_record(self, record_num: int) -> int:
+        """Calculate max data runs that fit in this MFT record's $DATA attribute.
+
+        Reads the record, strips non-essential attrs, finds $DATA offset,
+        and calculates available space for data run entries.
+        """
+        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+        record = self._undo_fixups(bytearray(
+            self.image[record_offset:record_offset + MFT_RECORD_SIZE]
+        ))
+
+        if record[:4] != b'FILE':
+            return 60  # Fallback default
+
+        # Strip to get maximum available space
+        record = self._strip_nonessential_attrs(record)
+
+        # Find where $DATA would end (or end marker position)
+        first_attr = struct.unpack('<H', record[20:22])[0]
+        off = first_attr
+        data_attr_off = -1
+
+        while off < MFT_RECORD_SIZE - 8:
+            attr_type = struct.unpack('<I', record[off:off + 4])[0]
+            if attr_type == 0xFFFFFFFF:
+                break
+            attr_len = struct.unpack('<I', record[off + 4:off + 8])[0]
+            if attr_len == 0 or attr_len > MFT_RECORD_SIZE:
+                break
+            name_len = record[off + 9]
+            if attr_type == 0x80 and name_len == 0:
+                data_attr_off = off
+            off += attr_len
+
+        # Available space: from $DATA start to end of record
+        # Non-resident $DATA header = 64 bytes, end marker = 4 bytes, terminator = 1 byte
+        if data_attr_off >= 0:
+            available = MFT_RECORD_SIZE - data_attr_off - 64 - 4 - 1
+        else:
+            # No existing $DATA, use end-of-attrs position
+            available = MFT_RECORD_SIZE - off - 64 - 4 - 1
+
+        # Worst-case per run: 1 (header) + 4 (length) + 5 (offset) = 10 bytes
+        max_runs = max(1, available // 10)
+        return min(max_runs, 60)  # Cap at 60 for safety
+
     def _strip_nonessential_attrs(self, record: bytearray) -> bytearray:
         """Strip non-essential attributes from an MFT record to free space.
 
@@ -768,7 +1036,7 @@ class ClusterMapper:
                     struct.pack_into('<I', new_record, 24, new_used)
 
                     # Apply fixups and write back
-                    self._apply_fixups(new_record)
+                    self._apply_fixups_to_record(new_record)
                     self.image[record_offset:record_offset + MFT_RECORD_SIZE] = new_record
 
                     return True
@@ -776,25 +1044,6 @@ class ClusterMapper:
                 off += attr_len
 
         return False
-
-    def _apply_fixups(self, record: bytearray):
-        """Apply NTFS fixups to an MFT record before writing."""
-        update_seq_off = struct.unpack('<H', record[4:6])[0]
-        update_seq_count = struct.unpack('<H', record[6:8])[0]
-
-        if update_seq_count < 2:
-            return
-
-        # Get the update sequence value
-        seq_val = record[update_seq_off:update_seq_off + 2]
-
-        # Apply to end of each sector
-        for i in range(1, update_seq_count):
-            sector_end = i * 512 - 2
-            # Save current value to update sequence array
-            record[update_seq_off + i * 2:update_seq_off + i * 2 + 2] = record[sector_end:sector_end + 2]
-            # Write sequence value to sector end
-            record[sector_end:sector_end + 2] = seq_val
 
     def allocate_file_direct(self, rel_path: str) -> bool:
         """Allocate clusters for a sparse file directly (no ntfs-3g).
@@ -805,6 +1054,7 @@ class ClusterMapper:
         3. cluster_map (routes reads to ext4 file)
 
         No data is copied - reads will return ext4 content.
+        Uses run-based allocation for efficiency with large files (40GB+).
 
         Returns True if successful.
         """
@@ -818,25 +1068,29 @@ class ClusterMapper:
         if needed_clusters == 0:
             return True  # Empty file, nothing to allocate
 
-        log(f"  Direct alloc: {rel_path} ({needed_clusters} clusters)")
+        # Calculate max runs that fit in this MFT record
+        max_runs = self._max_data_runs_in_record(record_num)
 
-        # Find free clusters
-        clusters = self._find_free_clusters(needed_clusters)
-        if not clusters:
+        log(f"  Direct alloc: {rel_path} ({needed_clusters} clusters, max {max_runs} runs)")
+
+        # Find free clusters as runs (not individual list)
+        runs = self._find_free_cluster_runs(needed_clusters, max_runs)
+        if not runs:
             log(f"  ERROR: Not enough free clusters for {rel_path}")
             return False
 
-        # Mark clusters as used in bitmap
-        self._mark_clusters_used(clusters)
+        log(f"  Found {len(runs)} runs for {needed_clusters} clusters")
 
-        # Build data runs (try to make contiguous runs)
-        from .data_runs import compress_cluster_list
-        data_runs = compress_cluster_list(sorted(clusters))
+        # Mark clusters as used in bitmap (bulk operation)
+        self._mark_cluster_runs_used(runs)
+
+        # Convert (start, count) runs to data_runs format (count, start)
+        data_runs = [(count, start) for start, count in runs]
 
         # Update MFT record with new data runs
         if not self._update_mft_data_runs(record_num, data_runs, file_size):
             # Rollback bitmap changes
-            self._mark_clusters_free(clusters)
+            self._mark_cluster_runs_free(runs)
             log(f"  ERROR: Failed to update MFT for {rel_path}")
             return False
 
@@ -845,16 +1099,20 @@ class ClusterMapper:
         # to read files whose data runs were replaced from sparse to normal.
         self._clear_stdinfo_sparse_flag(record_num)
 
-        # Update cluster_map to route these clusters to ext4 file
-        sorted_clusters = sorted(clusters)
-        log(f"  Mapping clusters {sorted_clusters[0]}-{sorted_clusters[-1]} to {os.path.basename(source_path)}")
-        offset = 0
-        for cluster in sorted_clusters:
-            existing = self.cluster_map.get(cluster)
-            if existing and existing != (source_path, offset):
-                log(f"  WARNING: cluster {cluster} already mapped to {existing}, overwriting with ({os.path.basename(source_path)}, {offset})")
-            self.cluster_map[cluster] = (source_path, offset)
-            offset += self.cluster_size
+        # Update _direct_run_map to route these clusters to ext4 file.
+        # Run-based rather than per-cluster to avoid O(n_clusters) cost for large files.
+        first_cluster = runs[0][0]
+        last_cluster = runs[-1][0] + runs[-1][1] - 1
+        log(f"  Mapping clusters {first_cluster}-{last_cluster} to {os.path.basename(source_path)}")
+        file_offset = 0
+        for start, count in runs:
+            bisect.insort(self._direct_run_map, (start, start + count, source_path, file_offset))
+            file_offset += count * self.cluster_size
+            self._alloc_watermark = max(self._alloc_watermark, start + count)
+
+        # Ensure source_to_clusters has an entry (empty set; runs are in _direct_run_map)
+        if source_path not in self.source_to_clusters:
+            self.source_to_clusters[source_path] = set()
 
         # Remove from sparse_files and sparse_file_clusters
         old_sparse_clusters = [c for c, p in self.sparse_file_clusters.items() if p == rel_path]
@@ -862,15 +1120,10 @@ class ClusterMapper:
             del self.sparse_file_clusters[c]
         del self.sparse_files[rel_path]
 
-        # Populate source_to_clusters so other code can find these mappings
-        if source_path not in self.source_to_clusters:
-            self.source_to_clusters[source_path] = set()
-        self.source_to_clusters[source_path].update(clusters)
-
-        # Track allocated clusters for deallocation
+        # Track allocated runs for deallocation (store runs, not individual clusters)
         if not hasattr(self, '_direct_allocated'):
             self._direct_allocated = {}
-        self._direct_allocated[rel_path] = (source_path, file_size, record_num, clusters)
+        self._direct_allocated[rel_path] = (source_path, file_size, record_num, runs)
 
         log(f"  Direct alloc complete: {rel_path}")
         return True
@@ -879,7 +1132,7 @@ class ClusterMapper:
         """Check if an MFT record belongs to a directly-allocated file."""
         if not hasattr(self, '_direct_allocated'):
             return False
-        for rel_path, (source_path, file_size, rec_num, clusters) in self._direct_allocated.items():
+        for rel_path, (source_path, file_size, rec_num, runs) in self._direct_allocated.items():
             if rec_num == record_num:
                 return True
         return False
@@ -937,20 +1190,29 @@ class ClusterMapper:
         if rel_path not in self._direct_allocated:
             return False
 
-        source_path, file_size, record_num, clusters = self._direct_allocated[rel_path]
+        source_path, file_size, record_num, runs = self._direct_allocated[rel_path]
 
         log(f"  Direct dealloc: {rel_path}")
 
-        # Remove cluster mappings
-        for cluster in clusters:
-            self.cluster_map.pop(cluster, None)
+        # Remove cluster mappings from _direct_run_map (O(runs), not O(clusters))
+        run_starts = {start for start, count in runs}
+        self._direct_run_map = [r for r in self._direct_run_map if r[0] not in run_starts]
+        # Also clean up per-cluster entries that may exist from a prior rescan.
+        # Only do this for small files; large files won't have cluster_map entries.
+        total_clusters = sum(count for _, count in runs)
+        if total_clusters <= RUN_MAP_THRESHOLD:
+            for start, count in runs:
+                for i in range(count):
+                    self.cluster_map.pop(start + i, None)
 
         # Mark clusters as free in bitmap
-        self._mark_clusters_free(clusters)
+        self._mark_cluster_runs_free(runs)
 
         # Restore MFT to sparse (single cluster at end for the \x00 byte)
         # This creates a sparse run followed by one allocated cluster
-        last_cluster = clusters[-1] if clusters else 0
+        # Use last cluster from last run
+        last_run_start, last_run_count = runs[-1]
+        last_cluster = last_run_start + last_run_count - 1
         # Sparse data runs: (cluster_count-1, 0) for sparse, (1, last_cluster) for allocated
         sparse_runs = []
         needed_clusters = (file_size + self.cluster_size - 1) // self.cluster_size
@@ -958,7 +1220,7 @@ class ClusterMapper:
             sparse_runs.append((needed_clusters - 1, 0))  # Sparse run
         sparse_runs.append((1, last_cluster))  # Keep one cluster allocated
 
-        # Actually, for simplicity, let's just mark the last cluster
+        # Mark the last cluster as used
         self._mark_clusters_used([last_cluster])
 
         self._update_mft_data_runs(record_num, sparse_runs, file_size)
@@ -984,6 +1246,7 @@ class ClusterMapper:
         self.source_to_clusters.clear()
         self.mft_record_to_dir.clear()
         self.resident_file_data.clear()
+        self._direct_run_map.clear()
 
         offset = self.mft_offset
         record_num = 0
@@ -997,6 +1260,10 @@ class ClusterMapper:
             sig = record[0:4]
             if sig != b'FILE':
                 if sig == b'BAAD' or sig == b'\x00\x00\x00\x00':
+                    if sig == b'BAAD':
+                        # Zero out BAAD records so Windows doesn't see corrupt fixups
+                        self.image[offset:offset + MFT_RECORD_SIZE] = b'\x00' * MFT_RECORD_SIZE
+                        log(f"  Zeroed BAAD record {record_num}")
                     offset += MFT_RECORD_SIZE
                     record_num += 1
                     continue
@@ -1020,6 +1287,9 @@ class ClusterMapper:
             sig = record[0:4]
             if sig != b'FILE':
                 if sig == b'BAAD' or sig == b'\x00\x00\x00\x00':
+                    if sig == b'BAAD':
+                        self.image[offset:offset + MFT_RECORD_SIZE] = b'\x00' * MFT_RECORD_SIZE
+                        log(f"  Zeroed BAAD record {record_num}")
                     offset += MFT_RECORD_SIZE
                     record_num += 1
                     continue
@@ -1467,9 +1737,30 @@ class ClusterMapper:
 
         Sparse runs (lcn=-1) advance file_offset but don't create mappings,
         so real clusters get the correct offset into the source file.
+
+        Large files (>RUN_MAP_THRESHOLD clusters) use _direct_run_map instead
+        of per-cluster cluster_map entries to avoid O(n) memory/time.
         """
+        total_real = sum(c for lc, c in data_runs if lc != -1)
+
         if source_path not in self.source_to_clusters:
             self.source_to_clusters[source_path] = set()
+
+        if total_real > RUN_MAP_THRESHOLD:
+            # Large file: store runs, not individual clusters
+            file_offset = 0
+            new_entries = []
+            for lcn, count in data_runs:
+                if lcn == -1:
+                    file_offset += count * self.cluster_size
+                    continue
+                new_entries.append((lcn, lcn + count, source_path, file_offset))
+                file_offset += count * self.cluster_size
+                self._alloc_watermark = max(self._alloc_watermark, lcn + count)
+            # Insert maintaining sort order
+            for entry in new_entries:
+                bisect.insort(self._direct_run_map, entry)
+            return
 
         file_offset = 0
         for lcn, count in data_runs:
@@ -1477,6 +1768,7 @@ class ClusterMapper:
                 # Sparse run - advance offset but don't map
                 file_offset += count * self.cluster_size
                 continue
+            self._alloc_watermark = max(self._alloc_watermark, lcn + count)
             for i in range(count):
                 cluster = lcn + i
                 self.cluster_map[cluster] = (source_path, file_offset)
@@ -2714,6 +3006,7 @@ class ClusterMapper:
                         if cluster in self.cluster_map:
                             del self.cluster_map[cluster]
                     del self.source_to_clusters[source_path]
+                self._direct_run_map = [r for r in self._direct_run_map if r[2] != source_path]
 
                 # Delete from ext4
                 if os.path.exists(source_path):
@@ -2818,6 +3111,11 @@ class ClusterMapper:
                         if cluster in self.cluster_map:
                             _, offset = self.cluster_map[cluster]
                             self.cluster_map[cluster] = (new_source, offset)
+                # Update run-based mappings (large files)
+                self._direct_run_map = [
+                    (s, e, new_source if sp == source_path else sp, o)
+                    for s, e, sp, o in self._direct_run_map
+                ]
 
                 # Update resident_file_data
                 if record_num in self.resident_file_data:
@@ -3064,15 +3362,21 @@ class ClusterMapper:
                                     del self.path_to_mft_record[old_rel]
                                 self.path_to_mft_record[new_rel_path] = record_num
 
+                                old_source = source_path
                                 source_path = new_path
                                 self.mft_record_to_source[record_num] = new_path
 
-                                if source_path in self.source_to_clusters:
-                                    clusters = self.source_to_clusters.pop(source_path)
+                                if old_source in self.source_to_clusters:
+                                    clusters = self.source_to_clusters.pop(old_source)
                                     self.source_to_clusters[new_path] = clusters
                                     for cluster in clusters:
                                         if cluster in self.cluster_map:
                                             self.cluster_map[cluster] = (new_path, self.cluster_map[cluster][1])
+                                # Update run-based mappings (large files)
+                                self._direct_run_map = [
+                                    (s, e, new_path if sp == old_source else sp, o)
+                                    for s, e, sp, o in self._direct_run_map
+                                ]
                         except OSError as e:
                             log(f"  Failed to rename file: {e}")
                     else:
@@ -3091,13 +3395,14 @@ class ClusterMapper:
                     source_path = new_path
                     self.mft_record_to_source[record_num] = new_path
 
-        # Remove old cluster mappings
+        # Remove old cluster mappings (both per-cluster and run-based)
         if source_path in self.source_to_clusters:
             old_clusters = self.source_to_clusters[source_path]
             for cluster in old_clusters:
                 if cluster in self.cluster_map:
                     del self.cluster_map[cluster]
             self.source_to_clusters[source_path] = set()
+        self._direct_run_map = [r for r in self._direct_run_map if r[2] != source_path]
 
         # Extract new data runs or handle resident data
         data_runs = self._extract_data_runs(record)

@@ -1,12 +1,10 @@
 # NTFS-Ext4 Bridge
 
-An NBD server that presents ext4 files as an NTFS volume to Windows VMs, enabling Backblaze backup of Linux file servers.
+An NBD server that presents ext4 files as an NTFS volume to Windows VMs.
 
 ## Overview
 
 This bridge allows a Windows VM (running under KVM/QEMU) to see files stored on a Linux ext4 filesystem as a standard NTFS volume. File data is read directly from ext4 source files while NTFS metadata is served from a template image. Changes made in Windows are written back to the ext4 source files.
-
-The primary use case is running Backblaze Personal Backup in a Windows VM to back up a Linux file server, since Backblaze does not support Linux.
 
 ## Features
 
@@ -26,7 +24,7 @@ The primary use case is running Backblaze Personal Backup in a Windows VM to bac
 Windows VM                    Linux Host (KVM)
 ┌──────────────┐              ┌──────────────────────────────────────┐
 │              │              │                                      │
-│  Backblaze   │              │  NTFSBridge (bridge.py)              │
+│  Windows app │              │  NTFSBridge (bridge.py)              │
 │      ↓       │              │    ├── ClusterMapper                 │
 │  NTFS (F:)   │              │    │     ├── MFT scan + tracking     │
 │      ↓       │   NBD/TCP    │    │     ├── cluster_map → ext4      │
