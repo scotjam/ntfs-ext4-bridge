@@ -48,10 +48,12 @@ Windows VM                    Linux Host (KVM)
 - ntfs-3g (for image creation and mounting)
 - nbd-client (for local NBD connection)
 - KVM/QEMU with a Windows VM
+- `pywinrm` (`pip3 install pywinrm`) — optional, for remote management without VNC
 
 ### Windows VM
 - [WNBD driver](https://github.com/cloudbase/wnbd) — presents NBD as a local SCSI disk
 - Network access to host (e.g. via virtio bridge at 192.168.122.1)
+- WinRM enabled — optional, for remote management without VNC
 
 ## Usage
 
@@ -110,6 +112,73 @@ Get-Volume -DriveLetter F
 C:\wnbd.exe unmap ntfs-bridge
 ```
 
+### Remote Management (no VNC required)
+
+You can start the bridge and connect the Windows VM entirely from the Linux host terminal, without opening a VNC session.
+
+#### One-time setup on the Windows VM
+
+Enable WinRM (run once in an elevated PowerShell session inside the VM):
+
+```powershell
+winrm quickconfig -quiet
+# Allow NTLM authentication
+Set-Item WSMan:\localhost\Service\Auth\Ntlm -Value $true
+```
+
+#### One-time setup on the Linux host
+
+```bash
+pip3 install pywinrm
+```
+
+#### Starting the bridge and connecting Windows
+
+```python
+import winrm
+import subprocess
+
+# 1. Start the bridge on the Linux host (run as root)
+# subprocess.Popen(['python3', '-m', 'ntfs_bridge.bridge', '--source', '...', ...])
+
+# 2. Connect to the Windows VM via WinRM
+s = winrm.Session('192.168.122.171', auth=('user', 'password'), transport='ntlm')
+
+# 3. Map the WNBD drive
+r = s.run_cmd('C:\\wnbd.exe', ['map', 'ntfs-bridge', '192.168.122.1', '--port', '10809'])
+
+# 4. Bring the disk online
+s.run_ps('Set-Disk -Number 1 -IsOffline $false; Set-Disk -Number 1 -IsReadOnly $false')
+```
+
+Or as a one-liner from the shell:
+
+```bash
+# Check current WNBD mappings
+python3 -c "
+import winrm
+s = winrm.Session('192.168.122.171', auth=('user', 'password'), transport='ntlm')
+print(s.run_cmd('C:\\\\wnbd.exe', ['list']).std_out.decode())
+"
+
+# Map the drive
+python3 -c "
+import winrm
+s = winrm.Session('192.168.122.171', auth=('user', 'password'), transport='ntlm')
+s.run_cmd('C:\\\\wnbd.exe', ['map', 'ntfs-bridge', '192.168.122.1', '--port', '10809'])
+s.run_ps('Set-Disk -Number 1 -IsOffline \$false; Set-Disk -Number 1 -IsReadOnly \$false')
+print('Done')
+"
+
+# Unmap the drive
+python3 -c "
+import winrm
+s = winrm.Session('192.168.122.171', auth=('user', 'password'), transport='ntlm')
+s.run_cmd('C:\\\\wnbd.exe', ['unmap', 'ntfs-bridge'])
+print('Done')
+"
+```
+
 ### Source Directory Setup
 
 The source directory should contain symlinks to actual data directories:
@@ -146,27 +215,13 @@ Items that stay in source:
 
 ## Known Limitations
 
-- **Very large files (40GB+) may fail** — see [Future Work](#future-work) below
 - **Resident files** — Files smaller than ~700 bytes are stored inline in NTFS MFT records and cannot be mapped to ext4 source files. Content updates to these files are synced via MFT write tracking.
 - **Image recreation** — If the source directory grows beyond 5% of the current image size, the image is recreated on next startup (takes a few minutes for ntfs-3g populate)
 - **Single WNBD connection** — Only one Windows VM should connect at a time
 - **Two always-failing files** — Files with certain special characters in PAR2 filenames fail to create via ntfs-3g (harmless, logged as warnings)
+- **Extreme fragmentation** — If the NTFS image bitmap becomes severely fragmented (e.g. from many alloc/dealloc cycles), very large files may fail to pre-allocate. Recreating the image resolves this.
 
 ## Future Work
-
-### Large file support (40GB+)
-
-Files approximately 40GB or larger currently fail during lazy allocation or read. The root cause is likely related to:
-
-- **Data run encoding limits** — NTFS data runs use variable-length encoding. Very large contiguous allocations may produce data run entries that exceed the space available in a single MFT record's $DATA attribute. The current `allocate_file_direct()` finds free clusters and writes data runs into the MFT record, but doesn't handle attribute list overflow or multi-record MFT entries.
-- **MFT attribute list** — When a file's attributes (including $DATA with its data runs) exceed the ~1KB MFT record size, NTFS uses an $ATTRIBUTE_LIST to split across multiple MFT records. The bridge does not currently create or manage attribute lists.
-- **Bitmap operations at scale** — Finding and marking hundreds of thousands of free clusters (a 40GB file at 64KB clusters = 655,360 clusters) may hit performance or correctness issues in the bitmap scanning code.
-
-Possible approaches:
-1. **Fragment large files** — Allocate in smaller chunks (e.g. 4GB segments) to keep data runs compact
-2. **Attribute list support** — Implement $ATTRIBUTE_LIST creation for files that need multiple MFT records
-3. **Pre-allocation during image creation** — Have ntfs-3g allocate clusters for large files during the initial populate phase (non-sparse), avoiding the need for runtime allocation entirely
-4. **Streaming allocation** — Allocate clusters on-demand as reads progress through the file, rather than all at once
 
 ### Other improvements
 
