@@ -8,6 +8,7 @@ import os
 import socket
 import struct
 import threading
+import time
 import traceback
 import sys
 from typing import Optional, Union, Protocol
@@ -306,7 +307,11 @@ class NBDServer:
             if cmd == NBD_CMD_READ:
                 if length > 16 * 1024 * 1024:
                     log(f"Large read: off={offset} len={length}")
+                t0 = time.monotonic()
                 data = self.mapper.read(offset, length)
+                elapsed = time.monotonic() - t0
+                if elapsed > 5.0:
+                    log(f"SLOW READ: off={offset} len={length} took {elapsed:.1f}s")
                 if len(data) != length:
                     log(f"Read size mismatch: expected {length}, got {len(data)}")
 
@@ -320,7 +325,11 @@ class NBDServer:
                     error = 1  # EPERM
                 else:
                     try:
+                        t0 = time.monotonic()
                         self.mapper.write(offset, write_data)
+                        elapsed = time.monotonic() - t0
+                        if elapsed > 5.0:
+                            log(f"SLOW WRITE: off={offset} len={length} took {elapsed:.1f}s")
                     except Exception as e:
                         log(f"Write error: {e}")
                         error = 5  # EIO
@@ -330,7 +339,11 @@ class NBDServer:
                 return False
 
             elif cmd == NBD_CMD_FLUSH:
+                t0 = time.monotonic()
                 self.mapper.flush()
+                elapsed = time.monotonic() - t0
+                if elapsed > 5.0:
+                    log(f"SLOW FLUSH: took {elapsed:.1f}s")
 
             elif cmd == NBD_CMD_TRIM:
                 pass
