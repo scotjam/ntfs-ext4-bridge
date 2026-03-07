@@ -475,6 +475,54 @@ class NTFSBridge:
             log(f"Populated: {dirs_created} dirs, {files_created} files"
                 f"{f', {files_skipped} skipped (existing)' if files_skipped else ''}")
 
+            # Also populate overflow_dir items at NTFS root
+            # These are root-level items created by Windows (System Volume Information,
+            # SID folders, user files) that survive restarts but were previously lost
+            # on image recreation.
+            if self.overflow_dir and os.path.isdir(self.overflow_dir) and \
+                    os.path.abspath(self.overflow_dir) != os.path.abspath(self.source_dir):
+                overflow_created = 0
+                overflow_skipped = 0
+                for root, dirs, files in os.walk(self.overflow_dir, followlinks=True):
+                    rel_root = os.path.relpath(root, self.overflow_dir)
+
+                    for d in dirs:
+                        if d.startswith('.'):
+                            continue
+                        rel_dir = os.path.join(rel_root, d) if rel_root != '.' else d
+                        ntfs_dir = os.path.join(tmp_mount, rel_dir)
+                        try:
+                            os.makedirs(ntfs_dir, exist_ok=True)
+                        except OSError as e:
+                            log(f"  Warning: could not create overflow dir {rel_dir}: {e}")
+
+                    for f in files:
+                        if f.startswith('.'):
+                            continue
+                        rel_file = os.path.join(rel_root, f) if rel_root != '.' else f
+                        source_file = os.path.join(root, f)
+                        ntfs_file = os.path.join(tmp_mount, rel_file)
+
+                        if os.path.exists(ntfs_file):
+                            overflow_skipped += 1
+                            continue
+
+                        try:
+                            file_size = os.path.getsize(source_file)
+                            if self.lazy_alloc and file_size > 700:
+                                with open(ntfs_file, 'wb'):
+                                    pass
+                                os.truncate(ntfs_file, file_size)
+                            else:
+                                shutil.copy2(source_file, ntfs_file)
+                            overflow_created += 1
+                        except OSError as e:
+                            log(f"  Warning: could not create overflow file {rel_file}: {e}")
+
+                if overflow_created or overflow_skipped:
+                    log(f"Overflow dir: {overflow_created} items restored"
+                        f"{f', {overflow_skipped} skipped (existing)' if overflow_skipped else ''}")
+
             # Sync and unmount
             subprocess.run(['sync'], capture_output=True)
             result = subprocess.run(
