@@ -144,9 +144,15 @@ class NTFSBridge:
 
             # Pre-allocate all sparse files during setup
             # This is fast (no data copy) and ensures ntfs-3g sees allocated files
-            sparse_files = list(self.mapper.sparse_files.keys())
+            # Sort largest files first: they need large contiguous free regions that
+            # will be consumed by smaller files if those are allocated first.
+            sparse_files = sorted(
+                self.mapper.sparse_files.keys(),
+                key=lambda p: self.mapper.sparse_files[p][1],  # file_size
+                reverse=True
+            )
             if sparse_files:
-                log(f"Pre-allocating {len(sparse_files)} sparse files...")
+                log(f"Pre-allocating {len(sparse_files)} sparse files (largest first)...")
                 for rel_path in sparse_files:
                     success = self.mapper.allocate_file_direct(rel_path)
                     if success:
@@ -451,11 +457,14 @@ class NTFSBridge:
                         file_size = os.path.getsize(source_file)
 
                         if self.lazy_alloc and file_size > 700:
-                            # Large file with lazy alloc - create sparse
-                            with open(ntfs_file, 'wb') as nf:
-                                if file_size > 0:
-                                    nf.seek(file_size - 1)
-                                    nf.write(b'\x00')
+                            # Large file with lazy alloc - create truly sparse NTFS entry.
+                            # os.truncate (rather than seek+write) sets the file size in
+                            # the NTFS MFT without allocating any clusters. The seek+write
+                            # approach allocated 1 trailing cluster per file, which with
+                            # thousands of sparse files fragments the NTFS bitmap completely.
+                            with open(ntfs_file, 'wb'):
+                                pass  # Create empty file
+                            os.truncate(ntfs_file, file_size)
                         else:
                             # Small file or no lazy alloc - copy content
                             shutil.copy2(source_file, ntfs_file)
