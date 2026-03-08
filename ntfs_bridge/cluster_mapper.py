@@ -13,6 +13,7 @@ get allocated on first read, and deallocated after a timeout.
 import bisect
 import mmap
 import os
+import shutil
 import struct
 import threading
 import time
@@ -3129,28 +3130,26 @@ class ClusterMapper:
             old_path = self._resolve_source_path(old_rel_path)
             new_path = self._resolve_source_path(new_rel_path)
 
-            try:
-                if os.path.exists(old_path) and not os.path.exists(new_path):
-                    self.ntfs_sync_in_progress.add(new_rel_path)
-                    self.ntfs_sync_in_progress.add(old_rel_path)
-                    now = time.time()
-                    self.ntfs_sync_timestamps[new_rel_path] = now
-                    self.ntfs_sync_timestamps[old_rel_path] = now
-                    try:
-                        os.rename(old_path, new_path)
-                        log(f"  DIR RENAMED: {old_rel_path} -> {new_rel_path}")
-                    finally:
-                        self.ntfs_sync_in_progress.discard(new_rel_path)
-                        self.ntfs_sync_in_progress.discard(old_rel_path)
+            if os.path.exists(old_path) and not os.path.exists(new_path):
+                self.ntfs_sync_in_progress.add(new_rel_path)
+                self.ntfs_sync_in_progress.add(old_rel_path)
+                now = time.time()
+                self.ntfs_sync_timestamps[new_rel_path] = now
+                self.ntfs_sync_timestamps[old_rel_path] = now
+                try:
+                    shutil.move(old_path, new_path)
+                    log(f"  DIR RENAMED: {old_rel_path} -> {new_rel_path}")
+                except OSError as e:
+                    log(f"  Failed to rename dir {old_rel_path}: {e}")
+                finally:
+                    self.ntfs_sync_in_progress.discard(new_rel_path)
+                    self.ntfs_sync_in_progress.discard(old_rel_path)
 
-                # Update all child paths in tracking structures
-                self._update_child_paths_on_dir_rename(old_rel_path, new_rel_path)
-
-                self.mft_record_to_dir[record_num] = new_rel_path
-                self.path_to_mft_record.pop(old_rel_path, None)
-                self.path_to_mft_record[new_rel_path] = record_num
-            except OSError as e:
-                log(f"  Failed to rename dir {old_rel_path}: {e}")
+            # Always update tracking (even on failure) to prevent infinite retry
+            self._update_child_paths_on_dir_rename(old_rel_path, new_rel_path)
+            self.mft_record_to_dir[record_num] = new_rel_path
+            self.path_to_mft_record.pop(old_rel_path, None)
+            self.path_to_mft_record[new_rel_path] = record_num
 
     def _update_child_paths_on_dir_rename(self, old_dir_path: str, new_dir_path: str):
         """Update all child file/dir paths when a parent directory is renamed."""
@@ -3414,13 +3413,15 @@ class ClusterMapper:
                                 self.ntfs_sync_timestamps[new_rel_path] = now
                                 self.ntfs_sync_timestamps[old_rel] = now
                                 try:
-                                    os.rename(source_path, new_path)
+                                    shutil.move(source_path, new_path)
                                     log(f"  FILE RENAMED: {os.path.basename(source_path)} -> {filename}")
+                                except OSError as e:
+                                    log(f"  Failed to rename file: {e}")
                                 finally:
                                     self.ntfs_sync_in_progress.discard(new_rel_path)
                                     self.ntfs_sync_in_progress.discard(old_rel)
 
-                                # Update path_to_mft_record
+                                # Update path_to_mft_record (always, to prevent retry)
                                 if old_rel in self.path_to_mft_record:
                                     del self.path_to_mft_record[old_rel]
                                 self.path_to_mft_record[new_rel_path] = record_num
@@ -3440,8 +3441,6 @@ class ClusterMapper:
                                     (s, e, new_path if sp == old_source else sp, o)
                                     for s, e, sp, o in self._direct_run_map
                                 ]
-                        except OSError as e:
-                            log(f"  Failed to rename file: {e}")
                     else:
                         # Update tracking even if not doing fs rename
                         if old_rel in self.path_to_mft_record:
