@@ -29,6 +29,64 @@ CLUSTER_SIZE = 4096  # Standard NTFS cluster size
 # per-cluster dict entries that consume hundreds of MB for large files.
 RUN_MAP_THRESHOLD = 10000  # ~40MB at 4096-byte clusters
 
+# Size of the in-RAM hot cache for the NTFS image metadata region.
+# All NTFS metadata (MFT, bitmap, boot sector) lives within the first few MB.
+# Keeping 64MB in RAM prevents page fault stalls when the underlying disk is
+# under heavy I/O load from other processes.
+_HOT_CACHE_SIZE = 64 * 1024 * 1024  # 64 MB
+
+
+class _HotImageCache:
+    """RAM-backed cache over a mmap for the NTFS image metadata region.
+
+    The first HOT_SIZE bytes are kept in a bytearray so reads and writes
+    never block on disk I/O. Beyond HOT_SIZE the underlying mmap is used
+    directly (these are data-cluster regions that are rarely accessed).
+
+    flush() writes the hot bytearray back to the mmap and syncs to disk.
+    """
+
+    def __init__(self, mm: mmap.mmap, hot_size: int):
+        self._mm = mm
+        self._hot_size = min(hot_size, len(mm))
+        log(f"Loading {self._hot_size // (1024 * 1024)}MB image metadata into RAM...")
+        self._hot = bytearray(mm[:self._hot_size])
+        log("Image metadata cached (reads/writes are now RAM-speed)")
+
+    def __len__(self) -> int:
+        return len(self._mm)
+
+    def __getitem__(self, s: slice) -> bytes:
+        start = s.start if s.start is not None else 0
+        stop = s.stop if s.stop is not None else len(self._mm)
+        if stop <= self._hot_size:
+            return bytes(self._hot[start:stop])
+        if start >= self._hot_size:
+            return self._mm[start:stop]
+        # Spans boundary
+        return bytes(self._hot[start:self._hot_size]) + self._mm[self._hot_size:stop]
+
+    def __setitem__(self, s: slice, value: bytes):
+        start = s.start if s.start is not None else 0
+        stop = s.stop if s.stop is not None else start + len(value)
+        if stop <= self._hot_size:
+            self._hot[start:stop] = value
+        elif start >= self._hot_size:
+            self._mm[start:stop] = value
+        else:
+            # Spans boundary
+            hot_end = self._hot_size
+            self._hot[start:hot_end] = value[:hot_end - start]
+            self._mm[hot_end:stop] = value[hot_end - start:]
+
+    def flush(self):
+        """Flush hot cache to mmap and sync to disk."""
+        self._mm[:self._hot_size] = bytes(self._hot)
+        self._mm.flush(0, self._hot_size)
+
+    def close(self):
+        self._mm.close()
+
 
 def log(msg):
     print(f"[ClusterMapper] {msg}", flush=True)
@@ -114,10 +172,14 @@ class ClusterMapper:
         except OSError:
             pass
 
-        # Memory-map the image file for efficient large file handling
-        # This avoids loading the entire image into RAM
+        # Memory-map the image file, then wrap with a hot RAM cache.
+        # The hot cache keeps the first 64MB in a bytearray so NTFS metadata
+        # reads/writes are RAM-speed and never stall on disk I/O.
         self._image_file = open(image_path, 'r+b')
-        self.image = mmap.mmap(self._image_file.fileno(), 0)
+        self.image = _HotImageCache(
+            mmap.mmap(self._image_file.fileno(), 0),
+            _HOT_CACHE_SIZE,
+        )
 
         # Parse boot sector
         boot = self.image[0:512]
@@ -231,6 +293,7 @@ class ClusterMapper:
     def close(self):
         """Close the memory-mapped image file."""
         if hasattr(self, 'image') and self.image:
+            self.image.flush()
             self.image.close()
             self.image = None
         if hasattr(self, '_image_file') and self._image_file:
