@@ -268,9 +268,45 @@ On restart (image reuse) and on image recreation, the overflow directory is re-p
 - Subsequent restarts reuse the image and skip existing files (should be fast)
 - Pre-allocation of sparse files runs in the background and doesn't block serving
 
+### WNBD disconnects
+
+WNBD presents the NBD device as a SCSI disk. Windows Storport enforces a mandatory I/O timeout on SCSI devices (30 seconds by default). If the bridge takes longer than this to reply to any request, WNBD sends a disconnect command.
+
+**Increase the WNBD I/O timeout** (run once in the Windows VM, as Administrator):
+
+```powershell
+C:\wnbd.exe set-config --disk-name ntfs-bridge --io-req-max-outstanding-reqs 128 --io-req-timeout 120
+```
+
+**Root cause of slow replies:** The NTFS image file is memory-mapped. If the host is under memory pressure, the kernel may evict image pages from RAM. The next access triggers a page fault and blocks until the disk responds — which can take 30–50 s on a loaded disk. The bridge pre-loads the NTFS metadata region (MFT, bitmap, boot sector) into a RAM buffer at startup (`_HotImageCache`) to eliminate this stall for the common case.
+
+**If disconnects still occur**, check the bridge log for `SLOW READ`/`SLOW WRITE` lines showing which requests are taking too long.
+
+**After an unexpected disconnect** (especially if Windows reports NTFS errors), run an online check before resuming:
+
+```powershell
+Repair-Volume -DriveLetter F -Scan
+```
+
+A mid-write disconnect can leave MFT records in an inconsistent state. CHKDSK corrects these without dismounting the volume.
+
 ### WNBD disconnects after ~90 requests
 - Ensure only one bridge process is running (`ps aux | grep ntfs_bridge`)
 - Kill any stale processes before restarting
+
+### Unexpected files appearing at the NTFS root
+
+After a bad disconnect mid-write, NTFS MFT records can be left in an inconsistent state. One symptom is that files whose parent directory record was corrupted appear to move to the filesystem root. The sync daemon sees these as new root-level items and copies them into the overflow directory. On the next bridge restart, the overflow population step restores them to the NTFS root — and the cycle repeats until the corruption is fixed.
+
+**Fix:**
+1. Run `Repair-Volume` (see above) to correct the MFT records
+2. Remove the ghost copies from the overflow directory (the originals on ext4 are unaffected)
+
+After these two steps the cycle is broken. Files will not reappear unless another mid-write disconnect corrupts the MFT again.
+
+### Cross-device rename failures (Recycle Bin / renames to overflow dir)
+
+When Windows deletes a root-level item that maps to the source directory (by moving it to the Recycle Bin), the bridge detects the rename and tries to move the corresponding ext4 file. If the source directory and overflow directory are on different filesystems, `os.rename` fails. The bridge uses `shutil.move` to handle this correctly (copy + delete across devices). If the move still fails, tracking is updated so the operation is not retried on every MFT scan.
 
 ### Source directory running out of space
 - Use `--overflow-dir` pointing to a disk with free space
