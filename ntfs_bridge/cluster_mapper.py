@@ -13,10 +13,12 @@ get allocated on first read, and deallocated after a timeout.
 import bisect
 import mmap
 import os
+import queue
 import shutil
 import struct
 import threading
 import time
+import traceback
 from typing import Dict, List, Tuple, Optional, Set, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -210,6 +212,13 @@ class ClusterMapper:
 
         # Thread safety
         self.lock = threading.RLock()
+
+        # Background MFT sync queue: write() puts (offset, data) here so that
+        # the NBD reply goes out immediately; ext4 operations run asynchronously.
+        self._mft_queue: queue.Queue = queue.Queue()
+        _t = threading.Thread(target=self._mft_worker, daemon=True,
+                              name="MFTSyncWorker")
+        _t.start()
 
         # Loop prevention sets (shared with SyncDaemon)
         self.ext4_sync_in_progress: Set[str] = set()
@@ -591,23 +600,118 @@ class ClusterMapper:
     def write(self, offset: int, data: bytes):
         """Write bytes to the virtual volume.
 
-        MFT writes update the image and trigger re-parsing.
-        Data cluster writes go to ext4 source files.
+        MFT writes update the image immediately (so NTFS stays consistent) and
+        queue the ext4 sync to a background thread so the NBD reply goes out
+        without waiting for slow filesystem operations.
+        Data cluster writes go to ext4 source files synchronously.
         Other metadata writes go to the image.
         """
-        # Lock MFT-region writes to prevent torn writes during concurrent reads
         if self.is_mft_region(offset, len(data)):
             with self.lock:
-                return self._write_inner(offset, data)
-        return self._write_inner(offset, data)
+                # Phase 1 (fast): write MFT data to image so NTFS sees it
+                self._mft_write_to_image(offset, data)
+            # Phase 2 (slow): sync changes to ext4 in background thread
+            self._mft_queue.put((offset, bytes(data)))
+        else:
+            self._write_inner(offset, data)
+
+    def _mft_write_to_image(self, offset: int, data: bytes):
+        """Write MFT record data to the image (fast path, called under self.lock).
+
+        Only updates the image bytes. The ext4 sync is done separately by
+        _mft_sync_ext4_passes() running in the background worker thread.
+        """
+        rel_offset = offset - self.mft_offset
+        if rel_offset < 0:
+            data = data[-rel_offset:]
+            rel_offset = 0
+
+        start_record = rel_offset // MFT_RECORD_SIZE
+        end_offset = rel_offset + len(data)
+        end_record = (end_offset + MFT_RECORD_SIZE - 1) // MFT_RECORD_SIZE
+
+        log(f"MFT write: records {start_record}-{end_record - 1}")
+
+        template_offset = self.mft_offset + rel_offset
+        if template_offset + len(data) <= len(self.image):
+            for record_num in range(start_record, end_record):
+                if record_num in self.dir_indx_clusters:
+                    continue
+                rec_start = record_num * MFT_RECORD_SIZE - rel_offset
+                rec_end = rec_start + MFT_RECORD_SIZE
+                if rec_start < 0:
+                    rec_start = 0
+                if rec_end > len(data):
+                    rec_end = len(data)
+                if rec_start < rec_end:
+                    tpl_start = template_offset + rec_start
+                    self.image[tpl_start:tpl_start + (rec_end - rec_start)] = data[rec_start:rec_end]
+
+    def _mft_worker(self):
+        """Background thread: drain the MFT write queue and sync changes to ext4.
+
+        Runs one write at a time (FIFO) so rename sequences stay ordered.
+        Acquires self.lock only briefly around metadata reads/writes; releases
+        it before slow filesystem operations so concurrent reads are not blocked.
+        """
+        while True:
+            offset, data = self._mft_queue.get()
+            try:
+                self._mft_sync_ext4_passes(offset, data)
+            except Exception as e:
+                log(f"MFT sync worker error: {e}")
+                traceback.print_exc()
+            finally:
+                self._mft_queue.task_done()
+
+    def _mft_sync_ext4_passes(self, offset: int, data: bytes):
+        """Two-pass ext4 sync for an MFT write (called from background thread).
+
+        Called without self.lock held. Each sub-method acquires self.lock only
+        for brief metadata reads/writes, releasing it before slow ext4 operations.
+        """
+        rel_offset = offset - self.mft_offset
+        if rel_offset < 0:
+            data = data[-rel_offset:]
+            rel_offset = 0
+
+        start_record = rel_offset // MFT_RECORD_SIZE
+        end_offset = rel_offset + len(data)
+        end_record = (end_offset + MFT_RECORD_SIZE - 1) // MFT_RECORD_SIZE
+
+        # Pass 1: Directory operations (renames and new directories)
+        for record_num in range(start_record, end_record):
+            with self.lock:
+                in_dir = record_num in self.mft_record_to_dir
+                in_source = record_num in self.mft_record_to_source
+            if in_dir:
+                self._check_directory_rename(record_num)
+            elif not in_source:
+                if record_num >= 24:
+                    log(f"  Pass1: record {record_num} -> _check_new_directory")
+                self._check_new_directory(record_num)
+
+        # Pass 2: File operations (deletions, renames, new files, content updates)
+        for record_num in range(start_record, end_record):
+            with self.lock:
+                in_source = record_num in self.mft_record_to_source
+                in_dir = record_num in self.mft_record_to_dir
+                is_direct = self._is_directly_allocated(record_num)
+            if in_source:
+                if is_direct:
+                    continue
+                if not self._check_file_deleted(record_num):
+                    self._reparse_mft_record(record_num)
+            elif not in_dir:
+                self._check_new_file(record_num)
 
     def _write_inner(self, offset: int, data: bytes):
-        """Inner write implementation (caller handles MFT locking)."""
+        """Inner write implementation for non-MFT writes."""
         cluster_size = self.cluster_size
 
-        # Check if write affects MFT
+        # MFT region is handled by write() via _mft_write_to_image + queue
         if self.is_mft_region(offset, len(data)):
-            self._handle_mft_write(offset, data)
+            return
 
         # Route each cluster-aligned chunk
         pos = 0
@@ -1238,7 +1342,7 @@ class ClusterMapper:
                         # Write directly to image (flags are in first 512 bytes,
                         # so fixups don't affect this offset)
                         abs_offset = record_offset + flags_off
-                        struct.pack_into('<I', self.image, abs_offset, new_flags)
+                        self.image[abs_offset:abs_offset + 4] = struct.pack('<I', new_flags)
                 return
 
             off += attr_len
@@ -2978,147 +3082,103 @@ class ClusterMapper:
         write_end = offset + length
         return not (write_end <= self.mft_offset or offset >= mft_end)
 
-    def _handle_mft_write(self, offset: int, data: bytes):
-        """Handle a write to the MFT region - re-parse affected records."""
-        rel_offset = offset - self.mft_offset
-        if rel_offset < 0:
-            data = data[-rel_offset:]
-            rel_offset = 0
-
-        start_record = rel_offset // MFT_RECORD_SIZE
-        end_offset = rel_offset + len(data)
-        end_record = (end_offset + MFT_RECORD_SIZE - 1) // MFT_RECORD_SIZE
-
-        log(f"MFT write: records {start_record}-{end_record - 1}")
-
-        # Update image with new MFT data (skip managed dir records)
-        template_offset = self.mft_offset + rel_offset
-        if template_offset + len(data) <= len(self.image):
-            for record_num in range(start_record, end_record):
-                if record_num in self.dir_indx_clusters:
-                    continue
-                rec_start = record_num * MFT_RECORD_SIZE - rel_offset
-                rec_end = rec_start + MFT_RECORD_SIZE
-                if rec_start < 0:
-                    rec_start = 0
-                if rec_end > len(data):
-                    rec_end = len(data)
-                if rec_start < rec_end:
-                    tpl_start = template_offset + rec_start
-                    self.image[tpl_start:tpl_start + (rec_end - rec_start)] = data[rec_start:rec_end]
-
-        # Two-pass processing: directories first, then files
-        # This ensures parent paths are up-to-date before processing child files
-
-        # Pass 1: Directory operations (renames and new directories)
-        for record_num in range(start_record, end_record):
-            if record_num in self.mft_record_to_dir:
-                self._check_directory_rename(record_num)
-            elif record_num not in self.mft_record_to_source:
-                if record_num >= 24:  # Skip system records
-                    log(f"  Pass1: record {record_num} -> _check_new_directory")
-                self._check_new_directory(record_num)
-
-        # Pass 2: File operations (deletions, renames, new files, content updates)
-        for record_num in range(start_record, end_record):
-            if record_num in self.mft_record_to_source:
-                # Skip reparse for directly-allocated files — their cluster
-                # mappings are authoritative and ntfs-3g metadata writes
-                # (access time updates etc.) must not disturb them.
-                if self._is_directly_allocated(record_num):
-                    continue
-                # Known file - check for deletion first, then reparse
-                if not self._check_file_deleted(record_num):
-                    self._reparse_mft_record(record_num)
-            elif record_num not in self.mft_record_to_dir:
-                self._check_new_file(record_num)
-
     def _check_file_deleted(self, record_num: int) -> bool:
         """Check if a tracked file's MFT record was marked as deleted.
 
+        Called from the background MFT sync thread (self.lock NOT held).
         Returns True if file was deleted.
         """
-        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
-        if record_offset + MFT_RECORD_SIZE > len(self.image):
-            return False
+        with self.lock:
+            record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+            if record_offset + MFT_RECORD_SIZE > len(self.image):
+                return False
 
-        record = self.image[record_offset:record_offset + MFT_RECORD_SIZE]
-        if record[0:4] != b'FILE':
-            return False
+            record = self.image[record_offset:record_offset + MFT_RECORD_SIZE]
+            if record[0:4] != b'FILE':
+                return False
 
-        flags = struct.unpack('<H', record[22:24])[0]
-        if not (flags & 0x01):  # Not in use = deleted
+            flags = struct.unpack('<H', record[22:24])[0]
+            if flags & 0x01:  # Still in use - not deleted
+                return False
+
             source_path = self.mft_record_to_source.get(record_num)
-            if source_path:
-                rel_path = self._get_rel_path(source_path)
+            if not source_path:
+                return True
 
-                # Check loop prevention
-                if rel_path in self.ext4_sync_in_progress:
-                    log(f"  Skipping delete (ext4 sync in progress): {rel_path}")
-                    # Still clean up tracking
-                    del self.mft_record_to_source[record_num]
-                    self.resident_file_data.pop(record_num, None)
-                    self.path_to_mft_record.pop(rel_path, None)
-                    return True
+            rel_path = self._get_rel_path(source_path)
 
-                # Remove tracking
+            if rel_path in self.ext4_sync_in_progress:
+                log(f"  Skipping delete (ext4 sync in progress): {rel_path}")
                 del self.mft_record_to_source[record_num]
                 self.resident_file_data.pop(record_num, None)
                 self.path_to_mft_record.pop(rel_path, None)
-                if source_path in self.source_to_clusters:
-                    for cluster in self.source_to_clusters[source_path]:
-                        if cluster in self.cluster_map:
-                            del self.cluster_map[cluster]
-                    del self.source_to_clusters[source_path]
-                self._direct_run_map = [r for r in self._direct_run_map if r[2] != source_path]
-
-                # Delete from ext4
-                if os.path.exists(source_path):
-                    self.ntfs_sync_in_progress.add(rel_path)
-                    self.ntfs_sync_timestamps[rel_path] = time.time()
-                    try:
-                        os.remove(source_path)
-                        log(f"  FILE DELETED: {rel_path}")
-                    except OSError as e:
-                        log(f"  Failed to delete {rel_path}: {e}")
-                    finally:
-                        self.ntfs_sync_in_progress.discard(rel_path)
-
                 return True
 
-        return False
+            # Remove tracking before releasing lock
+            del self.mft_record_to_source[record_num]
+            self.resident_file_data.pop(record_num, None)
+            self.path_to_mft_record.pop(rel_path, None)
+            if source_path in self.source_to_clusters:
+                for cluster in self.source_to_clusters[source_path]:
+                    if cluster in self.cluster_map:
+                        del self.cluster_map[cluster]
+                del self.source_to_clusters[source_path]
+            self._direct_run_map = [r for r in self._direct_run_map if r[2] != source_path]
+            do_delete = os.path.exists(source_path)
+            if do_delete:
+                self.ntfs_sync_in_progress.add(rel_path)
+                self.ntfs_sync_timestamps[rel_path] = time.time()
+
+        # Delete from ext4 without holding lock (os.remove is fast but avoid blocking)
+        if do_delete:
+            try:
+                os.remove(source_path)
+                log(f"  FILE DELETED: {rel_path}")
+            except OSError as e:
+                log(f"  Failed to delete {rel_path}: {e}")
+            finally:
+                with self.lock:
+                    self.ntfs_sync_in_progress.discard(rel_path)
+
+        return True
 
     def _check_directory_rename(self, record_num: int):
-        """Check if a tracked directory was renamed."""
-        old_rel_path = self.mft_record_to_dir.get(record_num)
-        if not old_rel_path:
-            return
+        """Check if a tracked directory was renamed.
 
-        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
-        if record_offset + MFT_RECORD_SIZE > len(self.image):
-            return
+        Called from the background MFT sync thread (self.lock NOT held).
+        Acquires self.lock for metadata reads/writes; releases it before
+        the slow shutil.move filesystem operation.
+        """
+        with self.lock:
+            old_rel_path = self.mft_record_to_dir.get(record_num)
+            if not old_rel_path:
+                return
 
-        record = self._undo_fixups(bytearray(
-            self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
+            record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+            if record_offset + MFT_RECORD_SIZE > len(self.image):
+                return
 
-        if record[0:4] != b'FILE':
-            return
+            record = self._undo_fixups(bytearray(
+                self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
+            if record[0:4] != b'FILE':
+                return
 
-        filename, parent_ref = self._extract_filename_and_parent(record)
-        if not filename:
-            return
+            filename, parent_ref = self._extract_filename_and_parent(record)
+            if not filename:
+                return
 
-        parent_record = parent_ref & 0xFFFFFFFFFFFF
-        if parent_record == 5:
-            new_rel_path = filename
-        elif parent_record in self.mft_record_to_dir:
-            parent_path = self.mft_record_to_dir[parent_record]
-            new_rel_path = os.path.join(parent_path, filename) if parent_path else filename
-        else:
-            new_rel_path = filename
+            parent_record = parent_ref & 0xFFFFFFFFFFFF
+            if parent_record == 5:
+                new_rel_path = filename
+            elif parent_record in self.mft_record_to_dir:
+                parent_path = self.mft_record_to_dir[parent_record]
+                new_rel_path = os.path.join(parent_path, filename) if parent_path else filename
+            else:
+                new_rel_path = filename
 
-        if new_rel_path != old_rel_path:
-            # Check loop prevention
+            if new_rel_path == old_rel_path:
+                return
+
             if new_rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping dir rename (ext4 sync in progress): {new_rel_path}")
                 self.mft_record_to_dir[record_num] = new_rel_path
@@ -3126,26 +3186,29 @@ class ClusterMapper:
                 self.path_to_mft_record[new_rel_path] = record_num
                 return
 
-            # Resolve old/new paths (may be in overflow_dir for root-level items)
             old_path = self._resolve_source_path(old_rel_path)
             new_path = self._resolve_source_path(new_rel_path)
-
-            if os.path.exists(old_path) and not os.path.exists(new_path):
+            do_move = os.path.exists(old_path) and not os.path.exists(new_path)
+            if do_move:
                 self.ntfs_sync_in_progress.add(new_rel_path)
                 self.ntfs_sync_in_progress.add(old_rel_path)
                 now = time.time()
                 self.ntfs_sync_timestamps[new_rel_path] = now
                 self.ntfs_sync_timestamps[old_rel_path] = now
-                try:
-                    shutil.move(old_path, new_path)
-                    log(f"  DIR RENAMED: {old_rel_path} -> {new_rel_path}")
-                except OSError as e:
-                    log(f"  Failed to rename dir {old_rel_path}: {e}")
-                finally:
-                    self.ntfs_sync_in_progress.discard(new_rel_path)
-                    self.ntfs_sync_in_progress.discard(old_rel_path)
 
-            # Always update tracking (even on failure) to prevent infinite retry
+        # Slow filesystem op outside the lock so reads are not blocked
+        if do_move:
+            try:
+                shutil.move(old_path, new_path)
+                log(f"  DIR RENAMED: {old_rel_path} -> {new_rel_path}")
+            except OSError as e:
+                log(f"  Failed to rename dir {old_rel_path}: {e}")
+
+        # Always update tracking (even on failure) to prevent infinite retry
+        with self.lock:
+            if do_move:
+                self.ntfs_sync_in_progress.discard(new_rel_path)
+                self.ntfs_sync_in_progress.discard(old_rel_path)
             self._update_child_paths_on_dir_rename(old_rel_path, new_rel_path)
             self.mft_record_to_dir[record_num] = new_rel_path
             self.path_to_mft_record.pop(old_rel_path, None)
@@ -3197,155 +3260,160 @@ class ClusterMapper:
                 self.mft_record_to_dir[record_num] = new_rel
 
     def _check_new_directory(self, record_num: int):
-        """Check if an MFT record is a new directory."""
-        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
-        if record_offset + MFT_RECORD_SIZE > len(self.image):
-            log(f"  _check_new_dir({record_num}): beyond image")
-            return
+        """Check if an MFT record is a new directory.
 
-        record = self._undo_fixups(bytearray(
-            self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
+        Called from the background MFT sync thread (self.lock NOT held).
+        """
+        with self.lock:
+            record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+            if record_offset + MFT_RECORD_SIZE > len(self.image):
+                log(f"  _check_new_dir({record_num}): beyond image")
+                return
 
-        if record[0:4] != b'FILE':
-            return
+            record = self._undo_fixups(bytearray(
+                self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
+            if record[0:4] != b'FILE':
+                return
 
-        flags = struct.unpack('<H', record[22:24])[0]
-        if not (flags & 0x01) or not (flags & 0x02):
-            return
+            flags = struct.unpack('<H', record[22:24])[0]
+            if not (flags & 0x01) or not (flags & 0x02):
+                return
+            if record_num in self.mft_record_to_dir:
+                return
 
-        if record_num in self.mft_record_to_dir:
-            return
+            filename, parent_ref = self._extract_filename_and_parent(record)
+            if not filename or filename.startswith('$'):
+                return
+            log(f"  _check_new_dir({record_num}): {filename} parent={parent_ref & 0xFFFFFFFFFFFF}")
 
-        filename, parent_ref = self._extract_filename_and_parent(record)
-        if not filename or filename.startswith('$'):
-            return
-        log(f"  _check_new_dir({record_num}): {filename} parent={parent_ref & 0xFFFFFFFFFFFF}")
+            parent_record = parent_ref & 0xFFFFFFFFFFFF
+            if parent_record == 5:
+                rel_path = filename
+            elif parent_record in self.mft_record_to_dir:
+                parent_path = self.mft_record_to_dir[parent_record]
+                rel_path = os.path.join(parent_path, filename) if parent_path else filename
+            else:
+                rel_path = filename
 
-        parent_record = parent_ref & 0xFFFFFFFFFFFF
-        if parent_record == 5:
-            rel_path = filename
-        elif parent_record in self.mft_record_to_dir:
-            parent_path = self.mft_record_to_dir[parent_record]
-            rel_path = os.path.join(parent_path, filename) if parent_path else filename
-        else:
-            rel_path = filename
+            if rel_path in self.ext4_sync_in_progress:
+                log(f"  Skipping new dir (ext4 sync in progress): {rel_path}")
+                self.mft_record_to_dir[record_num] = rel_path
+                self.path_to_mft_record[rel_path] = record_num
+                return
 
-        # Check loop prevention
-        if rel_path in self.ext4_sync_in_progress:
-            log(f"  Skipping new dir (ext4 sync in progress): {rel_path}")
-            self.mft_record_to_dir[record_num] = rel_path
-            self.path_to_mft_record[rel_path] = record_num
-            return
-
-        source_path = self._resolve_source_path(rel_path)
-        try:
-            if not os.path.exists(source_path):
+            source_path = self._resolve_source_path(rel_path)
+            do_create = not os.path.exists(source_path)
+            if do_create:
                 self.ntfs_sync_in_progress.add(rel_path)
                 self.ntfs_sync_timestamps[rel_path] = time.time()
-                try:
-                    os.makedirs(source_path, exist_ok=True)
-                    log(f"  NEW DIR: {rel_path} -> {source_path}")
-                finally:
-                    self.ntfs_sync_in_progress.discard(rel_path)
 
-            self.mft_record_to_dir[record_num] = rel_path
-            self.path_to_mft_record[rel_path] = record_num
+        # os.makedirs outside lock (fast but avoids holding lock during I/O)
+        try:
+            if do_create:
+                os.makedirs(source_path, exist_ok=True)
+                log(f"  NEW DIR: {rel_path} -> {source_path}")
         except OSError as e:
             log(f"  Failed to create dir {rel_path}: {e}")
+        finally:
+            with self.lock:
+                if do_create:
+                    self.ntfs_sync_in_progress.discard(rel_path)
+                self.mft_record_to_dir[record_num] = rel_path
+                self.path_to_mft_record[rel_path] = record_num
 
     def _check_new_file(self, record_num: int) -> Optional[str]:
-        """Check if an MFT record is a new file."""
-        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
-        if record_offset + MFT_RECORD_SIZE > len(self.image):
-            log(f"  _check_new_file({record_num}): beyond image")
-            return None
+        """Check if an MFT record is a new file.
 
-        record = self._undo_fixups(bytearray(
-            self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
+        Called from the background MFT sync thread (self.lock NOT held).
+        """
+        with self.lock:
+            record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+            if record_offset + MFT_RECORD_SIZE > len(self.image):
+                log(f"  _check_new_file({record_num}): beyond image")
+                return None
 
-        if record[0:4] != b'FILE':
-            return None
+            record = self._undo_fixups(bytearray(
+                self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
+            if record[0:4] != b'FILE':
+                return None
 
-        flags = struct.unpack('<H', record[22:24])[0]
-        if not (flags & 0x01) or (flags & 0x02):
-            return None
+            flags = struct.unpack('<H', record[22:24])[0]
+            if not (flags & 0x01) or (flags & 0x02):
+                return None
 
-        filename, parent_ref = self._extract_filename_and_parent(record)
-        if not filename or filename.startswith('$'):
-            return None
-        log(f"  _check_new_file({record_num}): {filename} parent={parent_ref & 0xFFFFFFFFFFFF}")
+            filename, parent_ref = self._extract_filename_and_parent(record)
+            if not filename or filename.startswith('$'):
+                return None
+            log(f"  _check_new_file({record_num}): {filename} parent={parent_ref & 0xFFFFFFFFFFFF}")
 
-        parent_record = parent_ref & 0xFFFFFFFFFFFF
-        if parent_record == 5:
-            rel_path = filename
-        elif parent_record in self.mft_record_to_dir:
-            parent_path = self.mft_record_to_dir[parent_record]
-            rel_path = os.path.join(parent_path, filename) if parent_path else filename
-        else:
-            rel_path = filename
+            parent_record = parent_ref & 0xFFFFFFFFFFFF
+            if parent_record == 5:
+                rel_path = filename
+            elif parent_record in self.mft_record_to_dir:
+                parent_path = self.mft_record_to_dir[parent_record]
+                rel_path = os.path.join(parent_path, filename) if parent_path else filename
+            else:
+                rel_path = filename
 
-        source_path = self._resolve_source_path(rel_path)
+            source_path = self._resolve_source_path(rel_path)
 
-        # Check loop prevention
-        if rel_path in self.ext4_sync_in_progress:
-            log(f"  Skipping new file (ext4 sync in progress): {rel_path}")
-            self.mft_record_to_source[record_num] = source_path
-            self._track_file_data(record, record_num, source_path)
-            return None
+            if rel_path in self.ext4_sync_in_progress:
+                log(f"  Skipping new file (ext4 sync in progress): {rel_path}")
+                self.mft_record_to_source[record_num] = source_path
+                self._track_file_data(record, record_num, source_path)
+                return None
 
-        if os.path.exists(source_path):
-            # File already exists - just track and map
-            self.mft_record_to_source[record_num] = source_path
-            self._track_file_data(record, record_num, source_path)
-            return None
+            if os.path.exists(source_path):
+                self.mft_record_to_source[record_num] = source_path
+                self._track_file_data(record, record_num, source_path)
+                return None
 
-        # Create the file in ext4
+            # Snapshot data runs under lock before releasing for I/O
+            data_runs = self._extract_data_runs(record)
+            resident_data = None if data_runs else self._extract_resident_data(record)
+            file_size = self._extract_file_size(record) if data_runs else None
+            self.ntfs_sync_in_progress.add(rel_path)
+            self.ntfs_sync_timestamps[rel_path] = time.time()
+
+        # Create the file in ext4 (outside lock)
         try:
             parent_dir = os.path.dirname(source_path)
             if parent_dir and not os.path.exists(parent_dir):
                 os.makedirs(parent_dir, exist_ok=True)
 
-            self.ntfs_sync_in_progress.add(rel_path)
-            self.ntfs_sync_timestamps[rel_path] = time.time()
-            try:
-                # Check for non-resident data first - need to copy from image
-                data_runs = self._extract_data_runs(record)
-                if data_runs:
-                    # Non-resident file: copy data from image clusters to ext4
-                    with open(source_path, 'wb') as f:
-                        for start_cluster, num_clusters in data_runs:
-                            if start_cluster == -1:
-                                # Sparse run - write zeros to maintain offsets
-                                f.write(b'\x00' * num_clusters * self.cluster_size)
-                                continue
-                            for i in range(num_clusters):
-                                cluster = start_cluster + i
-                                cluster_offset = cluster * self.cluster_size
-                                if cluster_offset + self.cluster_size <= len(self.image):
-                                    f.write(self.image[cluster_offset:cluster_offset + self.cluster_size])
-                    # Get actual file size from MFT and truncate
-                    file_size = self._extract_file_size(record)
-                    if file_size is not None and file_size > 0:
-                        with open(source_path, 'r+b') as f:
-                            f.truncate(file_size)
-                    log(f"  NEW FILE (non-resident): {rel_path} ({file_size} bytes)")
-                else:
-                    # Resident file: extract inline data
-                    resident_data = self._extract_resident_data(record)
-                    with open(source_path, 'wb') as f:
-                        if resident_data:
-                            f.write(resident_data)
-                    log(f"  NEW FILE: {rel_path}")
-            finally:
+            if data_runs:
+                with open(source_path, 'wb') as f:
+                    for start_cluster, num_clusters in data_runs:
+                        if start_cluster == -1:
+                            f.write(b'\x00' * num_clusters * self.cluster_size)
+                            continue
+                        for i in range(num_clusters):
+                            cluster = start_cluster + i
+                            cluster_offset = cluster * self.cluster_size
+                            with self.lock:
+                                chunk = self.image[cluster_offset:cluster_offset + self.cluster_size] \
+                                    if cluster_offset + self.cluster_size <= len(self.image) else b''
+                            f.write(chunk)
+                if file_size is not None and file_size > 0:
+                    with open(source_path, 'r+b') as f:
+                        f.truncate(file_size)
+                log(f"  NEW FILE (non-resident): {rel_path} ({file_size} bytes)")
+            else:
+                with open(source_path, 'wb') as f:
+                    if resident_data:
+                        f.write(resident_data)
+                log(f"  NEW FILE: {rel_path}")
+
+            with self.lock:
                 self.ntfs_sync_in_progress.discard(rel_path)
-
-            self.mft_record_to_source[record_num] = source_path
-            self.path_to_mft_record[rel_path] = record_num
-            self._track_file_data(record, record_num, source_path)
-
+                self.mft_record_to_source[record_num] = source_path
+                self.path_to_mft_record[rel_path] = record_num
+                self._track_file_data(record, record_num, source_path)
             return source_path
         except OSError as e:
             log(f"  Failed to create file {rel_path}: {e}")
+            with self.lock:
+                self.ntfs_sync_in_progress.discard(rel_path)
             return None
 
     def _track_file_data(self, record: bytearray, record_num: int, source_path: str):
@@ -3366,142 +3434,160 @@ class ClusterMapper:
                 }
 
     def _reparse_mft_record(self, record_num: int):
-        """Re-parse an MFT record for cluster updates, renames, and resident data."""
-        source_path = self.mft_record_to_source.get(record_num)
-        if not source_path:
-            return
+        """Re-parse an MFT record for cluster updates, renames, and resident data.
 
-        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
-        if record_offset + MFT_RECORD_SIZE > len(self.image):
-            return
+        Called from the background MFT sync thread (self.lock NOT held).
+        Acquires self.lock for metadata reads/writes; releases it before
+        slow filesystem operations (shutil.move, file I/O).
+        """
+        # --- Phase 1: read state under lock, decide what to do ---
+        with self.lock:
+            source_path = self.mft_record_to_source.get(record_num)
+            if not source_path:
+                return
 
-        record = self._undo_fixups(bytearray(
-            self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
+            record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+            if record_offset + MFT_RECORD_SIZE > len(self.image):
+                return
 
-        if record[0:4] != b'FILE':
-            return
+            record = self._undo_fixups(bytearray(
+                self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
+            if record[0:4] != b'FILE':
+                return
 
-        # Check for rename
-        filename, parent_ref = self._extract_filename_and_parent(record)
-        if filename:
-            parent_record = parent_ref & 0xFFFFFFFFFFFF
-            if parent_record == 5:
-                new_rel_path = filename
-            elif parent_record in self.mft_record_to_dir:
-                parent_path = self.mft_record_to_dir[parent_record]
-                new_rel_path = os.path.join(parent_path, filename) if parent_path else filename
-            else:
-                new_rel_path = filename
+            # Determine rename
+            do_move = False
+            old_source = source_path
+            new_path = source_path
+            old_rel = new_rel_path = self._get_rel_path(source_path)
 
-            new_path = self._resolve_source_path(new_rel_path)
+            filename, parent_ref = self._extract_filename_and_parent(record)
+            if filename:
+                parent_record = parent_ref & 0xFFFFFFFFFFFF
+                if parent_record == 5:
+                    new_rel_path = filename
+                elif parent_record in self.mft_record_to_dir:
+                    parent_path = self.mft_record_to_dir[parent_record]
+                    new_rel_path = os.path.join(parent_path, filename) if parent_path else filename
+                else:
+                    new_rel_path = filename
 
-            if new_path != source_path:
-                old_rel = self._get_rel_path(source_path)
+                new_path = self._resolve_source_path(new_rel_path)
 
-                if os.path.exists(source_path):
-                    # File exists at old path - need to rename it
-                    if new_rel_path not in self.ext4_sync_in_progress:
-                        try:
-                            parent_dir = os.path.dirname(new_path)
-                            if parent_dir and not os.path.exists(parent_dir):
-                                os.makedirs(parent_dir, exist_ok=True)
-
+                if new_path != source_path:
+                    if os.path.exists(source_path):
+                        if new_rel_path not in self.ext4_sync_in_progress:
                             if not os.path.exists(new_path):
+                                do_move = True
                                 self.ntfs_sync_in_progress.add(new_rel_path)
                                 self.ntfs_sync_in_progress.add(old_rel)
                                 now = time.time()
                                 self.ntfs_sync_timestamps[new_rel_path] = now
                                 self.ntfs_sync_timestamps[old_rel] = now
-                                try:
-                                    shutil.move(source_path, new_path)
-                                    log(f"  FILE RENAMED: {os.path.basename(source_path)} -> {filename}")
-                                except OSError as e:
-                                    log(f"  Failed to rename file: {e}")
-                                finally:
-                                    self.ntfs_sync_in_progress.discard(new_rel_path)
-                                    self.ntfs_sync_in_progress.discard(old_rel)
-
-                                # Update path_to_mft_record (always, to prevent retry)
+                            else:
+                                # Target already exists - just update tracking
                                 if old_rel in self.path_to_mft_record:
                                     del self.path_to_mft_record[old_rel]
                                 self.path_to_mft_record[new_rel_path] = record_num
-
-                                old_source = source_path
                                 source_path = new_path
                                 self.mft_record_to_source[record_num] = new_path
-
-                                if old_source in self.source_to_clusters:
-                                    clusters = self.source_to_clusters.pop(old_source)
-                                    self.source_to_clusters[new_path] = clusters
-                                    for cluster in clusters:
-                                        if cluster in self.cluster_map:
-                                            self.cluster_map[cluster] = (new_path, self.cluster_map[cluster][1])
-                                # Update run-based mappings (large files)
-                                self._direct_run_map = [
-                                    (s, e, new_path if sp == old_source else sp, o)
-                                    for s, e, sp, o in self._direct_run_map
-                                ]
+                        else:
+                            # Sync in progress - just update tracking
+                            if old_rel in self.path_to_mft_record:
+                                del self.path_to_mft_record[old_rel]
+                            self.path_to_mft_record[new_rel_path] = record_num
+                            source_path = new_path
+                            self.mft_record_to_source[record_num] = new_path
                     else:
-                        # Update tracking even if not doing fs rename
+                        # File doesn't exist at old path - just update tracking
                         if old_rel in self.path_to_mft_record:
                             del self.path_to_mft_record[old_rel]
                         self.path_to_mft_record[new_rel_path] = record_num
                         source_path = new_path
                         self.mft_record_to_source[record_num] = new_path
-                else:
-                    # File doesn't exist at old path - parent dir may have been renamed
-                    # Just update tracking to new path
-                    if old_rel in self.path_to_mft_record:
-                        del self.path_to_mft_record[old_rel]
-                    self.path_to_mft_record[new_rel_path] = record_num
-                    source_path = new_path
-                    self.mft_record_to_source[record_num] = new_path
 
-        # Remove old cluster mappings (both per-cluster and run-based)
-        if source_path in self.source_to_clusters:
-            old_clusters = self.source_to_clusters[source_path]
-            for cluster in old_clusters:
-                if cluster in self.cluster_map:
-                    del self.cluster_map[cluster]
-            self.source_to_clusters[source_path] = set()
-        self._direct_run_map = [r for r in self._direct_run_map if r[2] != source_path]
-
-        # Extract new data runs or handle resident data
-        data_runs = self._extract_data_runs(record)
-        if data_runs:
-            self._map_clusters(data_runs, source_path)
-            # No longer resident
-            self.resident_file_data.pop(record_num, None)
-        else:
-            # Resident data - extract and write to ext4 if changed
-            rel_path = self._get_rel_path(source_path)
-            resident_data = self._extract_resident_data(record)
-
-            if resident_data is not None and rel_path not in self.ext4_sync_in_progress:
-                # Only write if content actually changed (avoids cascading
-                # rewrites when ntfs-3g flushes neighboring MFT records)
+        # --- Phase 2: slow filesystem op outside the lock ---
+        if do_move:
+            parent_dir = os.path.dirname(new_path)
+            if parent_dir and not os.path.exists(parent_dir):
                 try:
-                    current_data = b''
-                    if os.path.exists(source_path):
-                        with open(source_path, 'rb') as f:
-                            current_data = f.read(len(resident_data) + 1)
-                    if current_data != resident_data:
-                        self.ntfs_sync_in_progress.add(rel_path)
-                        self.ntfs_sync_timestamps[rel_path] = time.time()
-                        try:
-                            with open(source_path, 'wb') as f:
-                                f.write(resident_data)
-                        finally:
-                            self.ntfs_sync_in_progress.discard(rel_path)
-                except OSError as e:
-                    log(f"  Error writing resident data: {e}")
+                    os.makedirs(parent_dir, exist_ok=True)
+                except OSError:
+                    pass
+            try:
+                shutil.move(old_source, new_path)
+                log(f"  FILE RENAMED: {os.path.basename(old_source)} -> {filename}")
+            except OSError as e:
+                log(f"  Failed to rename file: {e}")
 
-            # Update resident tracking
-            resident_loc = self._find_resident_data_location(record, record_num)
-            if resident_loc:
-                self.resident_file_data[record_num] = {
-                    'source_path': source_path,
-                    'val_len_abs': resident_loc[0],
-                    'data_abs': resident_loc[1],
-                    'available': resident_loc[2],
-                }
+            # Update tracking under lock (always, even on failure, to prevent retry)
+            with self.lock:
+                self.ntfs_sync_in_progress.discard(new_rel_path)
+                self.ntfs_sync_in_progress.discard(old_rel)
+                if old_rel in self.path_to_mft_record:
+                    del self.path_to_mft_record[old_rel]
+                self.path_to_mft_record[new_rel_path] = record_num
+                source_path = new_path
+                self.mft_record_to_source[record_num] = new_path
+                if old_source in self.source_to_clusters:
+                    clusters = self.source_to_clusters.pop(old_source)
+                    self.source_to_clusters[new_path] = clusters
+                    for cluster in clusters:
+                        if cluster in self.cluster_map:
+                            self.cluster_map[cluster] = (new_path, self.cluster_map[cluster][1])
+                self._direct_run_map = [
+                    (s, e, new_path if sp == old_source else sp, o)
+                    for s, e, sp, o in self._direct_run_map
+                ]
+
+        # --- Phase 3: cluster remapping and resident data update under lock ---
+        with self.lock:
+            # Remove old cluster mappings
+            if source_path in self.source_to_clusters:
+                old_clusters = self.source_to_clusters[source_path]
+                for cluster in old_clusters:
+                    if cluster in self.cluster_map:
+                        del self.cluster_map[cluster]
+                self.source_to_clusters[source_path] = set()
+            self._direct_run_map = [r for r in self._direct_run_map if r[2] != source_path]
+
+            # Extract new data runs or resident data
+            data_runs = self._extract_data_runs(record)
+            if data_runs:
+                self._map_clusters(data_runs, source_path)
+                self.resident_file_data.pop(record_num, None)
+            else:
+                rel_path = self._get_rel_path(source_path)
+                resident_data = self._extract_resident_data(record)
+                do_write_resident = (
+                    resident_data is not None and
+                    rel_path not in self.ext4_sync_in_progress
+                )
+                if do_write_resident:
+                    self.ntfs_sync_in_progress.add(rel_path)
+                    self.ntfs_sync_timestamps[rel_path] = time.time()
+
+                resident_loc = self._find_resident_data_location(record, record_num)
+                if resident_loc:
+                    self.resident_file_data[record_num] = {
+                        'source_path': source_path,
+                        'val_len_abs': resident_loc[0],
+                        'data_abs': resident_loc[1],
+                        'available': resident_loc[2],
+                    }
+
+        # Write resident data outside lock (fast, but avoids holding lock during I/O)
+        if do_write_resident:
+            try:
+                current_data = b''
+                if os.path.exists(source_path):
+                    with open(source_path, 'rb') as f:
+                        current_data = f.read(len(resident_data) + 1)
+                if current_data != resident_data:
+                    with open(source_path, 'wb') as f:
+                        f.write(resident_data)
+            except OSError as e:
+                log(f"  Error writing resident data: {e}")
+            finally:
+                with self.lock:
+                    self.ntfs_sync_in_progress.discard(rel_path)
