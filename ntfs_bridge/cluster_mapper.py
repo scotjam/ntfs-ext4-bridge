@@ -1109,7 +1109,12 @@ class ClusterMapper:
 
     def _update_mft_data_runs(self, record_num: int, data_runs: List[Tuple[int, int]],
                                file_size: int) -> bool:
-        """Update the $DATA attribute's data runs in an MFT record.
+        """Update or insert the $DATA attribute's data runs in an MFT record.
+
+        Handles two cases:
+        - REPLACE: existing $DATA attribute is found and updated with new data runs
+        - INSERT: no $DATA attribute exists (e.g. os.truncate failed during populate)
+          and a new one is inserted before the end-of-attributes marker
 
         Args:
             record_num: MFT record number
@@ -1127,18 +1132,48 @@ class ClusterMapper:
         if record[:4] != b'FILE':
             return False
 
-        # Try with original record first, strip attributes if it doesn't fit
+        runs_bytes = encode_data_runs(data_runs)
+        total_clusters = sum(c for c, _ in data_runs)
+        alloc_size = total_clusters * self.cluster_size
+
+        # Build non-resident $DATA attribute.
+        # name_offset=64 is required by NTFS spec for no-name non-resident attrs;
+        # setting it to 0 causes CHKDSK to flag the attribute as corrupt.
+        attr_size = 64 + len(runs_bytes)
+        attr_size_aligned = (attr_size + 7) & ~7  # 8-byte aligned
+
+        new_attr = bytearray(attr_size_aligned)
+        struct.pack_into('<I', new_attr, 0, 0x80)   # Type: $DATA
+        struct.pack_into('<I', new_attr, 4, attr_size_aligned)  # Length
+        new_attr[8] = 1                              # Non-resident flag
+        new_attr[9] = 0                              # Name length (0 = unnamed)
+        struct.pack_into('<H', new_attr, 10, 64)    # Name offset (64 = standard for no name)
+        struct.pack_into('<H', new_attr, 12, 0)     # Flags
+        struct.pack_into('<H', new_attr, 14, 0)     # Instance ID
+        struct.pack_into('<Q', new_attr, 16, 0)     # Start VCN
+        struct.pack_into('<Q', new_attr, 24, total_clusters - 1 if total_clusters > 0 else 0)  # End VCN
+        struct.pack_into('<H', new_attr, 32, 64)    # Data runs offset
+        struct.pack_into('<H', new_attr, 34, 0)     # Compression unit
+        struct.pack_into('<I', new_attr, 36, 0)     # Padding
+        struct.pack_into('<Q', new_attr, 40, alloc_size)   # Allocated size
+        struct.pack_into('<Q', new_attr, 48, file_size)    # Real size
+        struct.pack_into('<Q', new_attr, 56, file_size)    # Initialized size
+        new_attr[64:64 + len(runs_bytes)] = runs_bytes
+
+        # Try with original record first, then with stripped attrs if it doesn't fit
         for attempt in range(2):
             if attempt == 1:
                 record = self._strip_nonessential_attrs(record)
 
-            # Find the $DATA attribute
             first_attr = struct.unpack('<H', record[20:22])[0]
             off = first_attr
+            found_data_off = None    # offset of existing $DATA attr (REPLACE case)
+            end_of_attrs_off = None  # offset of 0xFFFFFFFF marker (INSERT case)
 
             while off < MFT_RECORD_SIZE - 8:
                 attr_type = struct.unpack('<I', record[off:off + 4])[0]
                 if attr_type == 0xFFFFFFFF:
+                    end_of_attrs_off = off
                     break
 
                 attr_len = struct.unpack('<I', record[off + 4:off + 8])[0]
@@ -1147,69 +1182,60 @@ class ClusterMapper:
 
                 name_len = record[off + 9]
                 if attr_type == 0x80 and name_len == 0:  # $DATA (unnamed)
-                    # Encode new data runs
-                    runs_bytes = encode_data_runs(data_runs)
-
-                    # Check if we need non-resident attribute
-                    total_clusters = sum(c for c, _ in data_runs)
-                    alloc_size = total_clusters * self.cluster_size
-
-                    # Build non-resident $DATA attribute
-                    # Attribute header (non-resident): 64 bytes header + data runs
-                    attr_size = 64 + len(runs_bytes)
-                    attr_size_aligned = (attr_size + 7) & ~7  # 8-byte aligned
-
-                    new_attr = bytearray(attr_size_aligned)
-                    struct.pack_into('<I', new_attr, 0, 0x80)  # Type
-                    struct.pack_into('<I', new_attr, 4, attr_size_aligned)  # Length
-                    new_attr[8] = 1  # Non-resident flag
-                    new_attr[9] = 0  # Name length
-                    struct.pack_into('<H', new_attr, 10, 0)  # Name offset
-                    struct.pack_into('<H', new_attr, 12, 0)  # Flags
-                    struct.pack_into('<H', new_attr, 14, 0)  # Instance
-                    struct.pack_into('<Q', new_attr, 16, 0)  # Start VCN
-                    struct.pack_into('<Q', new_attr, 24, total_clusters - 1 if total_clusters > 0 else 0)  # End VCN
-                    struct.pack_into('<H', new_attr, 32, 64)  # Data runs offset
-                    struct.pack_into('<H', new_attr, 34, 0)  # Compression unit
-                    struct.pack_into('<I', new_attr, 36, 0)  # Padding
-                    struct.pack_into('<Q', new_attr, 40, alloc_size)  # Allocated size
-                    struct.pack_into('<Q', new_attr, 48, file_size)  # Real size
-                    struct.pack_into('<Q', new_attr, 56, file_size)  # Initialized size
-                    # Runs start at offset 64
-                    new_attr[64:64 + len(runs_bytes)] = runs_bytes
-
-                    # Replace old attribute with new one
-                    old_attr_len = attr_len
-                    # Use record's used_size to avoid grabbing trailing zeros
-                    used_size = struct.unpack('<I', record[24:28])[0]
-                    if used_size > MFT_RECORD_SIZE or used_size < off + old_attr_len:
-                        used_size = MFT_RECORD_SIZE  # Fallback
-                    remaining = record[off + old_attr_len:used_size]
-
-                    # Check if new content fits in MFT_RECORD_SIZE
-                    new_used = off + len(new_attr) + len(remaining)
-                    if new_used > MFT_RECORD_SIZE:
-                        if attempt == 0:
-                            break  # Try again after stripping attrs
-                        log(f"  ERROR: Data runs too large for MFT record ({new_used} > {MFT_RECORD_SIZE})")
-                        return False
-
-                    # Build new record at fixed MFT_RECORD_SIZE
-                    new_record = bytearray(MFT_RECORD_SIZE)
-                    new_record[:off] = record[:off]
-                    new_record[off:off + len(new_attr)] = new_attr
-                    new_record[off + len(new_attr):off + len(new_attr) + len(remaining)] = remaining
-
-                    # Update used size in record header
-                    struct.pack_into('<I', new_record, 24, new_used)
-
-                    # Apply fixups and write back
-                    self._apply_fixups_to_record(new_record)
-                    self.image[record_offset:record_offset + MFT_RECORD_SIZE] = new_record
-
-                    return True
+                    found_data_off = off
+                    break
 
                 off += attr_len
+
+            if found_data_off is not None:
+                # REPLACE existing $DATA attribute
+                off = found_data_off
+                old_attr_len = struct.unpack('<I', record[off + 4:off + 8])[0]
+                used_size = struct.unpack('<I', record[24:28])[0]
+                if used_size > MFT_RECORD_SIZE or used_size < off + old_attr_len:
+                    used_size = MFT_RECORD_SIZE  # Fallback
+                remaining = record[off + old_attr_len:used_size]
+
+                new_used = off + len(new_attr) + len(remaining)
+                if new_used > MFT_RECORD_SIZE:
+                    if attempt == 0:
+                        continue  # Try again after stripping attrs
+                    log(f"  ERROR: Data runs too large for MFT record ({new_used} > {MFT_RECORD_SIZE})")
+                    return False
+
+                new_record = bytearray(MFT_RECORD_SIZE)
+                new_record[:off] = record[:off]
+                new_record[off:off + len(new_attr)] = new_attr
+                new_record[off + len(new_attr):off + len(new_attr) + len(remaining)] = remaining
+                struct.pack_into('<I', new_record, 24, new_used)
+
+            elif end_of_attrs_off is not None:
+                # INSERT new $DATA before end-of-attrs marker.
+                # This handles records where os.truncate failed during populate,
+                # leaving the MFT record without any $DATA attribute.
+                new_used = end_of_attrs_off + len(new_attr) + 4  # +4 for end marker
+                if new_used > MFT_RECORD_SIZE:
+                    if attempt == 0:
+                        continue  # Try again after stripping attrs
+                    log(f"  ERROR: No room to insert $DATA in MFT record {record_num} "
+                        f"({new_used} > {MFT_RECORD_SIZE})")
+                    return False
+
+                new_record = bytearray(MFT_RECORD_SIZE)
+                new_record[:end_of_attrs_off] = record[:end_of_attrs_off]
+                new_record[end_of_attrs_off:end_of_attrs_off + len(new_attr)] = new_attr
+                # Write end-of-attributes marker
+                struct.pack_into('<I', new_record, end_of_attrs_off + len(new_attr), 0xFFFFFFFF)
+                struct.pack_into('<I', new_record, 24, new_used)
+
+            else:
+                # Could not find $DATA or end-of-attrs marker — record is malformed
+                continue
+
+            # Apply NTFS fixups and write back to hot cache
+            self._apply_fixups_to_record(new_record)
+            self.image[record_offset:record_offset + MFT_RECORD_SIZE] = new_record
+            return True
 
         return False
 
@@ -3541,6 +3567,9 @@ class ClusterMapper:
                 ]
 
         # --- Phase 3: cluster remapping and resident data update under lock ---
+        do_write_resident = False
+        resident_data = None
+        rel_path = None
         with self.lock:
             # Remove old cluster mappings
             if source_path in self.source_to_clusters:
@@ -3552,6 +3581,7 @@ class ClusterMapper:
             self._direct_run_map = [r for r in self._direct_run_map if r[2] != source_path]
 
             # Extract new data runs or resident data
+            do_write_resident = False
             data_runs = self._extract_data_runs(record)
             if data_runs:
                 self._map_clusters(data_runs, source_path)
