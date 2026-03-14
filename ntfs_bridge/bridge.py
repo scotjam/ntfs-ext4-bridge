@@ -94,8 +94,8 @@ class NTFSBridge:
                     file_count += 1
                 except OSError:
                     pass
-        # Add 10% overhead for NTFS metadata + round up to nearest 64MB
-        needed_mb = int((total_bytes * 1.1) / (1024 * 1024)) + 64
+        # Add 25% overhead for NTFS metadata (MFT zone reserves 12.5% by default) + round up to nearest 64MB
+        needed_mb = int((total_bytes * 1.25) / (1024 * 1024)) + 64
         if needed_mb > self.image_size_mb:
             log(f"Auto-sizing image: {total_bytes/(1024**3):.1f}GB in {file_count} files -> {needed_mb}MB virtual image")
             self.image_size_mb = needed_mb
@@ -248,6 +248,19 @@ class NTFSBridge:
                     )
                     self.sync_daemon.start()
                     log("Sync daemon started")
+
+                # Run catch-up populate in background via production mount.
+                # The temp-mount populate may have failed for files in large
+                # directories (EIO from INDX B-tree splits when bitmap is full).
+                # Writing via the production ntfs-3g mount (through NBD) works
+                # fine for those cases, so we do a second pass here.
+                import threading as _threading
+                t = _threading.Thread(
+                    target=self._post_startup_populate,
+                    daemon=True,
+                    name="post-startup-populate"
+                )
+                t.start()
 
         log("="*60)
         log("NTFS-ext4 Bridge is running")
@@ -408,9 +421,12 @@ class NTFSBridge:
                 if fix_result.returncode != 0:
                     log(f"ntfsfix warning: {fix_result.stderr.strip()}")
 
-            # Mount the image with ntfs-3g
+            # Mount the image with ntfs-3g.
+            # Use 'recover' to force read-write even if the volume has a
+            # dirty/scheduled-check flag from allocate_file_direct's direct
+            # NTFS writes (which bypass the ntfs-3g journal).
             result = subprocess.run(
-                ['mount', '-t', 'ntfs-3g', '-o', 'rw,big_writes',
+                ['mount', '-t', 'ntfs-3g', '-o', 'rw,big_writes,recover',
                  self.image_path, tmp_mount],
                 capture_output=True, text=True
             )
@@ -545,6 +561,70 @@ class NTFSBridge:
                 os.rmdir(tmp_mount)
             except OSError:
                 pass
+
+    def _post_startup_populate(self):
+        """Catch-up populate via production ntfs-3g mount.
+
+        The pre-startup temp-mount populate fails with EIO for files in large
+        directories when the NTFS cluster bitmap is full (no room for INDX
+        B-tree splits). The production mount (via NBD) handles these correctly.
+
+        This runs in a background thread after the production mount is active
+        and copies any ext4 source files that are absent from the NTFS volume.
+        """
+        import time as _time
+        # Give the production mount a moment to settle
+        _time.sleep(2)
+
+        log("Post-startup populate: checking for missing files via production mount...")
+        files_created = 0
+        files_failed = 0
+
+        for root, dirs, files in os.walk(self.source_dir, followlinks=True):
+            # Skip hidden directories
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+
+            rel_root = os.path.relpath(root, self.source_dir)
+
+            # Ensure directories exist
+            for d in dirs:
+                rel_dir = os.path.join(rel_root, d) if rel_root != '.' else d
+                ntfs_dir = os.path.join(self.ntfs_mount, rel_dir)
+                try:
+                    os.makedirs(ntfs_dir, exist_ok=True)
+                except OSError:
+                    pass
+
+            for f in files:
+                if f.startswith('.'):
+                    continue
+                rel_file = os.path.join(rel_root, f) if rel_root != '.' else f
+                source_file = os.path.join(root, f)
+                ntfs_file = os.path.join(self.ntfs_mount, rel_file)
+
+                if os.path.exists(ntfs_file):
+                    continue
+
+                try:
+                    file_size = os.path.getsize(source_file)
+                    if self.lazy_alloc and file_size > 700:
+                        with open(ntfs_file, 'wb'):
+                            pass  # Create empty file
+                        os.truncate(ntfs_file, file_size)
+                    else:
+                        shutil.copy2(source_file, ntfs_file)
+                    files_created += 1
+                    if files_created % 50 == 0:
+                        log(f"Post-startup populate: {files_created} files added so far...")
+                except OSError as e:
+                    log(f"  Post-populate warning: could not create {rel_file}: {e}")
+                    files_failed += 1
+
+        if files_created or files_failed:
+            log(f"Post-startup populate complete: {files_created} files added"
+                f"{f', {files_failed} failed' if files_failed else ''}")
+        else:
+            log("Post-startup populate: no missing files found")
 
     def _connect_and_mount(self) -> bool:
         """Connect nbd-client and mount ntfs-3g."""
