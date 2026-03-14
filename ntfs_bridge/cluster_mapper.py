@@ -2068,6 +2068,23 @@ class ClusterMapper:
                         zero_len = zero_end - zero_start
                         result[dst_off:dst_off + zero_len] = b'\x00' * zero_len
 
+            # Restore NTFS USA fixup bytes that may have been overwritten.
+            # Each 512-byte sector in the MFT record must end with the USA
+            # check value (USA[0]) for ntfs-3g to accept the record.
+            # _inject_resident_data can overwrite those bytes (at record
+            # offsets 510-511 and 1022-1023) with ext4 file content.
+            record_abs = self.mft_offset + record_num * MFT_RECORD_SIZE
+            try:
+                usa_off = struct.unpack('<H', bytes(self.image[record_abs + 4: record_abs + 6]))[0]
+                check_val = bytes(self.image[record_abs + usa_off: record_abs + usa_off + 2])
+            except Exception:
+                continue
+            for sector_end in (512, 1024):
+                fixup_abs = record_abs + sector_end - 2  # 510 or 1022
+                if read_offset <= fixup_abs and fixup_abs + 2 <= read_end:
+                    buf_pos = fixup_abs - read_offset
+                    result[buf_pos:buf_pos + 2] = check_val
+
     # =========================================================================
     # Virtual file injection (ext4→NTFS live sync)
     # =========================================================================
