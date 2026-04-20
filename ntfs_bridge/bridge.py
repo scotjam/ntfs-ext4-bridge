@@ -16,6 +16,7 @@ Usage:
         --lazy  # Enable lazy allocation for large files
 """
 import argparse
+import fnmatch
 import os
 import shutil
 import signal
@@ -48,7 +49,8 @@ class NTFSBridge:
                  dealloc_timeout: float = 60.0,
                  partitioned: bool = False,
                  virtual_mode: bool = False,
-                 overflow_dir=None):
+                 overflow_dir=None,
+                 exclude_patterns=None):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
         self.ntfs_mount = os.path.abspath(ntfs_mount)
@@ -59,6 +61,7 @@ class NTFSBridge:
         self.partitioned = partitioned
         self.overflow_dir = overflow_dir
         self.virtual_mode = virtual_mode
+        self.exclude_patterns = list(exclude_patterns) if exclude_patterns else []
 
         self.mapper = None
         self.partition_wrapper = None
@@ -88,7 +91,13 @@ class NTFSBridge:
         total_bytes = 0
         file_count = 0
         for dirpath, dirnames, filenames in os.walk(self.source_dir, followlinks=True):
+            rel_root = os.path.relpath(dirpath, self.source_dir)
+            dirnames[:] = [d for d in dirnames
+                           if not self._should_exclude(os.path.join(rel_root, d) if rel_root != '.' else d)]
             for f in filenames:
+                rel_file = os.path.join(rel_root, f) if rel_root != '.' else f
+                if self._should_exclude(rel_file):
+                    continue
                 try:
                     total_bytes += os.path.getsize(os.path.join(dirpath, f))
                     file_count += 1
@@ -104,29 +113,46 @@ class NTFSBridge:
             self.image_size_mb = 64
             log(f"Adjusted image size to minimum {self.image_size_mb}MB")
 
-        # Step 1: Create NTFS image if it doesn't exist or is too small
+        # Step 1: Create NTFS image if it doesn't exist or is too small.
+        #
+        # IMPORTANT: Never recreate an existing image whose size has decreased
+        # because the source symlinks were partially inaccessible at startup.
+        # Recreating the image generates a new NTFS volume serial → new partition
+        # GUID → Windows loses the F: drive mapping and requires a full VM reboot.
+        #
+        # Safe recreation rules:
+        #   (a) If image does not exist → create it.
+        #   (b) If image exists AND is smaller than the existing image has ever
+        #       been (i.e. needed_mb > existing_size_mb by a large margin that
+        #       cannot be explained by symlink staleness) → recreate only if
+        #       needed_mb > existing_size_mb * 1.5  (source genuinely grew 50%+).
+        #   (c) In all other cases, keep the existing image regardless of whether
+        #       the freshly-calculated needed_mb is smaller than existing.
         image_is_fresh = False
         if os.path.exists(self.image_path):
             existing_size_mb = os.path.getsize(self.image_path) // (1024 * 1024)
-            # Allow 5% tolerance to avoid recreating on minor source changes
-            min_acceptable = int(self.image_size_mb * 0.95)
-            if existing_size_mb < min_acceptable:
-                log(f"Existing image too small ({existing_size_mb}MB < {min_acceptable}MB needed), recreating...")
+            if needed_mb > existing_size_mb * 1.5:
+                # Source has genuinely grown to more than 150% of existing image.
+                log(f"Existing image too small ({existing_size_mb}MB, need {needed_mb}MB for "
+                    f"{file_count} files), recreating...")
                 os.remove(self.image_path)
                 self._create_ntfs_image()
                 image_is_fresh = True
             else:
-                if existing_size_mb < self.image_size_mb:
-                    log(f"Using existing image (close enough): {existing_size_mb}MB "
-                        f"(ideal: {self.image_size_mb}MB)")
-                else:
-                    log(f"Using existing image: {self.image_path} ({existing_size_mb}MB)")
+                log(f"Using existing image: {self.image_path} ({existing_size_mb}MB, "
+                    f"calculated need: {needed_mb}MB for {file_count} files)")
         else:
             self._create_ntfs_image()
             image_is_fresh = True
 
         # Step 2: Populate image from ext4 source
         self._populate_image(needs_fsfix=not image_is_fresh)
+
+        # Step 2b: Fix $Bitmap for INDX clusters that ntfs-3g deallocated on
+        # unmount but whose data runs still exist in the MFT.  Without this,
+        # Windows/ntfs-3g reports those directories as "corrupted and unreadable"
+        # because it finds $INDEX_ALLOC data runs pointing to FREE clusters.
+        self._fix_indx_bitmap()
 
         # Step 3: Initialize ClusterMapper
         log("Initializing ClusterMapper...")
@@ -147,7 +173,8 @@ class NTFSBridge:
             # Sort largest files first: they need large contiguous free regions that
             # will be consumed by smaller files if those are allocated first.
             sparse_files = sorted(
-                self.mapper.sparse_files.keys(),
+                (p for p in self.mapper.sparse_files.keys()
+                 if not self._should_exclude(p)),
                 key=lambda p: self.mapper.sparse_files[p][1],  # file_size
                 reverse=True
             )
@@ -164,6 +191,21 @@ class NTFSBridge:
                     else:
                         log(f"  Warning: Failed to pre-allocate {rel_path}")
 
+                # Flush the mmap to disk and re-run ntfsfix to clear the journal
+                # that ntfs-3g wrote during _populate_image().  Without this,
+                # Windows replays ntfs-3g's journal on first mount and reverts all
+                # the non-resident DATA attributes we just installed back to the
+                # empty-resident state, making the files appear empty/corrupted.
+                log("Flushing image and re-running ntfsfix to clear post-populate journal...")
+                self.mapper.image.flush()
+                fix_result = subprocess.run(
+                    ['ntfsfix', self.image_path],
+                    capture_output=True, text=True
+                )
+                log(f"ntfsfix (post-alloc): {fix_result.stdout.strip()}")
+                if fix_result.returncode != 0:
+                    log(f"ntfsfix warning: {fix_result.stderr.strip()}")
+
             # Register existing allocated files
             for record_num, source_path in self.mapper.mft_record_to_source.items():
                 rel_path = os.path.relpath(source_path, self.source_dir)
@@ -178,6 +220,13 @@ class NTFSBridge:
             )
             self.virtual_file_manager.set_mapper(self.mapper)
             self.mapper.virtual_file_manager = self.virtual_file_manager
+
+        # Step 5b: Fix INDEX_ALLOC data_size for directories where ntfs-3g shrinks
+        # it on unmount but leaves valid INDX blocks beyond data_size.  Done LAST
+        # (after allocate_file_direct and flush) so allocate_file_direct cannot
+        # overwrite the fix via its MFT writes.  Writes via hot_cache so the NBD
+        # server (which starts next) immediately serves the corrected data.
+        self._fix_index_alloc_data_sizes()
 
         # Step 6: Create NBD server
         # Use PartitionWrapper for Windows VM mode (adds MBR partition table)
@@ -240,6 +289,14 @@ class NTFSBridge:
             mount_success = self._connect_and_mount()
 
             if mount_success:
+                # After the production ntfs-3g mount, repair any INDX clusters
+                # that ntfs-3g left FREE in $Bitmap during its startup fixups.
+                # ntfs-3g may relocate $INDEX_ALLOC pages without correctly
+                # updating $Bitmap, causing Windows to report directories as
+                # "corrupted and unreadable".
+                log("Post-mount: fixing INDX cluster bitmap entries...")
+                self.mapper.fix_indx_clusters()
+
                 # Start sync daemon for ntfs-3g based sync
                 if not self.virtual_mode:
                     self.sync_daemon = SyncDaemon(
@@ -388,7 +445,510 @@ class NTFSBridge:
             log(f"ERROR: mkfs.ntfs failed: {result.stderr}")
             sys.exit(1)
 
+        # mkfs.ntfs on large sparse images sets the boot sector's MFTMirr LCN
+        # to the volume midpoint, but MFT record 1 ($MFTMirr) stores the data
+        # runs at a different cluster.  This mismatch causes Windows/ntfsprogs
+        # to report "$MFTMirr does not match $MFT" and refuse to open directories.
+        # Fix: read MFT record 1 data runs and patch the boot sector to match.
+        self._fix_mftmirr_boot_sector()
+
         log("NTFS image created")
+
+    def _fix_mftmirr_boot_sector(self):
+        """Patch boot sector MFTMirr LCN to match MFT record 1 data runs.
+
+        mkfs.ntfs computes the boot sector MFTMirr LCN as total_clusters//2,
+        but places the actual $MFTMirr record at a different cluster.  The
+        inconsistency triggers 'Bad $MFTMirr lcn' errors and makes directories
+        unreadable in Windows.
+        """
+        import struct as _struct
+        try:
+            with open(self.image_path, 'r+b') as f:
+                # Read boot sector
+                f.seek(0)
+                bs = bytearray(f.read(512))
+                bytes_per_sector = _struct.unpack_from('<H', bs, 11)[0]
+                sectors_per_cluster = bs[13]
+                cluster_size = bytes_per_sector * sectors_per_cluster
+                mft_cluster = _struct.unpack_from('<q', bs, 48)[0]
+                boot_mftmirr = _struct.unpack_from('<q', bs, 56)[0]
+
+                # Read MFT record 1 ($MFTMirr) — undo fixups, find $DATA run
+                rec_offset = mft_cluster * cluster_size + 1 * 1024
+                f.seek(rec_offset)
+                raw = bytearray(f.read(1024))
+                if raw[:4] != b'FILE':
+                    log(f"  MFTMirr fix: record 1 is not FILE, skipping")
+                    return
+
+                # Undo update sequence array fixups
+                usa_off = _struct.unpack_from('<H', raw, 4)[0]
+                usa_count = _struct.unpack_from('<H', raw, 6)[0]
+                seq_num = _struct.unpack_from('<H', raw, usa_off)[0]
+                for i in range(1, usa_count):
+                    sector_end = i * 512 - 2
+                    if raw[sector_end:sector_end + 2] == _struct.pack('<H', seq_num):
+                        raw[sector_end:sector_end + 2] = raw[usa_off + i * 2:usa_off + i * 2 + 2]
+
+                # Find first non-sparse run in $DATA
+                first_attr = _struct.unpack_from('<H', raw, 20)[0]
+                off = first_attr
+                mft1_lcn = None
+                while off < 1024 - 8:
+                    atype = _struct.unpack_from('<I', raw, off)[0]
+                    if atype == 0xFFFFFFFF:
+                        break
+                    alen = _struct.unpack_from('<I', raw, off + 4)[0]
+                    if alen == 0 or alen > 1024:
+                        break
+                    if atype == 0x80 and not raw[off + 9]:  # unnamed $DATA
+                        non_res = raw[off + 8]
+                        if non_res:
+                            runs_off = _struct.unpack_from('<H', raw, off + 32)[0]
+                            runs = raw[off + runs_off:off + alen]
+                            pos = 0; lcn = 0
+                            while pos < len(runs) and runs[pos]:
+                                hdr = runs[pos]; pos += 1
+                                ls = hdr & 0xF; os2 = (hdr >> 4) & 0xF
+                                pos += ls
+                                if os2:
+                                    roff = int.from_bytes(runs[pos:pos + os2], 'little', signed=True)
+                                    pos += os2
+                                    lcn += roff
+                                    mft1_lcn = lcn
+                                    break
+                    off += alen
+
+                if mft1_lcn is None or mft1_lcn == boot_mftmirr:
+                    return  # Nothing to fix
+
+                log(f"  Fixing boot sector MFTMirr LCN: {boot_mftmirr:#x} → {mft1_lcn:#x}")
+                _struct.pack_into('<q', bs, 56, mft1_lcn)
+                f.seek(0)
+                f.write(bytes(bs))
+
+                # Also fix the backup boot sector at the end of the volume
+                f.seek(0, 2)
+                vol_size = f.tell()
+                backup_offset = vol_size - 512
+                if backup_offset > 512:
+                    f.seek(backup_offset)
+                    bbs = bytearray(f.read(512))
+                    if bbs[:8] == bs[:8]:  # Same OEM ID
+                        _struct.pack_into('<q', bbs, 56, mft1_lcn)
+                        f.seek(backup_offset)
+                        f.write(bytes(bbs))
+        except Exception as e:
+            log(f"  MFTMirr fix error (non-fatal): {e}")
+
+    def _fix_indx_bitmap(self):
+        """Mark directory INDX clusters as used in $Bitmap.
+
+        ntfs-3g allocates clusters for directory $INDEX_ALLOC pages during
+        _populate_image(), writes valid INDX data there, but then frees those
+        clusters in $Bitmap on unmount (compact/trim behaviour on sparse images).
+        The $INDEX_ALLOC data runs in the MFT still reference those clusters,
+        creating an inconsistency: Windows/ntfs-3g sees FREE clusters referenced
+        by $INDEX_ALLOC and reports 'corrupted and unreadable'.
+
+        Fix: scan every MFT record for $INDEX_ALLOC attributes and mark all
+        their clusters as USED in $Bitmap before ClusterMapper reads the bitmap.
+        """
+        import struct as _struct
+
+        MFT_RECORD_SIZE = 1024
+        log("Fixing $Bitmap for INDX clusters (ntfs-3g unmount may have freed them)...")
+
+        try:
+            with open(self.image_path, 'r+b') as f:
+                # Read NTFS params from boot sector
+                f.seek(0)
+                bs = f.read(512)
+                bytes_per_sector = _struct.unpack_from('<H', bs, 11)[0]
+                sectors_per_cluster = bs[13]
+                cluster_size = bytes_per_sector * sectors_per_cluster
+                mft_cluster = _struct.unpack_from('<q', bs, 48)[0]
+                total_sectors = _struct.unpack_from('<Q', bs, 40)[0]
+                total_clusters = total_sectors // sectors_per_cluster
+                mft_offset = mft_cluster * cluster_size
+
+                # Find $Bitmap location (MFT record 6)
+                f.seek(mft_offset + 6 * MFT_RECORD_SIZE)
+                raw = bytearray(f.read(MFT_RECORD_SIZE))
+                if raw[:4] != b'FILE':
+                    log("  Cannot find $Bitmap record, skipping")
+                    return
+                raw = self._undo_fixups_raw(raw)
+
+                # Parse $Bitmap $DATA runs
+                bitmap_runs = []
+                first_attr = _struct.unpack_from('<H', raw, 20)[0]
+                off = first_attr
+                while off < MFT_RECORD_SIZE - 8:
+                    atype = _struct.unpack_from('<I', raw, off)[0]
+                    if atype == 0xFFFFFFFF: break
+                    alen = _struct.unpack_from('<I', raw, off + 4)[0]
+                    if alen == 0 or alen > MFT_RECORD_SIZE: break
+                    if atype == 0x80 and not raw[off + 9] and raw[off + 8]:
+                        bitmap_real_size = _struct.unpack_from('<Q', raw, off + 48)[0]
+                        runs_off = _struct.unpack_from('<H', raw, off + 32)[0]
+                        rb = raw[off + runs_off:off + alen]
+                        pos = 0; lcn = 0
+                        while pos < len(rb) and rb[pos]:
+                            hdr = rb[pos]; pos += 1
+                            ls = hdr & 0xF; os2 = (hdr >> 4) & 0xF
+                            rlen = int.from_bytes(rb[pos:pos + ls], 'little'); pos += ls
+                            if os2:
+                                roff = int.from_bytes(rb[pos:pos + os2], 'little', signed=True)
+                                pos += os2; lcn += roff
+                                bitmap_runs.append((lcn, rlen))
+                            else:
+                                bitmap_runs.append((-1, rlen))
+                    off += alen
+
+                if not bitmap_runs:
+                    log("  Cannot parse $Bitmap runs, skipping")
+                    return
+
+                def read_bitmap_byte(cluster_num):
+                    """Read the bitmap byte containing the bit for cluster_num."""
+                    byte_pos = cluster_num // 8
+                    cum = 0
+                    for run_lcn, run_len in bitmap_runs:
+                        if run_lcn < 0:
+                            cum += run_len * cluster_size
+                            continue
+                        run_bytes = run_len * cluster_size
+                        if cum <= byte_pos < cum + run_bytes:
+                            f.seek(run_lcn * cluster_size + (byte_pos - cum))
+                            return f.read(1)[0]
+                        cum += run_bytes
+                    return None
+
+                def write_bitmap_byte(cluster_num, byte_val):
+                    """Write the bitmap byte containing the bit for cluster_num."""
+                    byte_pos = cluster_num // 8
+                    cum = 0
+                    for run_lcn, run_len in bitmap_runs:
+                        if run_lcn < 0:
+                            cum += run_len * cluster_size
+                            continue
+                        run_bytes = run_len * cluster_size
+                        if cum <= byte_pos < cum + run_bytes:
+                            f.seek(run_lcn * cluster_size + (byte_pos - cum))
+                            f.write(bytes([byte_val]))
+                            return True
+                        cum += run_bytes
+                    return False
+
+                # Scan ALL MFT records for $INDEX_ALLOC attributes.
+                # Stop after 200 consecutive non-FILE records (past end of MFT).
+                indx_clusters = set()
+                rec_num = 0
+                consecutive_non_file = 0
+                while consecutive_non_file < 200:
+                    offset = mft_offset + rec_num * MFT_RECORD_SIZE
+                    f.seek(offset)
+                    raw = f.read(MFT_RECORD_SIZE)
+                    if not raw or len(raw) < MFT_RECORD_SIZE:
+                        break
+                    if raw[:4] != b'FILE':
+                        consecutive_non_file += 1
+                        rec_num += 1
+                        continue
+                    consecutive_non_file = 0
+
+                    raw = self._undo_fixups_raw(bytearray(raw))
+                    flags = _struct.unpack_from('<H', raw, 22)[0]
+                    if not (flags & 0x2):  # Not a directory
+                        rec_num += 1
+                        continue
+
+                    # Walk attributes looking for $INDEX_ALLOC (0xA0)
+                    first_attr = _struct.unpack_from('<H', raw, 20)[0]
+                    off = first_attr
+                    while off < MFT_RECORD_SIZE - 8:
+                        atype = _struct.unpack_from('<I', raw, off)[0]
+                        if atype == 0xFFFFFFFF: break
+                        alen = _struct.unpack_from('<I', raw, off + 4)[0]
+                        if alen == 0 or alen > MFT_RECORD_SIZE: break
+                        if atype == 0xA0 and raw[off + 8]:  # $INDEX_ALLOC non-res
+                            runs_off = _struct.unpack_from('<H', raw, off + 32)[0]
+                            rb = raw[off + runs_off:off + alen]
+                            pos = 0; lcn = 0
+                            while pos < len(rb) and rb[pos]:
+                                hdr = rb[pos]; pos += 1
+                                ls = hdr & 0xF; os2 = (hdr >> 4) & 0xF
+                                rlen = int.from_bytes(rb[pos:pos + ls], 'little'); pos += ls
+                                if os2:
+                                    roff = int.from_bytes(rb[pos:pos + os2], 'little', signed=True)
+                                    pos += os2; lcn += roff
+                                    for c in range(lcn, lcn + rlen):
+                                        indx_clusters.add(c)
+                                else:
+                                    pos += 0  # sparse $INDEX_ALLOC run, no clusters
+                        off += alen
+                    rec_num += 1
+
+                log(f"  Found {len(indx_clusters)} INDX clusters across all directories")
+
+                # Mark them all as USED in $Bitmap (set the bit)
+                fixed = 0
+                for cluster in sorted(indx_clusters):
+                    if cluster < 0 or cluster >= total_clusters:
+                        continue
+                    byte_val = read_bitmap_byte(cluster)
+                    if byte_val is None:
+                        continue
+                    bit = (byte_val >> (cluster % 8)) & 1
+                    if not bit:  # Was FREE, needs fixing
+                        new_byte = byte_val | (1 << (cluster % 8))
+                        write_bitmap_byte(cluster, new_byte)
+                        fixed += 1
+
+                log(f"  Fixed {fixed} INDX clusters in $Bitmap")
+
+        except Exception as e:
+            log(f"  INDX bitmap fix error (non-fatal): {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _fix_index_alloc_data_sizes(self):
+        """Extend INDEX_ALLOC data_size to cover all valid INDX blocks in allocated clusters.
+
+        ntfs-3g on unmount may set data_size to only cover INDX blocks it considers
+        'active' (those with INDEX_BITMAP bits set), while leaving valid INDX data
+        (with valid INDX signatures and entries) in allocated clusters beyond data_size.
+        If an internal B+ tree node has a child pointer to such a beyond-data_size block,
+        Windows reports 'The file or directory is corrupted and unreadable'.
+
+        This function scans every directory MFT record, checks if any valid INDX blocks
+        exist beyond the current data_size in the allocated clusters, and if so:
+          - Extends data_size (and init_size) to cover them
+          - Sets the corresponding bit in the per-directory INDEX_BITMAP attribute
+          - Writes the corrected MFT record back via self.mapper.image (hot_cache)
+
+        Must be called AFTER ClusterMapper is initialized (uses self.mapper.image).
+        Writing through the hot_cache ensures the NBD server immediately serves the
+        corrected data, and the fix persists to disk on the next image flush().
+        """
+        import struct as _struct
+
+        INDX_RECORD_SIZE = 4096   # bytes per index record
+        MFT_RECORD_SIZE = 1024
+        log("Checking INDEX_ALLOC data_size for hidden INDX blocks...")
+
+        def redo_fixups(record: bytearray) -> bytearray:
+            """Re-apply USA fixups to an MFT record before writing."""
+            record = bytearray(record)
+            usa_off = _struct.unpack_from('<H', record, 4)[0]
+            usa_count = _struct.unpack_from('<H', record, 6)[0]
+            seq = _struct.unpack_from('<H', record, usa_off)[0]
+            for i in range(1, usa_count):
+                sec_end = i * 512 - 2
+                _struct.pack_into('<H', record, usa_off + i * 2,
+                                  _struct.unpack_from('<H', record, sec_end)[0])
+                _struct.pack_into('<H', record, sec_end, seq)
+            return record
+
+        def decode_runs(rb):
+            runs = []
+            pos = 0; lcn = 0
+            while pos < len(rb) and rb[pos]:
+                hdr = rb[pos]; pos += 1
+                ls = hdr & 0xF; os2 = (hdr >> 4) & 0xF
+                rlen = int.from_bytes(rb[pos:pos + ls], 'little'); pos += ls
+                if os2:
+                    delta = int.from_bytes(rb[pos:pos + os2], 'little', signed=True)
+                    pos += os2; lcn += delta
+                    runs.append((lcn, rlen))
+            return runs
+
+        try:
+            img = self.mapper.image
+            cluster_size = self.mapper.cluster_size
+            bps = self.mapper.bytes_per_sector
+            mft_offset = self.mapper.mft_offset
+            img_len = len(img)
+
+            vcn_step = INDX_RECORD_SIZE // bps  # VCNs per INDX block (e.g. 8 for 512B sectors)
+
+            def stream_to_file_offset(stream_byte_off, runs):
+                cur = 0
+                for lcn, length in runs:
+                    run_bytes = length * cluster_size
+                    if cur + run_bytes > stream_byte_off:
+                        return lcn * cluster_size + (stream_byte_off - cur)
+                    cur += run_bytes
+                return None
+
+            fixed_count = 0
+            rec_num = 0
+            consecutive_non_file = 0
+
+            while consecutive_non_file < 200:
+                mft_file_off = mft_offset + rec_num * MFT_RECORD_SIZE
+                if mft_file_off + MFT_RECORD_SIZE > img_len:
+                    break
+                raw = bytes(img[mft_file_off:mft_file_off + MFT_RECORD_SIZE])
+                if len(raw) < MFT_RECORD_SIZE:
+                    break
+                if raw[:4] != b'FILE':
+                    consecutive_non_file += 1
+                    rec_num += 1
+                    continue
+                consecutive_non_file = 0
+
+                rec = self._undo_fixups_raw(bytearray(raw))
+                flags = _struct.unpack_from('<H', rec, 22)[0]
+                if not (flags & 0x2):  # Not a directory
+                    rec_num += 1
+                    continue
+
+                # Parse INDEX_ALLOC (0xA0) and INDEX_BITMAP (0xB0) attrs
+                ia_off = None; ia_alloc = 0; ia_data = 0; ia_runs = []
+                ib_off = None; ib_val_off = 0; ib_val_len = 0
+
+                p = _struct.unpack_from('<H', rec, 20)[0]
+                while p < MFT_RECORD_SIZE - 8:
+                    at = _struct.unpack_from('<I', rec, p)[0]
+                    al = _struct.unpack_from('<I', rec, p + 4)[0]
+                    if at == 0xFFFFFFFF or al == 0: break
+                    if at == 0xA0 and rec[p + 8]:  # nonresident INDEX_ALLOC
+                        ia_off = p
+                        ia_alloc = _struct.unpack_from('<Q', rec, p + 40)[0]
+                        ia_data  = _struct.unpack_from('<Q', rec, p + 48)[0]
+                        dr_off = _struct.unpack_from('<H', rec, p + 32)[0]
+                        ia_runs = decode_runs(rec[p + dr_off:p + al])
+                    if at == 0xB0 and not rec[p + 8]:  # resident INDEX_BITMAP
+                        ib_off = p
+                        ib_val_off = _struct.unpack_from('<H', rec, p + 20)[0]
+                        ib_val_len = _struct.unpack_from('<I', rec, p + 16)[0]
+                    p += al
+
+                if ia_off is None or not ia_runs or ia_data >= ia_alloc:
+                    rec_num += 1
+                    continue
+
+                # Read current INDEX_BITMAP before scanning so we can start
+                # new_bitmap from the existing bits (scan only ADDs bits, never
+                # removes them — prevents clearing bits for directories whose
+                # INDX cluster data isn't in the hot image but was written by
+                # ntfs-3g and is still valid).
+                old_bitmap = (bytes(rec[ib_off + ib_val_off:
+                                        ib_off + ib_val_off + ib_val_len])
+                              if ib_off is not None else None)
+
+                # Scan ALL INDX blocks in the allocated space to compute the
+                # full expected data_size and INDEX_BITMAP.
+                new_data = ia_data
+                new_bitmap = (bytearray(old_bitmap) if old_bitmap is not None
+                              else (bytearray(ib_val_len)
+                                    if ib_off is not None else None))
+                block_idx = 0
+                vcn = 0
+                while vcn * bps < ia_alloc:
+                    stream_byte_off = vcn * bps
+                    foff = stream_to_file_offset(stream_byte_off, ia_runs)
+                    if foff is not None and foff + INDX_RECORD_SIZE <= img_len:
+                        blk = bytes(img[foff:foff + INDX_RECORD_SIZE])
+                        if len(blk) == INDX_RECORD_SIZE and blk[:4] == b'INDX':
+                            end = stream_byte_off + INDX_RECORD_SIZE
+                            if end > new_data:
+                                new_data = end
+                            if (new_bitmap is not None
+                                    and block_idx // 8 < len(new_bitmap)):
+                                new_bitmap[block_idx // 8] |= (
+                                    1 << (block_idx % 8))
+                    vcn += vcn_step
+                    block_idx += 1
+
+                bitmap_changed = (old_bitmap is not None
+                                  and new_bitmap is not None
+                                  and bytes(new_bitmap) != old_bitmap)
+
+                # Always register protection so _mft_write_to_image() re-patches
+                # data_size and INDEX_BITMAP whenever Windows writes back stale
+                # smaller values (journal replay, access-time updates, etc.).
+                # Done regardless of whether an extension was needed this startup,
+                # so the protection is active even when the disk is already correct.
+                _ib_off_reg = ib_off if ib_off is not None else -1
+                _ib_val_off_reg = ib_val_off if ib_off is not None else 0
+                _bitmap_reg = (bytes(new_bitmap) if new_bitmap is not None
+                               else b'')
+                self.mapper.protect_ia_size(
+                    rec_num, ia_off, new_data,
+                    _ib_off_reg, _ib_val_off_reg, _bitmap_reg)
+
+                if new_data > ia_data or bitmap_changed:
+                    # Get dir name for log
+                    name = ""
+                    p2 = _struct.unpack_from('<H', rec, 20)[0]
+                    while p2 < MFT_RECORD_SIZE - 8:
+                        at = _struct.unpack_from('<I', rec, p2)[0]
+                        al = _struct.unpack_from('<I', rec, p2 + 4)[0]
+                        if at == 0xFFFFFFFF or al == 0: break
+                        if at == 0x30:
+                            nl = rec[p2 + 88]
+                            name = rec[p2 + 90:p2 + 90 + nl * 2].decode(
+                                'utf-16-le', errors='replace')
+                            break
+                        p2 += al
+
+                    # Patch the logical (fixup-undone) record
+                    _struct.pack_into('<Q', rec, ia_off + 48, new_data)  # data_size
+                    _struct.pack_into('<Q', rec, ia_off + 56, new_data)  # init_size
+                    if new_bitmap is not None and ib_off is not None:
+                        bm_start = ib_off + ib_val_off
+                        rec[bm_start:bm_start + ib_val_len] = new_bitmap
+
+                    # Re-apply fixups and write via hot_cache (NBD server reads this)
+                    on_disk = redo_fixups(rec)
+                    img[mft_file_off:mft_file_off + MFT_RECORD_SIZE] = bytes(on_disk)
+
+                    # Verify the write landed in hot_cache correctly
+                    check = bytes(img[mft_file_off + ia_off + 48:
+                                      mft_file_off + ia_off + 56])
+                    got = _struct.unpack_from('<Q', bytes(check))[0]
+                    bm_desc = ""
+                    if bitmap_changed and new_bitmap is not None and old_bitmap is not None:
+                        bm_desc = (f" bitmap {old_bitmap.hex()}"
+                                   f"->{bytes(new_bitmap).hex()}")
+                    if got == new_data:
+                        log(f"  Record {rec_num} ({name!r}): "
+                            f"data_size {ia_data} -> {new_data}{bm_desc} [OK]")
+                    else:
+                        log(f"  Record {rec_num} ({name!r}): "
+                            f"data_size write FAILED (expected {new_data}, got {got})")
+
+                    fixed_count += 1
+
+                rec_num += 1
+
+            log(f"  Fixed INDEX_ALLOC/bitmap for {fixed_count} director(ies)")
+            if fixed_count:
+                # Flush to disk so the fix survives a bridge restart without
+                # needing to re-scan every time.
+                self.mapper.image.flush()
+                log(f"  Flushed {fixed_count} INDEX_ALLOC fix(es) to disk")
+
+        except Exception as e:
+            log(f"  Index alloc data_size fix error (non-fatal): {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _undo_fixups_raw(self, record: bytearray) -> bytearray:
+        """Undo USA fixups without logging."""
+        import struct as _struct
+        usa_off = _struct.unpack_from('<H', record, 4)[0]
+        usa_count = _struct.unpack_from('<H', record, 6)[0]
+        seq_num = _struct.unpack_from('<H', record, usa_off)[0]
+        for i in range(1, usa_count):
+            sector_end = i * 512 - 2
+            if record[sector_end:sector_end + 2] == _struct.pack('<H', seq_num):
+                record[sector_end:sector_end + 2] = record[usa_off + i * 2:usa_off + i * 2 + 2]
+        return record
 
     def _populate_image(self, needs_fsfix: bool = False):
         """Populate the NTFS image with files from ext4 source."""
@@ -411,13 +971,21 @@ class NTFSBridge:
         try:
             if needs_fsfix:
                 # Fix dirty NTFS filesystem before mounting.
-                # allocate_file_direct() modifies MFT outside ntfs-3g's journal,
-                # which makes ntfs-3g consider the filesystem dirty and mount
-                # read-only. ntfsfix clears the dirty flag so we can mount rw.
+                #
+                # Run full ntfsfix (no -d flag) so it both:
+                #   1. Empties the $LogFile (prevents Windows from hanging on
+                #      log replay after an unclean bridge shutdown)
+                #   2. Clears the dirty bit (allows ntfs-3g rw mount)
+                #
+                # ntfsfix -d only clears the dirty bit but leaves the $LogFile
+                # intact. Windows replays any entries it finds, which can cause
+                # an indefinite hang when the log contains stale transactions
+                # from a bridge that was killed mid-write.
                 fix_result = subprocess.run(
-                    ['ntfsfix', '-d', self.image_path],
+                    ['ntfsfix', self.image_path],
                     capture_output=True, text=True
                 )
+                log(f"ntfsfix: {fix_result.stdout.strip()}")
                 if fix_result.returncode != 0:
                     log(f"ntfsfix warning: {fix_result.stderr.strip()}")
 
@@ -442,11 +1010,11 @@ class NTFSBridge:
 
             for root, dirs, files in os.walk(self.source_dir, followlinks=True):
                 rel_root = os.path.relpath(root, self.source_dir)
+                dirs[:] = [d for d in dirs
+                           if not self._should_exclude(os.path.join(rel_root, d) if rel_root != '.' else d)]
 
                 # Create directories
                 for d in dirs:
-                    if d.startswith('.'):
-                        continue
                     rel_dir = os.path.join(rel_root, d) if rel_root != '.' else d
                     ntfs_dir = os.path.join(tmp_mount, rel_dir)
                     try:
@@ -457,9 +1025,9 @@ class NTFSBridge:
 
                 # Create files - sparse for large files if lazy_alloc enabled
                 for f in files:
-                    if f.startswith('.'):
-                        continue
                     rel_file = os.path.join(rel_root, f) if rel_root != '.' else f
+                    if self._should_exclude(rel_file):
+                        continue
                     source_file = os.path.join(root, f)
                     ntfs_file = os.path.join(tmp_mount, rel_file)
 
@@ -503,8 +1071,6 @@ class NTFSBridge:
                     rel_root = os.path.relpath(root, self.overflow_dir)
 
                     for d in dirs:
-                        if d.startswith('.'):
-                            continue
                         rel_dir = os.path.join(rel_root, d) if rel_root != '.' else d
                         ntfs_dir = os.path.join(tmp_mount, rel_dir)
                         try:
@@ -513,8 +1079,6 @@ class NTFSBridge:
                             log(f"  Warning: could not create overflow dir {rel_dir}: {e}")
 
                     for f in files:
-                        if f.startswith('.'):
-                            continue
                         rel_file = os.path.join(rel_root, f) if rel_root != '.' else f
                         source_file = os.path.join(root, f)
                         ntfs_file = os.path.join(tmp_mount, rel_file)
@@ -581,10 +1145,9 @@ class NTFSBridge:
         files_failed = 0
 
         for root, dirs, files in os.walk(self.source_dir, followlinks=True):
-            # Skip hidden directories
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-
             rel_root = os.path.relpath(root, self.source_dir)
+            dirs[:] = [d for d in dirs
+                       if not self._should_exclude(os.path.join(rel_root, d) if rel_root != '.' else d)]
 
             # Ensure directories exist
             for d in dirs:
@@ -596,9 +1159,9 @@ class NTFSBridge:
                     pass
 
             for f in files:
-                if f.startswith('.'):
-                    continue
                 rel_file = os.path.join(rel_root, f) if rel_root != '.' else f
+                if self._should_exclude(rel_file):
+                    continue
                 source_file = os.path.join(root, f)
                 ntfs_file = os.path.join(self.ntfs_mount, rel_file)
 
@@ -666,7 +1229,7 @@ class NTFSBridge:
         # Mount with ntfs-3g
         log(f"Mounting ntfs-3g {mount_device} on {self.ntfs_mount}...")
         result = subprocess.run(
-            ['mount', '-t', 'ntfs-3g', '-o', 'rw,big_writes',
+            ['mount', '-t', 'ntfs-3g', '-o', 'rw,big_writes,recover',
              mount_device, self.ntfs_mount],
             capture_output=True, text=True
         )
@@ -710,6 +1273,16 @@ class NTFSBridge:
                     return device
         return ''
 
+    def _should_exclude(self, rel_path: str) -> bool:
+        """Return True if rel_path matches any --exclude pattern."""
+        if not self.exclude_patterns:
+            return False
+        name = os.path.basename(rel_path)
+        for pattern in self.exclude_patterns:
+            if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(rel_path, pattern):
+                return True
+        return False
+
     @staticmethod
     def _get_dir_size(path: str) -> int:
         """Get total size of files in a directory."""
@@ -750,6 +1323,10 @@ def main():
                         help='Directory for root-level files created by Windows '
                              '(e.g. System Volume Information). Should be on the data disk. '
                              'Default: source directory')
+    parser.add_argument('--exclude', action='append', metavar='PATTERN', dest='exclude',
+                        help='Exclude files/dirs matching this glob pattern (can repeat). '
+                             'Matched against filename and relative path. '
+                             'Example: --exclude "*.raw" --exclude "bridge-test"')
 
     args = parser.parse_args()
 
@@ -763,7 +1340,8 @@ def main():
         dealloc_timeout=args.dealloc_timeout,
         partitioned=args.partitioned,
         virtual_mode=args.virtual,
-        overflow_dir=args.overflow_dir
+        overflow_dir=args.overflow_dir,
+        exclude_patterns=args.exclude,
     )
 
     # Handle signals
