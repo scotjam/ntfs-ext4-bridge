@@ -1122,6 +1122,50 @@ class ClusterMapper:
         except Exception as e:
             log(f"  MFTMirr: error loading mirror info: {e} — mirror sync disabled")
 
+    def _get_mft_runs(self):
+        """Parse MFT $DATA runs from MFT record 0 for non-contiguous MFT support.
+
+        Returns list of (disk_byte_offset, byte_length) and total_records.
+        """
+        rec0 = self._undo_fixups(bytearray(
+            self.image[self.mft_offset:self.mft_offset + MFT_RECORD_SIZE]))
+        mft_runs = []
+        total_records = 0
+        a = struct.unpack('<H', rec0[20:22])[0]
+        while a < MFT_RECORD_SIZE - 8:
+            at = struct.unpack('<I', rec0[a:a+4])[0]
+            if at == 0xFFFFFFFF: break
+            al = struct.unpack('<I', rec0[a+4:a+8])[0]
+            if al == 0: break
+            if at == 0x80 and rec0[a+8]:  # $DATA non-resident
+                data_size = struct.unpack('<Q', rec0[a+48:a+56])[0]
+                total_records = data_size // MFT_RECORD_SIZE
+                ro = struct.unpack('<H', rec0[a+32:a+34])[0]
+                rb = rec0[a+ro:a+al]
+                pos = 0; lcn = 0
+                while pos < len(rb) and rb[pos]:
+                    hdr = rb[pos]; pos += 1
+                    ls = hdr & 0xF; os2 = (hdr >> 4) & 0xF
+                    rlen = int.from_bytes(rb[pos:pos+ls], 'little'); pos += ls
+                    if os2:
+                        delta = int.from_bytes(rb[pos:pos+os2], 'little', signed=True)
+                        pos += os2; lcn += delta
+                        mft_runs.append((lcn * self.cluster_size,
+                                         rlen * self.cluster_size))
+                break
+            a += al
+        return mft_runs, total_records
+
+    def _mft_record_offset(self, rec_num, mft_runs):
+        """Resolve MFT record number to image byte offset using data runs."""
+        stream_off = rec_num * MFT_RECORD_SIZE
+        cum = 0
+        for disk_off, run_bytes in mft_runs:
+            if cum + run_bytes > stream_off:
+                return disk_off + (stream_off - cum)
+            cum += run_bytes
+        return None
+
     def fix_indx_clusters(self):
         """Mark all directory $INDEX_ALLOC clusters as used in bitmap + free-run index.
 
@@ -1137,24 +1181,20 @@ class ClusterMapper:
             log("  INDX fix: no bitmap, skipping")
             return
 
+        mft_runs, total_records = self._get_mft_runs()
         indx_clusters = set()
-        consecutive_non_file = 0
-        rec_num = 0
-        while consecutive_non_file < 200:
-            record_offset = self.mft_offset + rec_num * MFT_RECORD_SIZE
-            raw = self.image[record_offset:record_offset + MFT_RECORD_SIZE]
-            if len(raw) < MFT_RECORD_SIZE:
-                break
-            if raw[:4] != b'FILE':
-                consecutive_non_file += 1
-                rec_num += 1
+
+        for rec_num in range(total_records):
+            record_offset = self._mft_record_offset(rec_num, mft_runs)
+            if record_offset is None:
                 continue
-            consecutive_non_file = 0
+            raw = self.image[record_offset:record_offset + MFT_RECORD_SIZE]
+            if len(raw) < MFT_RECORD_SIZE or raw[:4] != b'FILE':
+                continue
 
             record = self._undo_fixups(bytearray(raw))
             flags = struct.unpack('<H', record[22:24])[0]
             if not (flags & 0x2):  # Not a directory
-                rec_num += 1
                 continue
 
             first_attr = struct.unpack('<H', record[20:22])[0]
@@ -1178,7 +1218,6 @@ class ClusterMapper:
                     except Exception:
                         pass
                 off += attr_len
-            rec_num += 1
 
         if not indx_clusters:
             log("  INDX fix: no INDX clusters found")

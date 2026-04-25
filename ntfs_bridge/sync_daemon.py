@@ -82,9 +82,9 @@ class SyncDaemon:
 
     def _on_event(self, event_type: str, rel_path: str):
         """Handle a file system event from the watcher."""
-        # Skip hidden/system files
+        # Skip NTFS system files
         basename = os.path.basename(rel_path)
-        if basename.startswith('.') or basename.startswith('$'):
+        if basename.startswith('$'):
             return
 
         # Check loop prevention: skip if NTFS→ext4 sync created this

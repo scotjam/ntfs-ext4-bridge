@@ -113,6 +113,14 @@ class NTFSBridge:
             self.image_size_mb = 64
             log(f"Adjusted image size to minimum {self.image_size_mb}MB")
 
+        # Cap image size at filesystem max file size (ext4 with 4K blocks: 16 TiB).
+        max_file_tib = 16
+        max_file_mb = max_file_tib * 1024 * 1024  # 16777216 MB
+        if self.image_size_mb > max_file_mb:
+            log(f"Capping image size from {self.image_size_mb}MB to {max_file_mb}MB "
+                f"(ext4 {max_file_tib}TiB max file size)")
+            self.image_size_mb = max_file_mb
+
         # Step 1: Create NTFS image if it doesn't exist or is too small.
         #
         # IMPORTANT: Never recreate an existing image whose size has decreased
@@ -133,10 +141,12 @@ class NTFSBridge:
             existing_size_mb = os.path.getsize(self.image_path) // (1024 * 1024)
             if needed_mb > existing_size_mb * 1.5:
                 # Source has genuinely grown to more than 150% of existing image.
+                # Create new image first, only delete old one after success.
                 log(f"Existing image too small ({existing_size_mb}MB, need {needed_mb}MB for "
                     f"{file_count} files), recreating...")
-                os.remove(self.image_path)
-                self._create_ntfs_image()
+                tmp_path = self.image_path + '.new'
+                self._create_ntfs_image(path_override=tmp_path)
+                os.replace(tmp_path, self.image_path)
                 image_is_fresh = True
             else:
                 log(f"Using existing image: {self.image_path} ({existing_size_mb}MB, "
@@ -415,34 +425,45 @@ class NTFSBridge:
 
         log("Bridge stopped")
 
-    def _create_ntfs_image(self):
+    def _create_ntfs_image(self, path_override: str = None):
         """Create a new NTFS image file."""
-        log(f"Creating {self.image_size_mb}MB NTFS image...")
+        target = path_override or self.image_path
+        log(f"Creating {self.image_size_mb}MB NTFS image at {target}...")
 
         # Create sparse image file
         size_bytes = self.image_size_mb * 1024 * 1024
         result = subprocess.run(
-            ['truncate', '-s', str(size_bytes), self.image_path],
+            ['truncate', '-s', str(size_bytes), target],
             capture_output=True, text=True
         )
         if result.returncode != 0:
-            # Fallback: create with dd
+            # Fallback: create sparse with dd (seek to end, write 1 byte)
             result = subprocess.run(
-                ['dd', 'if=/dev/zero', f'of={self.image_path}',
-                 'bs=1M', f'count={self.image_size_mb}'],
+                ['dd', 'if=/dev/zero', f'of={target}',
+                 'bs=1', 'count=1', f'seek={size_bytes - 1}'],
                 capture_output=True, text=True
             )
             if result.returncode != 0:
                 log(f"ERROR: Failed to create image: {result.stderr}")
+                if path_override:
+                    try:
+                        os.remove(target)
+                    except OSError:
+                        pass
                 sys.exit(1)
 
         # Format as NTFS
         result = subprocess.run(
-            ['mkfs.ntfs', '-F', '-Q', '-c', '65536', self.image_path],
+            ['mkfs.ntfs', '-F', '-Q', '-c', '65536', target],
             capture_output=True, text=True
         )
         if result.returncode != 0:
             log(f"ERROR: mkfs.ntfs failed: {result.stderr}")
+            if path_override:
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
             sys.exit(1)
 
         # mkfs.ntfs on large sparse images sets the boot sector's MFTMirr LCN
@@ -450,7 +471,12 @@ class NTFSBridge:
         # runs at a different cluster.  This mismatch causes Windows/ntfsprogs
         # to report "$MFTMirr does not match $MFT" and refuse to open directories.
         # Fix: read MFT record 1 data runs and patch the boot sector to match.
+        old_path = self.image_path
+        if path_override:
+            self.image_path = target
         self._fix_mftmirr_boot_sector()
+        if path_override:
+            self.image_path = old_path
 
         log("NTFS image created")
 
@@ -541,6 +567,74 @@ class NTFSBridge:
                         f.write(bytes(bbs))
         except Exception as e:
             log(f"  MFTMirr fix error (non-fatal): {e}")
+
+    @staticmethod
+    def _parse_mft_data_runs(image_path: str):
+        """Parse MFT $DATA runs to resolve record numbers to disk offsets.
+
+        Returns (cluster_size, mft_runs, total_records) where mft_runs is a list
+        of (disk_byte_offset, byte_length) for each MFT data run, in order.
+        Record N maps to stream offset N*1024; walk the runs to find disk offset.
+        """
+        import struct as _s
+        with open(image_path, 'rb') as f:
+            f.seek(0)
+            bs = f.read(512)
+            bps = _s.unpack_from('<H', bs, 11)[0]
+            spc = bs[13]
+            cs = bps * spc
+            mft_lcn = _s.unpack_from('<q', bs, 48)[0]
+            mft_off = mft_lcn * cs
+
+            f.seek(mft_off)
+            rec0 = bytearray(f.read(1024))
+            # Undo fixups on MFT record 0
+            fu_off = _s.unpack_from('<H', rec0, 4)[0]
+            fu_cnt = _s.unpack_from('<H', rec0, 6)[0]
+            sig = _s.unpack_from('<H', rec0, fu_off)[0]
+            for i in range(1, fu_cnt):
+                p = i * 512 - 2
+                if p < len(rec0) and _s.unpack_from('<H', rec0, p)[0] == sig:
+                    _s.pack_into('<H', rec0, p, _s.unpack_from('<H', rec0, fu_off + i*2)[0])
+
+            # Find $DATA attribute
+            a = _s.unpack_from('<H', rec0, 20)[0]
+            mft_data_size = 0
+            mft_runs = []
+            while a < 1020:
+                at = _s.unpack_from('<I', rec0, a)[0]
+                if at == 0xFFFFFFFF: break
+                al = _s.unpack_from('<I', rec0, a + 4)[0]
+                if al == 0: break
+                if at == 0x80 and rec0[a + 8]:  # $DATA non-resident
+                    mft_data_size = _s.unpack_from('<Q', rec0, a + 48)[0]
+                    ro = _s.unpack_from('<H', rec0, a + 32)[0]
+                    rb = rec0[a + ro:a + al]
+                    pos = 0; lcn = 0
+                    while pos < len(rb) and rb[pos]:
+                        hdr = rb[pos]; pos += 1
+                        ls = hdr & 0xF; os2 = (hdr >> 4) & 0xF
+                        rlen = int.from_bytes(rb[pos:pos+ls], 'little'); pos += ls
+                        if os2:
+                            delta = int.from_bytes(rb[pos:pos+os2], 'little', signed=True)
+                            pos += os2; lcn += delta
+                            mft_runs.append((lcn * cs, rlen * cs))
+                    break
+                a += al
+
+            total_records = mft_data_size // 1024
+            return cs, mft_runs, total_records
+
+    @staticmethod
+    def _mft_record_disk_offset(rec_num: int, mft_runs, rec_size: int = 1024):
+        """Resolve MFT record number to disk byte offset using MFT data runs."""
+        stream_off = rec_num * rec_size
+        cum = 0
+        for disk_off, run_bytes in mft_runs:
+            if cum + run_bytes > stream_off:
+                return disk_off + (stream_off - cum)
+            cum += run_bytes
+        return None  # Record beyond MFT
 
     def _fix_indx_bitmap(self):
         """Mark directory INDX clusters as used in $Bitmap.
@@ -642,27 +736,28 @@ class NTFSBridge:
                         cum += run_bytes
                     return False
 
+                # Parse MFT data runs to handle non-contiguous MFT
+                _, mft_runs, total_mft_records = self._parse_mft_data_runs(
+                    self.image_path)
+                log(f"  MFT has {total_mft_records} records in {len(mft_runs)} runs")
+
                 # Scan ALL MFT records for $INDEX_ALLOC attributes.
-                # Stop after 200 consecutive non-FILE records (past end of MFT).
                 indx_clusters = set()
-                rec_num = 0
-                consecutive_non_file = 0
-                while consecutive_non_file < 200:
-                    offset = mft_offset + rec_num * MFT_RECORD_SIZE
+                for rec_num in range(total_mft_records):
+                    offset = self._mft_record_disk_offset(
+                        rec_num, mft_runs, MFT_RECORD_SIZE)
+                    if offset is None:
+                        continue
                     f.seek(offset)
                     raw = f.read(MFT_RECORD_SIZE)
                     if not raw or len(raw) < MFT_RECORD_SIZE:
-                        break
-                    if raw[:4] != b'FILE':
-                        consecutive_non_file += 1
-                        rec_num += 1
                         continue
-                    consecutive_non_file = 0
+                    if raw[:4] != b'FILE':
+                        continue
 
                     raw = self._undo_fixups_raw(bytearray(raw))
                     flags = _struct.unpack_from('<H', raw, 22)[0]
                     if not (flags & 0x2):  # Not a directory
-                        rec_num += 1
                         continue
 
                     # Walk attributes looking for $INDEX_ALLOC (0xA0)
@@ -689,7 +784,6 @@ class NTFSBridge:
                                 else:
                                     pos += 0  # sparse $INDEX_ALLOC run, no clusters
                         off += alen
-                    rec_num += 1
 
                 log(f"  Found {len(indx_clusters)} INDX clusters across all directories")
 
@@ -784,26 +878,27 @@ class NTFSBridge:
                 return None
 
             fixed_count = 0
-            rec_num = 0
-            consecutive_non_file = 0
 
-            while consecutive_non_file < 200:
-                mft_file_off = mft_offset + rec_num * MFT_RECORD_SIZE
+            # Parse MFT data runs to handle non-contiguous MFT
+            _, mft_runs, total_mft_records = self._parse_mft_data_runs(
+                self.image_path)
+
+            for rec_num in range(total_mft_records):
+                mft_file_off = self._mft_record_disk_offset(
+                    rec_num, mft_runs, MFT_RECORD_SIZE)
+                if mft_file_off is None:
+                    continue
                 if mft_file_off + MFT_RECORD_SIZE > img_len:
-                    break
+                    continue
                 raw = bytes(img[mft_file_off:mft_file_off + MFT_RECORD_SIZE])
                 if len(raw) < MFT_RECORD_SIZE:
-                    break
-                if raw[:4] != b'FILE':
-                    consecutive_non_file += 1
-                    rec_num += 1
                     continue
-                consecutive_non_file = 0
+                if raw[:4] != b'FILE':
+                    continue
 
                 rec = self._undo_fixups_raw(bytearray(raw))
                 flags = _struct.unpack_from('<H', rec, 22)[0]
                 if not (flags & 0x2):  # Not a directory
-                    rec_num += 1
                     continue
 
                 # Parse INDEX_ALLOC (0xA0) and INDEX_BITMAP (0xB0) attrs
@@ -828,7 +923,6 @@ class NTFSBridge:
                     p += al
 
                 if ia_off is None or not ia_runs or ia_data >= ia_alloc:
-                    rec_num += 1
                     continue
 
                 # Read current INDEX_BITMAP before scanning so we can start
@@ -923,8 +1017,6 @@ class NTFSBridge:
                             f"data_size write FAILED (expected {new_data}, got {got})")
 
                     fixed_count += 1
-
-                rec_num += 1
 
             log(f"  Fixed INDEX_ALLOC/bitmap for {fixed_count} director(ies)")
             if fixed_count:
