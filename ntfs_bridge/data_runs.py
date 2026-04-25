@@ -25,26 +25,33 @@ def encode_data_runs(runs: List[Tuple[int, int]]) -> bytes:
     prev_lcn = 0
 
     for length, lcn in runs:
-        # Calculate LCN offset from previous
-        lcn_offset = lcn - prev_lcn
-
         # Determine bytes needed for length (unsigned)
         len_bytes = _min_bytes_unsigned(length)
 
-        # Determine bytes needed for LCN offset (signed)
-        off_bytes = _min_bytes_signed(lcn_offset)
+        if lcn is None:
+            # Sparse run: no LCN offset field (off_bytes=0 in header)
+            header = len_bytes  # high nibble = 0
+            encoded.append(header)
+            encoded.extend(length.to_bytes(len_bytes, 'little', signed=False))
+            # prev_lcn unchanged for sparse runs
+        else:
+            # Calculate LCN offset from previous
+            lcn_offset = lcn - prev_lcn
 
-        # Header byte
-        header = (off_bytes << 4) | len_bytes
-        encoded.append(header)
+            # Determine bytes needed for LCN offset (signed)
+            off_bytes = _min_bytes_signed(lcn_offset)
 
-        # Length (little-endian, unsigned)
-        encoded.extend(length.to_bytes(len_bytes, 'little', signed=False))
+            # Header byte
+            header = (off_bytes << 4) | len_bytes
+            encoded.append(header)
 
-        # LCN offset (little-endian, signed)
-        encoded.extend(lcn_offset.to_bytes(off_bytes, 'little', signed=True))
+            # Length (little-endian, unsigned)
+            encoded.extend(length.to_bytes(len_bytes, 'little', signed=False))
 
-        prev_lcn = lcn
+            # LCN offset (little-endian, signed)
+            encoded.extend(lcn_offset.to_bytes(off_bytes, 'little', signed=True))
+
+            prev_lcn = lcn
 
     # Terminator
     encoded.append(0x00)
@@ -80,13 +87,17 @@ def decode_data_runs(data: bytes) -> List[Tuple[int, int]]:
         length = int.from_bytes(data[pos:pos + len_bytes], 'little', signed=False)
         pos += len_bytes
 
-        # Read LCN offset (signed)
-        lcn_offset = int.from_bytes(data[pos:pos + off_bytes], 'little', signed=True)
-        pos += off_bytes
+        if off_bytes == 0:
+            # Sparse run: no physical clusters
+            runs.append((length, None))
+        else:
+            # Read LCN offset (signed)
+            lcn_offset = int.from_bytes(data[pos:pos + off_bytes], 'little', signed=True)
+            pos += off_bytes
 
-        lcn = prev_lcn + lcn_offset
-        runs.append((length, lcn))
-        prev_lcn = lcn
+            lcn = prev_lcn + lcn_offset
+            runs.append((length, lcn))
+            prev_lcn = lcn
 
     return runs
 

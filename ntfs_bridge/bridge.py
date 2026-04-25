@@ -44,6 +44,7 @@ class NTFSBridge:
 
     def __init__(self, image_path: str, source_dir: str,
                  ntfs_mount: str, port: int = 10809,
+                 host: str = '127.0.0.1',
                  image_size_mb: int = 256,
                  lazy_alloc: bool = False,
                  dealloc_timeout: float = 60.0,
@@ -55,6 +56,7 @@ class NTFSBridge:
         self.source_dir = os.path.abspath(source_dir)
         self.ntfs_mount = os.path.abspath(ntfs_mount)
         self.port = port
+        self.host = host
         self.image_size_mb = image_size_mb
         self.lazy_alloc = lazy_alloc
         self.dealloc_timeout = dealloc_timeout
@@ -257,7 +259,7 @@ class NTFSBridge:
 
         self.nbd_server = NBDServer(
             mapper=nbd_backend,
-            host='0.0.0.0',  # Listen on all interfaces for VM access
+            host=self.host,
             port=self.port
         )
 
@@ -1400,6 +1402,8 @@ def main():
                         help='Path to mount NTFS via ntfs-3g')
     parser.add_argument('--port', type=int, default=10809,
                         help='NBD server port (default: 10809)')
+    parser.add_argument('--host', default='127.0.0.1',
+                        help='NBD server bind address (default: 127.0.0.1, use 0.0.0.0 for VM access)')
     parser.add_argument('--size', type=int, default=256,
                         help='Minimum image size in MB; auto-increased based on source content (default: 256)')
     parser.add_argument('--lazy', action='store_true',
@@ -1427,6 +1431,7 @@ def main():
         source_dir=args.source,
         ntfs_mount=args.mount,
         port=args.port,
+        host=args.host,
         image_size_mb=args.size,
         lazy_alloc=args.lazy,
         dealloc_timeout=args.dealloc_timeout,

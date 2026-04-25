@@ -297,6 +297,8 @@ class PartitionWrapper:
                 # Reading from partition - offset and pass to mapper
                 partition_offset = current_offset - PARTITION_OFFSET_BYTES
                 data = self.mapper.read(partition_offset, remaining)
+                if not data or len(data) == 0:
+                    break  # Prevent infinite loop
                 result[pos:pos + len(data)] = data
                 pos += len(data)
 
