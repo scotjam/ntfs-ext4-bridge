@@ -196,6 +196,7 @@ class ClusterMapper:
         self.cluster_size = self.bytes_per_sector * self.sectors_per_cluster
         self.mft_cluster = struct.unpack('<Q', boot[0x30:0x38])[0]
         self.mft_offset = self.mft_cluster * self.cluster_size
+        self._mft_runs, self._mft_total_records = self._get_mft_runs()
 
         # Cluster -> (source_file_path, offset_in_file)
         self.cluster_map: Dict[int, Tuple[str, int]] = {}
@@ -231,6 +232,10 @@ class ClusterMapper:
         _t.start()
 
         # Loop prevention sets (shared with SyncDaemon)
+        # Individual set operations (add, discard, `in`) are thread-safe under
+        # CPython's GIL.  A lock is provided for any compound operations or
+        # future iteration that may need atomicity.
+        self._sync_lock = threading.Lock()
         self.ext4_sync_in_progress: Set[str] = set()
         self.ntfs_sync_in_progress: Set[str] = set()
 
@@ -678,20 +683,32 @@ class ClusterMapper:
         Only updates the image bytes. The ext4 sync is done separately by
         _mft_sync_ext4_passes() running in the background worker thread.
         """
-        rel_offset = offset - self.mft_offset
-        if rel_offset < 0:
-            data = data[-rel_offset:]
-            rel_offset = 0
+        write_end = offset + len(data)
 
-        start_record = rel_offset // MFT_RECORD_SIZE
-        end_offset = rel_offset + len(data)
-        end_record = (end_offset + MFT_RECORD_SIZE - 1) // MFT_RECORD_SIZE
+        # Determine which MFT records are touched by this write
+        touched_records = []
+        cum_records = 0
+        for disk_off, run_bytes in self._mft_runs:
+            run_end = disk_off + run_bytes
+            if offset < run_end and write_end > disk_off:
+                # This run overlaps with the write
+                overlap_start = max(offset, disk_off)
+                overlap_end = min(write_end, run_end)
+                first_rec_in_overlap = cum_records + (overlap_start - disk_off) // MFT_RECORD_SIZE
+                last_rec_in_overlap = cum_records + (overlap_end - disk_off - 1) // MFT_RECORD_SIZE
+                for rn in range(first_rec_in_overlap, last_rec_in_overlap + 1):
+                    touched_records.append(rn)
+            cum_records += run_bytes // MFT_RECORD_SIZE
 
-        log(f"MFT write: records {start_record}-{end_record - 1}")
+        if not touched_records:
+            return
 
-        template_offset = self.mft_offset + rel_offset
-        if template_offset + len(data) <= len(self.image):
-            for record_num in range(start_record, end_record):
+        log(f"MFT write: records {touched_records[0]}-{touched_records[-1]}")
+
+        # Write data to image at the actual disk offset
+        if write_end <= len(self.image):
+            # First, write the raw data to the image
+            for record_num in touched_records:
                 if record_num in self.dir_indx_clusters:
                     continue
                 if record_num in self._direct_allocated_records:
@@ -699,51 +716,53 @@ class ClusterMapper:
                     # ntfs-3g or Windows journal replay may write stale sparse data
                     # runs for these records, which would silently undo allocate_file_direct().
                     continue
-                rec_start = record_num * MFT_RECORD_SIZE - rel_offset
-                rec_end = rec_start + MFT_RECORD_SIZE
-                if rec_start < 0:
-                    rec_start = 0
-                if rec_end > len(data):
-                    rec_end = len(data)
-                if rec_start < rec_end:
-                    tpl_start = template_offset + rec_start
-                    chunk = data[rec_start:rec_end]
-                    self.image[tpl_start:tpl_start + len(chunk)] = chunk
+                rec_abs = self._rec_offset(record_num)
+                if rec_abs is None:
+                    continue
+                # Determine the overlap between the write data and this record
+                rec_end_abs = rec_abs + MFT_RECORD_SIZE
+                overlap_start = max(offset, rec_abs)
+                overlap_end = min(write_end, rec_end_abs)
+                if overlap_start >= overlap_end:
+                    continue
+                data_start = overlap_start - offset
+                data_end = overlap_end - offset
+                chunk = data[data_start:data_end]
+                self.image[overlap_start:overlap_start + len(chunk)] = chunk
 
-                    # Re-patch INDEX_ALLOC data_size and INDEX_BITMAP for protected
-                    # directories. Windows journal replay and access-time updates write
-                    # back old (smaller) values, hiding INDX blocks and making the
-                    # directory appear "corrupted and unreadable". By re-patching
-                    # immediately after the write we keep the fix alive indefinitely.
-                    # These fields don't fall at USA fixup positions (sector-end bytes
-                    # 510-511 / 1022-1023), so direct bytearray patching is safe.
-                    if record_num in self._protected_ia_sizes:
-                        ia_off_in_rec, target_ds, ib_off_in_rec, ib_val_off, bitmap = \
-                            self._protected_ia_sizes[record_num]
-                        rec_abs = self.mft_offset + record_num * MFT_RECORD_SIZE
-                        # Re-patch data_size and init_size
-                        ds_off = rec_abs + ia_off_in_rec + 48
-                        is_off = rec_abs + ia_off_in_rec + 56
-                        packed = struct.pack('<Q', target_ds)
-                        self.image[ds_off:ds_off + 8] = packed
-                        self.image[is_off:is_off + 8] = packed
-                        # Re-patch INDEX_BITMAP (ensures Windows sees all blocks as allocated)
-                        if ib_off_in_rec >= 0 and bitmap:
-                            bm_abs = rec_abs + ib_off_in_rec + ib_val_off
-                            self.image[bm_abs:bm_abs + len(bitmap)] = bitmap
+                # Re-patch INDEX_ALLOC data_size and INDEX_BITMAP for protected
+                # directories. Windows journal replay and access-time updates write
+                # back old (smaller) values, hiding INDX blocks and making the
+                # directory appear "corrupted and unreadable". By re-patching
+                # immediately after the write we keep the fix alive indefinitely.
+                # These fields don't fall at USA fixup positions (sector-end bytes
+                # 510-511 / 1022-1023), so direct bytearray patching is safe.
+                if record_num in self._protected_ia_sizes:
+                    ia_off_in_rec, target_ds, ib_off_in_rec, ib_val_off, bitmap = \
+                        self._protected_ia_sizes[record_num]
+                    # Re-patch data_size and init_size
+                    ds_off = rec_abs + ia_off_in_rec + 48
+                    is_off = rec_abs + ia_off_in_rec + 56
+                    packed = struct.pack('<Q', target_ds)
+                    self.image[ds_off:ds_off + 8] = packed
+                    self.image[is_off:is_off + 8] = packed
+                    # Re-patch INDEX_BITMAP (ensures Windows sees all blocks as allocated)
+                    if ib_off_in_rec >= 0 and bitmap:
+                        bm_abs = rec_abs + ib_off_in_rec + ib_val_off
+                        self.image[bm_abs:bm_abs + len(bitmap)] = bitmap
 
-                    # Keep $MFTMirr in sync: if this record falls within the
-                    # mirror's range, copy the full record to the mirror cluster.
-                    # This prevents ntfs-3g from crashing with "$MFTMirr does not
-                    # match $MFT" after any write to the mirrored records.
-                    if (self._mft_mirror_offset >= 0
-                            and record_num < self._mft_mirror_record_count):
-                        # Re-read the full (now-updated) record from the primary MFT
-                        primary_off = self.mft_offset + record_num * MFT_RECORD_SIZE
-                        mirror_off = self._mft_mirror_offset + record_num * MFT_RECORD_SIZE
-                        full_record = self.image[primary_off:primary_off + MFT_RECORD_SIZE]
-                        if len(full_record) == MFT_RECORD_SIZE:
-                            self.image[mirror_off:mirror_off + MFT_RECORD_SIZE] = full_record
+                # Keep $MFTMirr in sync: if this record falls within the
+                # mirror's range, copy the full record to the mirror cluster.
+                # This prevents ntfs-3g from crashing with "$MFTMirr does not
+                # match $MFT" after any write to the mirrored records.
+                if (self._mft_mirror_offset >= 0
+                        and record_num < self._mft_mirror_record_count):
+                    # Re-read the full (now-updated) record from the primary MFT
+                    primary_off = rec_abs
+                    mirror_off = self._mft_mirror_offset + record_num * MFT_RECORD_SIZE
+                    full_record = self.image[primary_off:primary_off + MFT_RECORD_SIZE]
+                    if len(full_record) == MFT_RECORD_SIZE:
+                        self.image[mirror_off:mirror_off + MFT_RECORD_SIZE] = full_record
 
     def _mft_worker(self):
         """Background thread: drain the MFT write queue and sync changes to ext4.
@@ -768,17 +787,27 @@ class ClusterMapper:
         Called without self.lock held. Each sub-method acquires self.lock only
         for brief metadata reads/writes, releasing it before slow ext4 operations.
         """
-        rel_offset = offset - self.mft_offset
-        if rel_offset < 0:
-            data = data[-rel_offset:]
-            rel_offset = 0
+        write_end = offset + len(data)
 
-        start_record = rel_offset // MFT_RECORD_SIZE
-        end_offset = rel_offset + len(data)
-        end_record = (end_offset + MFT_RECORD_SIZE - 1) // MFT_RECORD_SIZE
+        # Determine which MFT records are touched by this write
+        touched_records = []
+        cum_records = 0
+        for disk_off, run_bytes in self._mft_runs:
+            run_end = disk_off + run_bytes
+            if offset < run_end and write_end > disk_off:
+                overlap_start = max(offset, disk_off)
+                overlap_end = min(write_end, run_end)
+                first_rec = cum_records + (overlap_start - disk_off) // MFT_RECORD_SIZE
+                last_rec = cum_records + (overlap_end - disk_off - 1) // MFT_RECORD_SIZE
+                for rn in range(first_rec, last_rec + 1):
+                    touched_records.append(rn)
+            cum_records += run_bytes // MFT_RECORD_SIZE
+
+        if not touched_records:
+            return
 
         # Pass 1: Directory operations (renames and new directories)
-        for record_num in range(start_record, end_record):
+        for record_num in touched_records:
             with self.lock:
                 in_dir = record_num in self.mft_record_to_dir
                 in_source = record_num in self.mft_record_to_source
@@ -790,7 +819,7 @@ class ClusterMapper:
                 self._check_new_directory(record_num)
 
         # Pass 2: File operations (deletions, renames, new files, content updates)
-        for record_num in range(start_record, end_record):
+        for record_num in touched_records:
             with self.lock:
                 in_source = record_num in self.mft_record_to_source
                 in_dir = record_num in self.mft_record_to_dir
@@ -843,8 +872,7 @@ class ClusterMapper:
                             self._write_logged.add(source_path)
                     except OSError as e:
                         log(f"Write error for {source_path}: {e}")
-                        if byte_offset + chunk_len <= len(self.image):
-                            self.image[byte_offset:byte_offset + chunk_len] = chunk_data
+                        # Don't fall back to image - that would be silently lost on next read
             elif (run_mapping := self._run_map_lookup(cluster)) is not None:
                 # Write to ext4 source file (run-based mapping — all files with
                 # RUN_MAP_THRESHOLD=0 end up here, ensuring writes reach ext4)
@@ -861,8 +889,7 @@ class ClusterMapper:
                         self._write_logged.add(source_path)
                 except OSError as e:
                     log(f"Write error for {source_path}: {e}")
-                    if byte_offset + chunk_len <= len(self.image):
-                        self.image[byte_offset:byte_offset + chunk_len] = chunk_data
+                    # Don't fall back to image - that would be silently lost on next read
             else:
                 # Write to image (metadata region)
                 if byte_offset + chunk_len <= len(self.image):
@@ -929,7 +956,10 @@ class ClusterMapper:
     def _find_bitmap_location(self):
         """Find $Bitmap (MFT record 6) data runs to locate cluster bitmap."""
         # $Bitmap is always MFT record 6
-        record_offset = self.mft_offset + 6 * MFT_RECORD_SIZE
+        record_offset = self._rec_offset(6)
+        if record_offset is None:
+            log("Warning: $Bitmap MFT record offset not found")
+            return
         record = self._undo_fixups(bytearray(self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
 
         if record[:4] != b'FILE':
@@ -1039,7 +1069,9 @@ class ClusterMapper:
         """
         total_reserved = 0
         for record_num in range(16):
-            record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+            record_offset = self._rec_offset(record_num)
+            if record_offset is None:
+                continue
             raw = self.image[record_offset:record_offset + MFT_RECORD_SIZE]
             if len(raw) < MFT_RECORD_SIZE or raw[:4] != b'FILE':
                 continue
@@ -1086,8 +1118,11 @@ class ClusterMapper:
         in sync with the primary MFT without any external ntfsfix step.
         """
         try:
-            raw = self.image[self.mft_offset + MFT_RECORD_SIZE:
-                             self.mft_offset + 2 * MFT_RECORD_SIZE]
+            _rec1_off = self._rec_offset(1)
+            if _rec1_off is None:
+                log("  MFTMirr: record 1 offset not found — mirror sync disabled")
+                return
+            raw = self.image[_rec1_off:_rec1_off + MFT_RECORD_SIZE]
             if len(raw) < MFT_RECORD_SIZE or raw[:4] != b'FILE':
                 log("  MFTMirr: record 1 missing or invalid — mirror sync disabled")
                 return
@@ -1164,6 +1199,20 @@ class ClusterMapper:
             if cum + run_bytes > stream_off:
                 return disk_off + (stream_off - cum)
             cum += run_bytes
+        return None
+
+    def _rec_offset(self, record_num):
+        """Get disk byte offset for MFT record number."""
+        return self._mft_record_offset(record_num, self._mft_runs)
+
+    def _offset_to_rec(self, disk_offset):
+        """Get MFT record number from disk byte offset."""
+        cum_records = 0
+        for disk_off, run_bytes in self._mft_runs:
+            if disk_off <= disk_offset < disk_off + run_bytes:
+                byte_within_run = disk_offset - disk_off
+                return cum_records + byte_within_run // MFT_RECORD_SIZE
+            cum_records += run_bytes // MFT_RECORD_SIZE
         return None
 
     def fix_indx_clusters(self):
@@ -1506,7 +1555,9 @@ class ClusterMapper:
         Reads the record, strips non-essential attrs, finds $DATA offset,
         and calculates available space for data run entries.
         """
-        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+        record_offset = self._rec_offset(record_num)
+        if record_offset is None:
+            return 60  # Fallback default
         record = self._undo_fixups(bytearray(
             self.image[record_offset:record_offset + MFT_RECORD_SIZE]
         ))
@@ -1610,7 +1661,9 @@ class ClusterMapper:
         """
         from .data_runs import encode_data_runs
 
-        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+        record_offset = self._rec_offset(record_num)
+        if record_offset is None:
+            return False
         record = self._undo_fixups(bytearray(self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
 
         if record[:4] != b'FILE':
@@ -1729,7 +1782,9 @@ class ClusterMapper:
         Called after allocate_file_direct() so Windows sees the correct file size
         in directory listings (Windows reads size from $FILE_NAME, not $DATA).
         """
-        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+        record_offset = self._rec_offset(record_num)
+        if record_offset is None:
+            return False
         record = self._undo_fixups(bytearray(
             self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
         if record[:4] != b'FILE':
@@ -1767,7 +1822,9 @@ class ClusterMapper:
         """
         from .data_runs import decode_data_runs
 
-        par_offset = self.mft_offset + parent_record_num * MFT_RECORD_SIZE
+        par_offset = self._rec_offset(parent_record_num)
+        if par_offset is None:
+            return False
         par_rec = self._undo_fixups(bytearray(
             self.image[par_offset:par_offset + MFT_RECORD_SIZE]))
         if par_rec[:4] != b'FILE':
@@ -1920,9 +1977,9 @@ class ClusterMapper:
         # Update $FILE_NAME sizes and parent $I30 so Windows sees correct file size.
         # allocate_file_direct() only updates $DATA; without this Windows sees
         # $FILE_NAME.real_size=0 vs $DATA size=4GB and marks file as corrupted.
+        _fn_rec_off = self._rec_offset(record_num)
         _fn_rec = self._undo_fixups(bytearray(
-            self.image[self.mft_offset + record_num * MFT_RECORD_SIZE:
-                       self.mft_offset + (record_num + 1) * MFT_RECORD_SIZE]
+            self.image[_fn_rec_off:_fn_rec_off + MFT_RECORD_SIZE]
         ))
         _, _parent_ref_raw = self._extract_filename_and_parent(_fn_rec)
         if _parent_ref_raw:
@@ -1974,7 +2031,9 @@ class ClusterMapper:
         (non-sparse) runs, ntfs-3g may still treat the file as sparse and
         fail reads. Clearing this flag fixes that.
         """
-        record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+        record_offset = self._rec_offset(record_num)
+        if record_offset is None:
+            return
         record = self._undo_fixups(bytearray(
             self.image[record_offset:record_offset + MFT_RECORD_SIZE]
         ))
@@ -2042,11 +2101,11 @@ class ClusterMapper:
         # Use last cluster from last run
         last_run_start, last_run_count = runs[-1]
         last_cluster = last_run_start + last_run_count - 1
-        # Sparse data runs: (cluster_count-1, 0) for sparse, (1, last_cluster) for allocated
+        # Sparse data runs: (cluster_count-1, None) for sparse hole, (1, last_cluster) for allocated
         sparse_runs = []
         needed_clusters = (file_size + self.cluster_size - 1) // self.cluster_size
         if needed_clusters > 1:
-            sparse_runs.append((needed_clusters - 1, 0))  # Sparse run
+            sparse_runs.append((needed_clusters - 1, None))  # Sparse run (no physical clusters)
         sparse_runs.append((1, last_cluster))  # Keep one cluster allocated
 
         # Mark the last cluster as used
@@ -2078,26 +2137,19 @@ class ClusterMapper:
         self.resident_file_data.clear()
         self._direct_run_map.clear()
 
-        offset = self.mft_offset
-        record_num = 0
-
-        # Determine total MFT records from $MFT $DATA size
-        total_mft_records = self._get_mft_record_count()
-
         # First pass: find all directories
-        while record_num < total_mft_records and offset + MFT_RECORD_SIZE <= len(self.image):
+        for record_num in range(self._mft_total_records):
+            offset = self._rec_offset(record_num)
+            if offset is None or offset + MFT_RECORD_SIZE > len(self.image):
+                continue
             record = self.image[offset:offset + MFT_RECORD_SIZE]
             sig = record[0:4]
             if sig != b'FILE':
-                if sig == b'BAAD' or sig == b'\x00\x00\x00\x00':
-                    if sig == b'BAAD':
-                        # Zero out BAAD records so Windows doesn't see corrupt fixups
-                        self.image[offset:offset + MFT_RECORD_SIZE] = b'\x00' * MFT_RECORD_SIZE
-                        log(f"  Zeroed BAAD record {record_num}")
-                    offset += MFT_RECORD_SIZE
-                    record_num += 1
-                    continue
-                break
+                if sig == b'BAAD':
+                    # Zero out BAAD records so Windows doesn't see corrupt fixups
+                    self.image[offset:offset + MFT_RECORD_SIZE] = b'\x00' * MFT_RECORD_SIZE
+                    log(f"  Zeroed BAAD record {record_num}")
+                continue
 
             record = self._undo_fixups(bytearray(record))
             flags = struct.unpack('<H', record[22:24])[0]
@@ -2105,34 +2157,24 @@ class ClusterMapper:
             if flags & 0x01 and flags & 0x02:  # In-use directory
                 self._process_directory_record(record, record_num)
 
-            offset += MFT_RECORD_SIZE
-            record_num += 1
-
         # Second pass: find all files (both resident and non-resident)
-        offset = self.mft_offset
-        record_num = 0
-
-        while record_num < total_mft_records and offset + MFT_RECORD_SIZE <= len(self.image):
+        for record_num in range(self._mft_total_records):
+            offset = self._rec_offset(record_num)
+            if offset is None or offset + MFT_RECORD_SIZE > len(self.image):
+                continue
             record = self.image[offset:offset + MFT_RECORD_SIZE]
             sig = record[0:4]
             if sig != b'FILE':
-                if sig == b'BAAD' or sig == b'\x00\x00\x00\x00':
-                    if sig == b'BAAD':
-                        self.image[offset:offset + MFT_RECORD_SIZE] = b'\x00' * MFT_RECORD_SIZE
-                        log(f"  Zeroed BAAD record {record_num}")
-                    offset += MFT_RECORD_SIZE
-                    record_num += 1
-                    continue
-                break
+                if sig == b'BAAD':
+                    self.image[offset:offset + MFT_RECORD_SIZE] = b'\x00' * MFT_RECORD_SIZE
+                    log(f"  Zeroed BAAD record {record_num}")
+                continue
 
             record = self._undo_fixups(bytearray(record))
             flags = struct.unpack('<H', record[22:24])[0]
 
             if flags & 0x01 and not (flags & 0x02):  # In-use file
                 self._process_file_record(record, record_num)
-
-            offset += MFT_RECORD_SIZE
-            record_num += 1
 
     def _get_mft_record_count(self) -> int:
         """Get total MFT record count from $MFT record 0 $DATA attribute."""
@@ -2340,6 +2382,8 @@ class ClusterMapper:
             if attr_type == 0x30 and not attr_name:  # $FILE_NAME
                 val_len = struct.unpack('<I', record[off + 16:off + 20])[0]
                 val_off = struct.unpack('<H', record[off + 20:off + 22])[0]
+                if off + val_off + val_len > MFT_RECORD_SIZE:
+                    break
                 fn_data = record[off + val_off:off + val_off + val_len]
                 if len(fn_data) >= 66:
                     parent_ref = struct.unpack('<Q', fn_data[0:8])[0]
@@ -2461,7 +2505,9 @@ class ClusterMapper:
         """
         first_attr = struct.unpack('<H', record[20:22])[0]
         off = first_attr
-        record_abs = self.mft_offset + record_num * MFT_RECORD_SIZE
+        record_abs = self._rec_offset(record_num)
+        if record_abs is None:
+            return None
 
         while off < MFT_RECORD_SIZE - 8:
             attr_type = struct.unpack('<I', record[off:off + 4])[0]
@@ -2555,6 +2601,30 @@ class ClusterMapper:
         if top_level in self.known_root_entries:
             return os.path.join(self.source_dir, rel_path)
         return os.path.join(self.overflow_dir, rel_path)
+
+    def _validate_path(self, source_path: str, context: str = '') -> bool:
+        """Validate that a resolved path stays within allowed directories.
+
+        Returns True if the path is safe, False if it escapes the allowed
+        directories (path traversal) or contains null bytes.
+        """
+        # Reject null bytes in the path
+        if '\x00' in source_path:
+            log(f"  PATH REJECTED (null byte){' in ' + context if context else ''}: {source_path!r}")
+            return False
+
+        resolved = os.path.realpath(source_path)
+        source_real = os.path.realpath(self.source_dir)
+        overflow_real = os.path.realpath(self.overflow_dir)
+
+        if resolved.startswith(source_real + os.sep) or resolved == source_real:
+            return True
+        if overflow_real != source_real:
+            if resolved.startswith(overflow_real + os.sep) or resolved == overflow_real:
+                return True
+
+        log(f"  PATH REJECTED (traversal){' in ' + context if context else ''}: {source_path} -> {resolved}")
+        return False
 
     def _get_rel_path(self, source_path: str) -> str:
         """Get the relative path from a full source path.
@@ -2724,7 +2794,9 @@ class ClusterMapper:
             # check value (USA[0]) for ntfs-3g to accept the record.
             # _inject_resident_data can overwrite those bytes (at record
             # offsets 510-511 and 1022-1023) with ext4 file content.
-            record_abs = self.mft_offset + record_num * MFT_RECORD_SIZE
+            record_abs = self._rec_offset(record_num)
+            if record_abs is None:
+                continue
             try:
                 usa_off = struct.unpack('<H', bytes(self.image[record_abs + 4: record_abs + 6]))[0]
                 check_val = bytes(self.image[record_abs + usa_off: record_abs + usa_off + 2])
@@ -2752,35 +2824,29 @@ class ClusterMapper:
         vfm = self.virtual_file_manager
         read_end = offset + length
 
-        # Calculate which MFT records this read covers
-        rel_offset = offset - self.mft_offset
-        if rel_offset < 0:
-            return
-
-        start_record = rel_offset // MFT_RECORD_SIZE
-        end_record = (rel_offset + length + MFT_RECORD_SIZE - 1) // MFT_RECORD_SIZE
-
         # Check each virtual record to see if it falls in this read
         for record_num in list(vfm.mft_to_virtual.keys()):
-            if start_record <= record_num < end_record:
-                # This virtual record is within our read range
-                record_data = vfm.get_virtual_mft_record(record_num)
-                if record_data:
-                    # Calculate where this record should go in the result
-                    record_abs_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
-                    if record_abs_offset >= offset and record_abs_offset + MFT_RECORD_SIZE <= read_end:
-                        # Entire record fits in this read
-                        dst = record_abs_offset - offset
-                        result[dst:dst + MFT_RECORD_SIZE] = record_data
-                    else:
-                        # Partial overlap - handle carefully
-                        overlap_start = max(record_abs_offset, offset)
-                        overlap_end = min(record_abs_offset + MFT_RECORD_SIZE, read_end)
-                        if overlap_start < overlap_end:
-                            src_off = overlap_start - record_abs_offset
-                            dst_off = overlap_start - offset
-                            patch_len = overlap_end - overlap_start
-                            result[dst_off:dst_off + patch_len] = record_data[src_off:src_off + patch_len]
+            record_abs_offset = self._rec_offset(record_num)
+            if record_abs_offset is None:
+                continue
+            # Check if this record overlaps with the read range
+            if record_abs_offset + MFT_RECORD_SIZE <= offset or record_abs_offset >= read_end:
+                continue
+            record_data = vfm.get_virtual_mft_record(record_num)
+            if record_data:
+                if record_abs_offset >= offset and record_abs_offset + MFT_RECORD_SIZE <= read_end:
+                    # Entire record fits in this read
+                    dst = record_abs_offset - offset
+                    result[dst:dst + MFT_RECORD_SIZE] = record_data
+                else:
+                    # Partial overlap - handle carefully
+                    overlap_start = max(record_abs_offset, offset)
+                    overlap_end = min(record_abs_offset + MFT_RECORD_SIZE, read_end)
+                    if overlap_start < overlap_end:
+                        src_off = overlap_start - record_abs_offset
+                        dst_off = overlap_start - offset
+                        patch_len = overlap_end - overlap_start
+                        result[dst_off:dst_off + patch_len] = record_data[src_off:src_off + patch_len]
 
     def _inject_virtual_dir_entries(self, result: bytearray, offset: int, length: int):
         """Virtualize directory listings to include virtual files.
@@ -2812,12 +2878,7 @@ class ClusterMapper:
 
         vfm = self.virtual_file_manager
 
-        rel_offset = offset - self.mft_offset
-        if rel_offset < 0:
-            return
-
-        start_record = rel_offset // MFT_RECORD_SIZE
-        end_record = (rel_offset + length + MFT_RECORD_SIZE - 1) // MFT_RECORD_SIZE
+        read_end = offset + length
 
         # Log which directories we know about (first call only)
         if not hasattr(self, '_logged_dirs'):
@@ -2826,33 +2887,38 @@ class ClusterMapper:
 
         # Check each directory record
         for record_num, dir_path in list(self.mft_record_to_dir.items()):
-            if start_record <= record_num < end_record:
-                # Get virtual children for this directory
-                virtual_children = vfm.get_virtual_children(record_num)
-                if virtual_children:
-                    log(f"Dir {record_num} ({dir_path}) has {len(virtual_children)} virtual children: {[c.rel_path for c in virtual_children]}")
+            record_abs_offset = self._rec_offset(record_num)
+            if record_abs_offset is None:
+                continue
+            # Check if this record overlaps with the read range
+            if record_abs_offset + MFT_RECORD_SIZE <= offset or record_abs_offset >= read_end:
+                continue
 
-                if not virtual_children:
-                    continue
+            # Get virtual children for this directory
+            virtual_children = vfm.get_virtual_children(record_num)
+            if virtual_children:
+                log(f"Dir {record_num} ({dir_path}) has {len(virtual_children)} virtual children: {[c.rel_path for c in virtual_children]}")
 
-                # Virtualize this directory
-                record_abs_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
-                if record_abs_offset >= offset and record_abs_offset + MFT_RECORD_SIZE <= offset + length:
-                    dst = record_abs_offset - offset
-                    record_data = bytearray(result[dst:dst + MFT_RECORD_SIZE])
+            if not virtual_children:
+                continue
 
-                    # Build or update virtualized directory
-                    self._ensure_dir_virtualized(record_num, record_data, virtual_children)
+            # Virtualize this directory
+            if record_abs_offset >= offset and record_abs_offset + MFT_RECORD_SIZE <= offset + length:
+                dst = record_abs_offset - offset
+                record_data = bytearray(result[dst:dst + MFT_RECORD_SIZE])
 
-                    # Get the virtualized MFT record
-                    if record_num in self.virtualized_dirs:
-                        virt_record = self._build_virtualized_mft_record(record_num, record_data)
-                        if virt_record and len(virt_record) == MFT_RECORD_SIZE:
-                            result[dst:dst + MFT_RECORD_SIZE] = virt_record
-                        elif virt_record:
-                            log(f"Virtualized record size mismatch: {len(virt_record)} != {MFT_RECORD_SIZE}")
-                        else:
-                            log(f"Failed to build virtualized record for dir {record_num}")
+                # Build or update virtualized directory
+                self._ensure_dir_virtualized(record_num, record_data, virtual_children)
+
+                # Get the virtualized MFT record
+                if record_num in self.virtualized_dirs:
+                    virt_record = self._build_virtualized_mft_record(record_num, record_data)
+                    if virt_record and len(virt_record) == MFT_RECORD_SIZE:
+                        result[dst:dst + MFT_RECORD_SIZE] = virt_record
+                    elif virt_record:
+                        log(f"Virtualized record size mismatch: {len(virt_record)} != {MFT_RECORD_SIZE}")
+                    else:
+                        log(f"Failed to build virtualized record for dir {record_num}")
 
     def _inject_virtual_indx_clusters(self, result: bytearray, offset: int, length: int):
         """Inject synthesized INDX blocks for virtual clusters."""
@@ -3763,19 +3829,21 @@ class ClusterMapper:
 
     def is_mft_region(self, offset: int, length: int) -> bool:
         """Check if an offset affects the MFT region (including virtual MFT records)."""
-        max_tracked = max(self.mft_record_to_source.keys()) if self.mft_record_to_source else 64
-        mft_end = self.mft_offset + max(256, max_tracked + 64) * MFT_RECORD_SIZE
-
+        end = offset + length
+        for disk_off, run_bytes in self._mft_runs:
+            run_end = disk_off + run_bytes
+            if offset < run_end and end > disk_off:
+                return True
         # Also consider virtual MFT records (which may be at higher record numbers)
         if self.virtual_file_manager:
             vfm = self.virtual_file_manager
             if vfm.mft_to_virtual:
-                max_virtual = max(vfm.mft_to_virtual.keys())
-                virtual_mft_end = self.mft_offset + (max_virtual + 1) * MFT_RECORD_SIZE
-                mft_end = max(mft_end, virtual_mft_end)
-
-        write_end = offset + length
-        return not (write_end <= self.mft_offset or offset >= mft_end)
+                for vrec in vfm.mft_to_virtual.keys():
+                    vrec_off = self._rec_offset(vrec)
+                    if vrec_off is not None:
+                        if offset < vrec_off + MFT_RECORD_SIZE and end > vrec_off:
+                            return True
+        return False
 
     def _check_file_deleted(self, record_num: int) -> bool:
         """Check if a tracked file's MFT record was marked as deleted.
@@ -3784,7 +3852,9 @@ class ClusterMapper:
         Returns True if file was deleted.
         """
         with self.lock:
-            record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+            record_offset = self._rec_offset(record_num)
+            if record_offset is None:
+                return False
             if record_offset + MFT_RECORD_SIZE > len(self.image):
                 return False
 
@@ -3849,7 +3919,9 @@ class ClusterMapper:
             if not old_rel_path:
                 return
 
-            record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+            record_offset = self._rec_offset(record_num)
+            if record_offset is None:
+                return
             if record_offset + MFT_RECORD_SIZE > len(self.image):
                 return
 
@@ -3987,7 +4059,9 @@ class ClusterMapper:
         Called from the background MFT sync thread (self.lock NOT held).
         """
         with self.lock:
-            record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+            record_offset = self._rec_offset(record_num)
+            if record_offset is None:
+                return
             if record_offset + MFT_RECORD_SIZE > len(self.image):
                 log(f"  _check_new_dir({record_num}): beyond image")
                 return
@@ -4026,6 +4100,8 @@ class ClusterMapper:
                 return
 
             source_path = self._resolve_source_path(rel_path)
+            if not self._validate_path(source_path, '_check_new_directory'):
+                return
             do_create = not os.path.exists(source_path)
             if do_create:
                 self.ntfs_sync_in_progress.add(rel_path)
@@ -4052,7 +4128,9 @@ class ClusterMapper:
         Called from the background MFT sync thread (self.lock NOT held).
         """
         with self.lock:
-            record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+            record_offset = self._rec_offset(record_num)
+            if record_offset is None:
+                return None
             if record_offset + MFT_RECORD_SIZE > len(self.image):
                 log(f"  _check_new_file({record_num}): beyond image")
                 return None
@@ -4081,6 +4159,8 @@ class ClusterMapper:
                 rel_path = filename
 
             source_path = self._resolve_source_path(rel_path)
+            if not self._validate_path(source_path, '_check_new_file'):
+                return None
 
             if rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping new file (ext4 sync in progress): {rel_path}")
@@ -4171,7 +4251,9 @@ class ClusterMapper:
             if not source_path:
                 return
 
-            record_offset = self.mft_offset + record_num * MFT_RECORD_SIZE
+            record_offset = self._rec_offset(record_num)
+            if record_offset is None:
+                return
             if record_offset + MFT_RECORD_SIZE > len(self.image):
                 return
 
@@ -4198,6 +4280,9 @@ class ClusterMapper:
                     new_rel_path = filename
 
                 new_path = self._resolve_source_path(new_rel_path)
+                if not self._validate_path(new_path, '_reparse_mft_record'):
+                    new_path = source_path
+                    new_rel_path = old_rel
 
                 if new_path != source_path:
                     if os.path.exists(source_path):

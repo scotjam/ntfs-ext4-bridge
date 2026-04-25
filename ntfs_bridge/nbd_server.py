@@ -68,7 +68,7 @@ class NBDServer:
     """NBD server backed by ClusterMapper or PartitionWrapper."""
 
     def __init__(self, mapper: NBDBackend,
-                 host: str = '0.0.0.0', port: int = 10809,
+                 host: str = '127.0.0.1', port: int = 10809,
                  read_only: bool = False):
         self.host = host
         self.port = port
@@ -191,6 +191,10 @@ class NBDServer:
             opt_len = struct.unpack('>I', opt_len_data)[0]
             log(f"Handshake: option type={opt_type} len={opt_len}")
 
+            if opt_len > 65536:
+                log(f"Handshake: rejecting oversized option (len={opt_len})")
+                raise ValueError(f"Option data too large: {opt_len} bytes")
+
             opt_data = b''
             if opt_len > 0:
                 opt_data = self._recv_exact(sock, opt_len)
@@ -295,10 +299,18 @@ class NBDServer:
             log(f"Bad magic: {magic:x}")
             return False
 
+        MAX_PAYLOAD = 32 * 1024 * 1024  # 32 MB
+
         cmd_names = {0: 'READ', 1: 'WRITE', 2: 'DISC', 3: 'FLUSH', 4: 'TRIM'}
         cmd_name = cmd_names.get(cmd, f'UNKNOWN({cmd})')
 
         self._req_count += 1
+
+        if length > MAX_PAYLOAD and cmd in (NBD_CMD_READ, NBD_CMD_WRITE):
+            log(f"Rejecting oversized {cmd_name}: len={length} exceeds {MAX_PAYLOAD}")
+            reply = struct.pack('>IIQ', NBD_REPLY_MAGIC, 22, handle)  # EINVAL
+            sock.sendall(reply)
+            return True
 
         error = 0
         data = b''
@@ -312,8 +324,11 @@ class NBDServer:
                 elapsed = time.monotonic() - t0
                 if elapsed > 5.0:
                     log(f"SLOW READ: off={offset} len={length} took {elapsed:.1f}s")
-                if len(data) != length:
-                    log(f"Read size mismatch: expected {length}, got {len(data)}")
+                if len(data) < length:
+                    log(f"Read size mismatch: expected {length}, got {len(data)}, padding with zeros")
+                    data = data + b'\x00' * (length - len(data))
+                elif len(data) > length:
+                    data = data[:length]
 
             elif cmd == NBD_CMD_WRITE:
                 try:
@@ -380,7 +395,7 @@ def main():
     parser.add_argument('image', help='Path to NTFS image file')
     parser.add_argument('source', help='Path to ext4 source directory')
     parser.add_argument('-p', '--port', type=int, default=10809)
-    parser.add_argument('-H', '--host', default='0.0.0.0')
+    parser.add_argument('-H', '--host', default='127.0.0.1')
     parser.add_argument('-r', '--read-only', action='store_true')
 
     args = parser.parse_args()
