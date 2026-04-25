@@ -106,7 +106,10 @@ class PartitionWrapper:
         entry[4] = 0x07  # NTFS
         entry[5] = 0xFE; entry[6] = 0xFF; entry[7] = 0xFF  # CHS end
         struct.pack_into('<I', entry, 8, PARTITION_OFFSET_SECTORS)
-        struct.pack_into('<I', entry, 12, partition_sectors)
+        # MBR partition table uses 32-bit LBA sector counts; cap at 0xFFFFFFFF
+        # for volumes > 2TB.  Windows will use the NTFS boot sector's actual
+        # cluster count rather than the MBR entry for the true volume size.
+        struct.pack_into('<I', entry, 12, min(partition_sectors, 0xFFFFFFFF))
         mbr[446:462] = entry
 
         mbr[510] = 0x55
