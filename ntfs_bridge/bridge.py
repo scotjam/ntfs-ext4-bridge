@@ -1293,10 +1293,11 @@ class NTFSBridge:
 
         self._nbd_device = nbd_device
 
-        # Connect nbd-client
+        # Connect nbd-client. -p: persist (auto-reconnect if the connection
+        # drops for any reason, so /dev/nbd0 doesn't get orphaned).
         log(f"Connecting nbd-client to {nbd_device}...")
         result = subprocess.run(
-            ['nbd-client', '-N', '', '127.0.0.1', str(self.port), nbd_device],
+            ['nbd-client', '-p', '-N', '', '127.0.0.1', str(self.port), nbd_device],
             capture_output=True, text=True
         )
         if result.returncode != 0:
