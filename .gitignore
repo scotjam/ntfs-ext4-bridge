@@ -25,3 +25,23 @@ venv/
 # Temp files
 /tmp/
 *.tmp
+
+# Claude Code config
+.claude/
+
+# Ad-hoc WinRM debug scripts (contain hardcoded credentials)
+/winrm_check*.py
+
+# One-off debug scripts (contain hardcoded credentials)
+/scripts/check_gaming*.py
+
+# Ad-hoc test scripts (root-level) for deprecated virtual mode
+/test_virtual_*.sh
+
+# Tests for deprecated dynamic_ntfs/dynamic_server code path
+/tests/test_dynamic_*
+
+# Ad-hoc test scripts (not part of formal suite)
+/tests/test_large_files.sh
+/tests/test_new_large.sh
+/tests/test_ntfs3g_mount.py
