@@ -163,41 +163,44 @@ class SyncDaemon:
             log(f"  Failed to create dir in NTFS: {rel_path}: {e}")
 
     def _sync_create_file(self, rel_path: str, source_path: str, ntfs_path: str):
-        """Create a file in the NTFS mount.
+        """Notice a new file in ext4 and (deliberately) do NOT propagate it
+        to the NTFS mount.
 
-        For large files (>700 bytes) with lazy allocation enabled:
-        - Create as sparse (metadata only, no data copy)
-        - File will be allocated on first read
+        SAFETY: writing to `ntfs_path` (the FUSE-mounted view of the
+        bridge's synthesized NTFS image) is mirrored back to the source
+        ext4 file by the bridge's write-through layer. That meant the
+        previous implementation's `shutil.copy2(source_path, ntfs_path)`
+        and `lazy_allocator.create_sparse_file()` (which does
+        `open(ntfs_path, 'wb')`) would both truncate the source file
+        and overwrite it — either fully (if the operation completed),
+        leaving an all-zeros file at the same size, or partially (if
+        the underlying write hit Errno 5 partway through), leaving the
+        source file with intact head bytes and a zero-filled tail.
 
-        For small files or without lazy allocation:
-        - Copy actual content so NTFS allocates real clusters
+        The trade-off this disables: a file added to the ext4 source
+        AFTER the bridge has started won't appear in the synthesized
+        NTFS view until the bridge is restarted (the synthesizer
+        rebuilds from the source dir at boot). The source ext4 file
+        stays intact.
         """
-        # Ensure parent directory exists in NTFS mount
-        parent = os.path.dirname(ntfs_path)
-        if parent and not os.path.exists(parent):
-            parent_rel = os.path.dirname(rel_path)
-            parent_source = os.path.join(self.source_dir, parent_rel)
-            if os.path.isdir(parent_source):
-                self._sync_create_dir(parent_rel, parent_source, parent)
-
         try:
             file_size = os.path.getsize(source_path)
-
-            # Use lazy allocation for large files if available
-            if self.lazy_allocator and file_size > LARGE_FILE_THRESHOLD:
-                # Create as sparse file (will be allocated on first read)
-                if self.lazy_allocator.create_sparse_file(rel_path, source_path):
-                    subprocess.run(['sync'], capture_output=True)
-                    return
-                # Fall through to full copy if sparse creation failed
-
-            # Small file or no lazy allocator - copy actual content
-            shutil.copy2(source_path, ntfs_path)
-
-            log(f"  FILE created in NTFS: {rel_path} ({file_size} bytes)")
-            subprocess.run(['sync'], capture_output=True)
         except OSError as e:
-            log(f"  Failed to create file in NTFS: {rel_path}: {e}")
+            log(f"  Could not stat new file {rel_path}: {e}")
+            return
+        log(f"  FILE noticed in ext4 (not synthesizing live to avoid "
+            f"write-through corruption — restart the bridge to pick "
+            f"it up): {rel_path} ({file_size} bytes)")
+        # Register for lazy allocation so an eventual read can find
+        # source bytes via the cluster mapper. Visibility in the
+        # synthesized NTFS directory listing still requires a bridge
+        # restart.
+        if self.lazy_allocator and file_size > LARGE_FILE_THRESHOLD:
+            try:
+                self.lazy_allocator.register_file(
+                    rel_path, source_path, is_allocated=False)
+            except Exception as e:
+                log(f"  register_file failed for {rel_path}: {e}")
 
     def _handle_delete(self, rel_path: str):
         """Handle file/directory deletion in ext4."""

@@ -255,39 +255,28 @@ class LazyAllocator:
                         self.on_deallocated(rel_path)
                     return True
 
-            # Fall back to ntfs-3g method for files allocated through ntfs-3g
-            ntfs_path = os.path.join(self.ntfs_mount, rel_path)
-            file_size = os.path.getsize(source_path)
-
-            # Mark as ext4 sync in progress to prevent sync daemon interference
-            self.mapper.ext4_sync_in_progress.add(rel_path)
-            try:
-                # Truncate to 0 to free clusters
-                with open(ntfs_path, 'wb') as f:
-                    pass  # Empty file
-
-                # Restore size as sparse
-                with open(ntfs_path, 'r+b') as f:
-                    if file_size > 0:
-                        f.seek(file_size - 1)
-                        f.write(b'\x00')
-
-                subprocess.run(['sync'], capture_output=True)
-
-                # Rescan MFT - clusters will no longer be mapped
-                self.mapper.rescan_mft()
-
-            finally:
-                self.mapper.ext4_sync_in_progress.discard(rel_path)
-
+            # DISABLED: the ntfs-3g fallback path opens `ntfs_path` (the
+            # FUSE-mounted view of the bridge's synthesized NTFS) in
+            # 'wb' mode and then sparse-extends it. The bridge's
+            # write-through layer mirrors that truncate + sparse hole
+            # back to the source ext4 file, destroying its contents.
+            # If the operation completes, the source file ends up all
+            # zeros at the original size. If it's interrupted (Errno 5
+            # I/O error mid-truncate), the source file is left with
+            # its head bytes intact and a zero-filled tail. Either way
+            # the source ext4 file is irrecoverable from the bridge.
+            #
+            # The only safe deallocation is `deallocate_file_direct`
+            # above, which manipulates only the synthesized image's
+            # cluster bitmap. If that path isn't available (the file
+            # wasn't allocated via allocate_file_direct), we leave the
+            # file allocated; the worst that happens is the image's
+            # raw file grows. The source data stays correct.
+            log(f"  Deallocation skipped (no direct path; would damage "
+                f"source via write-through): {rel_path}")
             with self.state_lock:
-                self.file_states[rel_path] = STATE_SPARSE
-                self.last_read_time.pop(rel_path, None)
-
-            log(f"  Deallocated: {rel_path}")
-            if self.on_deallocated:
-                self.on_deallocated(rel_path)
-            return True
+                self.file_states[rel_path] = STATE_ALLOCATED
+            return False
 
         except Exception as e:
             log(f"  Deallocation failed for {rel_path}: {e}")
@@ -320,39 +309,37 @@ class LazyAllocator:
                 self.deallocate_file(rel_path)
 
     def create_sparse_file(self, rel_path: str, source_path: str) -> bool:
-        """Create a sparse file entry in NTFS (metadata only, no data).
+        """DISABLED — see SyncDaemon._sync_create_file for context.
 
-        Used by SyncDaemon when a new large file is detected in ext4.
-        Creates the file with correct size but no allocated clusters.
+        The previous implementation opened `ntfs_path` (the FUSE mount
+        path) in 'wb' mode and then sparse-extended it. The bridge's
+        write-through layer mirrors both operations back to the source
+        ext4 file, destroying its contents. Two failure modes:
+
+          * operation completes -> source file is all zeros, original
+            size preserved
+          * operation hits Errno 5 mid-truncate -> source file has its
+            head bytes intact but a zero-filled tail
+
+        Either way the source file is irrecoverable. The damage
+        already inflicted across the existing libraries is documented
+        in the corruption audit. New files cannot be synthesized live;
+        they'll appear in the NTFS view after the next bridge restart
+        (when the synthesizer rebuilds from the source dir).
         """
-        ntfs_path = os.path.join(self.ntfs_mount, rel_path)
-
         try:
             file_size = os.path.getsize(source_path)
-
-            if file_size <= self.LARGE_FILE_THRESHOLD:
-                # Small file - copy normally (will be resident)
-                return False  # Let caller handle normally
-
-            # Ensure parent directory exists
-            parent = os.path.dirname(ntfs_path)
-            if parent and not os.path.exists(parent):
-                os.makedirs(parent, exist_ok=True)
-
-            # Create sparse file (no data copy)
-            with open(ntfs_path, 'wb') as f:
-                if file_size > 0:
-                    f.seek(file_size - 1)
-                    f.write(b'\x00')
-
-            subprocess.run(['sync'], capture_output=True)
-
-            # Register for lazy allocation
-            self.register_file(rel_path, source_path, is_allocated=False)
-
-            log(f"  Created sparse: {rel_path} ({file_size / 1024 / 1024:.1f} MB)")
-            return True
-
-        except Exception as e:
-            log(f"  Failed to create sparse file {rel_path}: {e}")
+        except OSError as e:
+            log(f"  create_sparse_file: stat failed for {rel_path}: {e}")
             return False
+        if file_size <= self.LARGE_FILE_THRESHOLD:
+            return False
+        # Register for lazy allocation so the cluster mapper knows where
+        # to read source bytes from if a read ever does hit this region.
+        # Directory listing for this file in the synthesized NTFS view
+        # remains unavailable until the next bridge restart.
+        self.register_file(rel_path, source_path, is_allocated=False)
+        log(f"  Noted new file (not synthesizing live, restart bridge to "
+            f"surface in NTFS view): {rel_path} "
+            f"({file_size / 1024 / 1024:.1f} MB)")
+        return True
