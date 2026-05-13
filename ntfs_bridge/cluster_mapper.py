@@ -4127,6 +4127,40 @@ class ClusterMapper:
                 new_rel = new_dir_path + dir_path[len(old_dir_path):]
                 self.mft_record_to_dir[record_num] = new_rel
 
+    def _is_orphan_root_fallthrough(self, parent_record: int, rel_path: str) -> bool:
+        """Detect the parent-untracked → root-fallthrough corruption pattern.
+
+        The three workers (_check_new_directory, _check_new_file,
+        _reparse_mft_record) all derive rel_path with the same branch:
+
+            if parent_record == 5:
+                rel_path = filename
+            elif parent_record in mft_record_to_dir:
+                rel_path = join(parent_path, filename)
+            else:
+                rel_path = filename   # <-- silently treated as root
+
+        The final else fires when Windows mutates an MFT record whose parent
+        directory we never successfully tracked (e.g. _check_new_directory
+        rejected it earlier because _validate_path balks at symlink
+        traversal). The worker then materializes the record at source_dir
+        root — a corrupted duplicate of a tree file, invisible in the NTFS
+        view because the MFT entry already points correctly inside its
+        proper subtree.
+
+        We only flag this specific fallthrough — *not* a legitimate root
+        write where parent_record == 5. Backblaze and other apps may freely
+        create new top-level entries (.bzvol, working dirs, etc) and those
+        go through the normal write path.
+        """
+        if parent_record == 5:
+            return False
+        if parent_record in self.mft_record_to_dir:
+            return False
+        if os.sep in rel_path:
+            return False
+        return True
+
     def _check_new_directory(self, record_num: int):
         """Check if an MFT record is a new directory.
 
@@ -4165,6 +4199,11 @@ class ClusterMapper:
                 rel_path = os.path.join(parent_path, filename) if parent_path else filename
             else:
                 rel_path = filename
+
+            if self._is_orphan_root_fallthrough(parent_record, rel_path):
+                log(f"  Skipping orphan-root dir fallthrough: {rel_path} "
+                    f"(record {record_num}, parent={parent_record} untracked)")
+                return
 
             if rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping new dir (ext4 sync in progress): {rel_path}")
@@ -4231,6 +4270,11 @@ class ClusterMapper:
                 rel_path = os.path.join(parent_path, filename) if parent_path else filename
             else:
                 rel_path = filename
+
+            if self._is_orphan_root_fallthrough(parent_record, rel_path):
+                log(f"  Skipping orphan-root file fallthrough: {rel_path} "
+                    f"(record {record_num}, parent={parent_record} untracked)")
+                return None
 
             source_path = self._resolve_source_path(rel_path)
             if not self._validate_path(source_path, '_check_new_file'):
@@ -4352,6 +4396,11 @@ class ClusterMapper:
                     new_rel_path = os.path.join(parent_path, filename) if parent_path else filename
                 else:
                     new_rel_path = filename
+
+                if self._is_orphan_root_fallthrough(parent_record, new_rel_path) and os.sep in old_rel:
+                    log(f"  Refusing reparse-move to orphan root: {old_rel} -> {new_rel_path} "
+                        f"(record {record_num}, parent={parent_record} untracked); keeping old path")
+                    new_rel_path = old_rel
 
                 new_path = self._resolve_source_path(new_rel_path)
                 if not self._validate_path(new_path, '_reparse_mft_record'):
