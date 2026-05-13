@@ -189,12 +189,23 @@ class ClusterMapper:
             os.makedirs(self.overflow_dir, exist_ok=True)
             log(f"Overflow directory: {self.overflow_dir}")
 
-        # Known top-level entries in the source directory (for root path resolution)
+        # Known top-level entries in the source directory (for root path
+        # resolution). protected_roots is the authoritative allowlist: only
+        # source_dir top-level entries named there are recognised. Anything
+        # else at source_dir root is ignored, and _resolve_source_path
+        # consequently routes its rel_paths to overflow_dir. When
+        # protected_roots is empty, source_dir contributes nothing -- a
+        # misconfigured bridge can't accidentally expose shares.
         self.known_root_entries: Set[str] = set()
-        try:
-            self.known_root_entries = set(os.listdir(self.source_dir))
-        except OSError:
-            pass
+        if self._protected_top_dirs:
+            try:
+                entries = set(os.listdir(self.source_dir))
+            except OSError:
+                entries = set()
+            self.known_root_entries = {
+                name for name in entries
+                if name.lower() in self._protected_top_dirs
+            }
 
         # Memory-map the image file, then wrap with a hot RAM cache.
         # The hot cache keeps the first 64MB in a bytearray so NTFS metadata
