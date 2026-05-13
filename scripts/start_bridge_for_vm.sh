@@ -67,6 +67,13 @@ echo "Starting bridge19 at $(date)" >> "$LOG"
 cd "$PROJECT_DIR"
 export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
 
+# Optional: silent-drop writes for chosen top-level subdirs of the source.
+# Operators set PROTECTED_ROOTS=dir1,dir2 in a local wrapper (not committed).
+PROTECTED_FLAG=()
+if [ -n "${PROTECTED_ROOTS:-}" ]; then
+    PROTECTED_FLAG=(--protected-roots "$PROTECTED_ROOTS")
+fi
+
 python3 -m ntfs_bridge.bridge \
     --source "$SOURCE_DIR" \
     --image "$IMAGE_PATH" \
@@ -74,6 +81,6 @@ python3 -m ntfs_bridge.bridge \
     --port "$PORT" \
     --partitioned \
     --lazy \
-    --dealloc-timeout 31536000 >> "$LOG" 2>&1
+    --dealloc-timeout 31536000 "${PROTECTED_FLAG[@]}" >> "$LOG" 2>&1
 
 echo "Bridge exited at $(date) code=$?" >> "$LOG"

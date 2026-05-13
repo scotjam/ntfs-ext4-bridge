@@ -51,7 +51,8 @@ class NTFSBridge:
                  partitioned: bool = False,
                  virtual_mode: bool = False,
                  overflow_dir=None,
-                 exclude_patterns=None):
+                 exclude_patterns=None,
+                 protected_roots=None):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
         self.ntfs_mount = os.path.abspath(ntfs_mount)
@@ -64,6 +65,7 @@ class NTFSBridge:
         self.overflow_dir = overflow_dir
         self.virtual_mode = virtual_mode
         self.exclude_patterns = list(exclude_patterns) if exclude_patterns else []
+        self.protected_roots = list(protected_roots) if protected_roots else []
 
         self.mapper = None
         self.partition_wrapper = None
@@ -169,7 +171,8 @@ class NTFSBridge:
         # Step 3: Initialize ClusterMapper
         log("Initializing ClusterMapper...")
         self.mapper = ClusterMapper(self.image_path, self.source_dir,
-                                     overflow_dir=self.overflow_dir)
+                                     overflow_dir=self.overflow_dir,
+                                     protected_roots=self.protected_roots)
 
         # Step 4: Create LazyAllocator if enabled
         if self.lazy_alloc:
@@ -1424,8 +1427,19 @@ def main():
                         help='Exclude files/dirs matching this glob pattern (can repeat). '
                              'Matched against filename and relative path. '
                              'Example: --exclude "*.raw" --exclude "bridge-test"')
+    parser.add_argument('--protected-roots', default='',
+                        help='Comma-separated list of top-level subdirectories of '
+                             '--source whose contents are presented read-only to the '
+                             'NTFS volume. Writes targeting MFT records or data '
+                             'clusters of files under these directories are silently '
+                             'dropped. The drive remains writable at the root and in '
+                             'other subdirectories (e.g. System Volume Information, '
+                             'or any working dir a backup/indexing tool installs at '
+                             'the volume root). Example: '
+                             '--protected-roots share-a,share-b,share-c')
 
     args = parser.parse_args()
+    protected_roots = [r.strip() for r in args.protected_roots.split(',') if r.strip()]
 
     bridge = NTFSBridge(
         image_path=args.image,
@@ -1440,6 +1454,7 @@ def main():
         virtual_mode=args.virtual,
         overflow_dir=args.overflow_dir,
         exclude_patterns=args.exclude,
+        protected_roots=protected_roots,
     )
 
     # Handle signals
