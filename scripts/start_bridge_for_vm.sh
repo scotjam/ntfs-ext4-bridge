@@ -74,6 +74,15 @@ if [ -n "${PROTECTED_ROOTS:-}" ]; then
     PROTECTED_FLAG=(--protected-roots "$PROTECTED_ROOTS")
 fi
 
+# Optional: send root-level entries Windows creates outside the source tree
+# (e.g. .bzvol, System Volume Information, $RECYCLE.BIN) to a separate
+# overflow directory rather than the source-dir root. Set OVERFLOW_DIR=path
+# in a local wrapper (not committed) to point at a partition with room.
+OVERFLOW_FLAG=()
+if [ -n "${OVERFLOW_DIR:-}" ]; then
+    OVERFLOW_FLAG=(--overflow-dir "$OVERFLOW_DIR")
+fi
+
 python3 -m ntfs_bridge.bridge \
     --source "$SOURCE_DIR" \
     --image "$IMAGE_PATH" \
@@ -81,6 +90,7 @@ python3 -m ntfs_bridge.bridge \
     --port "$PORT" \
     --partitioned \
     --lazy \
-    --dealloc-timeout 31536000 "${PROTECTED_FLAG[@]}" >> "$LOG" 2>&1
+    --dealloc-timeout 31536000 \
+    "${PROTECTED_FLAG[@]}" "${OVERFLOW_FLAG[@]}" >> "$LOG" 2>&1
 
 echo "Bridge exited at $(date) code=$?" >> "$LOG"
