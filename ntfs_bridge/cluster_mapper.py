@@ -171,10 +171,13 @@ class ClusterMapper:
         # (root-level files, subdirectories created by Windows like System
         # Volume Information, $RECYCLE.BIN, or any working dir a backup or
         # indexing tool installs at the volume root) still propagate normally.
-        # Set by --protected-roots; empty set = no protection.
+        # Set by --protected-roots; empty set = no protection. Stored
+        # lowercased and matched case-insensitively, because the synthesized
+        # NTFS view is case-insensitive even when the ext4 source preserves
+        # case (e.g. Documents vs documents).
         self._protected_top_dirs: Set[str] = set()
         if protected_roots:
-            self._protected_top_dirs = {p for p in protected_roots if p}
+            self._protected_top_dirs = {p.lower() for p in protected_roots if p}
 
         # Overflow directory for root-level items not in the source tree
         # (e.g. System Volume Information, Windows SID folders)
@@ -381,7 +384,7 @@ class ClusterMapper:
             )
             protected_dirs = sum(
                 1 for rel in self.mft_record_to_dir.values()
-                if rel and rel.split(os.sep, 1)[0] in self._protected_top_dirs
+                if rel and rel.split(os.sep, 1)[0].lower() in self._protected_top_dirs
             )
             log(f"Protected (read-only at bridge): {sorted(self._protected_top_dirs)} "
                 f"-> {protected_files} files, {protected_dirs} dirs")
@@ -720,10 +723,13 @@ class ClusterMapper:
         if not rel_path:
             return False
         top = rel_path.split(os.sep, 1)[0]
-        return top in self._protected_top_dirs
+        return top.lower() in self._protected_top_dirs
 
     def _is_source_protected(self, source_path: str) -> bool:
-        """Return True if source_path lies under a protected top-level dir of source_dir."""
+        """Return True if source_path lies under a protected top-level dir of source_dir.
+
+        Case-insensitive comparison; see _protected_top_dirs note.
+        """
         if not self._protected_top_dirs:
             return False
         prefix = self.source_dir + os.sep
@@ -731,7 +737,7 @@ class ClusterMapper:
             return False
         rel = source_path[len(prefix):]
         top = rel.split(os.sep, 1)[0]
-        return top in self._protected_top_dirs
+        return top.lower() in self._protected_top_dirs
 
     def _mft_write_to_image(self, offset: int, data: bytes):
         """Write MFT record data to the image (fast path, called under self.lock).
