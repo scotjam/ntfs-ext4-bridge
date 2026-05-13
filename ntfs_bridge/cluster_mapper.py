@@ -19,7 +19,7 @@ import struct
 import threading
 import time
 import traceback
-from typing import Dict, List, Tuple, Optional, Set, TYPE_CHECKING
+from typing import Dict, Iterable, List, Tuple, Optional, Set, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .lazy_allocator import LazyAllocator
@@ -159,9 +159,22 @@ class ClusterMapper:
     """
 
     def __init__(self, image_path: str, source_dir: str,
-                 overflow_dir: Optional[str] = None):
+                 overflow_dir: Optional[str] = None,
+                 protected_roots: Optional[Iterable[str]] = None):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
+
+        # Top-level subdirectories of source_dir whose contents are presented
+        # read-only at the bridge level. Writes that target an MFT record
+        # belonging to a file/dir under one of these roots, or a data cluster
+        # belonging to such a file, are silently dropped. Writes elsewhere
+        # (root-level files, subdirectories created by Windows like System
+        # Volume Information, $RECYCLE.BIN, or any working dir a backup or
+        # indexing tool installs at the volume root) still propagate normally.
+        # Set by --protected-roots; empty set = no protection.
+        self._protected_top_dirs: Set[str] = set()
+        if protected_roots:
+            self._protected_top_dirs = {p for p in protected_roots if p}
 
         # Overflow directory for root-level items not in the source tree
         # (e.g. System Volume Information, Windows SID folders)
@@ -360,6 +373,18 @@ class ClusterMapper:
         log(f"Initialized: {len(self._direct_run_map)} runs mapped, "
             f"{len(self.mft_record_to_source)} files tracked "
             f"({len(self.resident_file_data)} resident)")
+
+        if self._protected_top_dirs:
+            protected_files = sum(
+                1 for src in self.mft_record_to_source.values()
+                if self._is_source_protected(src)
+            )
+            protected_dirs = sum(
+                1 for rel in self.mft_record_to_dir.values()
+                if rel and rel.split(os.sep, 1)[0] in self._protected_top_dirs
+            )
+            log(f"Protected (read-only at bridge): {sorted(self._protected_top_dirs)} "
+                f"-> {protected_files} files, {protected_dirs} dirs")
 
     def close(self):
         """Close the memory-mapped image file."""
@@ -677,6 +702,37 @@ class ClusterMapper:
         else:
             self._write_inner(offset, data)
 
+    def _is_record_protected(self, record_num: int) -> bool:
+        """Return True if record_num's path resolves under a protected top-level dir.
+
+        Uses mft_record_to_source / mft_record_to_dir to map the record back to
+        its relative path, then checks the top-level component against
+        self._protected_top_dirs. Resident files have their data inside the MFT
+        record, so blocking the record write also protects the file content.
+        """
+        if not self._protected_top_dirs:
+            return False
+        rel_path = None
+        if record_num in self.mft_record_to_source:
+            rel_path = self._get_rel_path(self.mft_record_to_source[record_num])
+        elif record_num in self.mft_record_to_dir:
+            rel_path = self.mft_record_to_dir[record_num]
+        if not rel_path:
+            return False
+        top = rel_path.split(os.sep, 1)[0]
+        return top in self._protected_top_dirs
+
+    def _is_source_protected(self, source_path: str) -> bool:
+        """Return True if source_path lies under a protected top-level dir of source_dir."""
+        if not self._protected_top_dirs:
+            return False
+        prefix = self.source_dir + os.sep
+        if not source_path.startswith(prefix):
+            return False
+        rel = source_path[len(prefix):]
+        top = rel.split(os.sep, 1)[0]
+        return top in self._protected_top_dirs
+
     def _mft_write_to_image(self, offset: int, data: bytes):
         """Write MFT record data to the image (fast path, called under self.lock).
 
@@ -715,6 +771,12 @@ class ClusterMapper:
                     # Protect directly-allocated file records from external overwrites.
                     # ntfs-3g or Windows journal replay may write stale sparse data
                     # runs for these records, which would silently undo allocate_file_direct().
+                    continue
+                if self._is_record_protected(record_num):
+                    # User-configured read-only top-level dir: drop the write.
+                    # The image keeps its current (good) record bytes; ext4 source
+                    # never sees the write either, since _mft_sync_ext4_passes
+                    # re-reads the (unchanged) record from the image.
                     continue
                 rec_abs = self._rec_offset(record_num)
                 if rec_abs is None:
@@ -860,6 +922,9 @@ class ClusterMapper:
                 else:
                     # Write to ext4 source file (per-cluster mapping)
                     source_path, file_offset = mapping
+                    if self._is_source_protected(source_path):
+                        pos += chunk_len
+                        continue
                     write_offset = file_offset + cluster_offset
                     try:
                         with open(source_path, 'r+b') as f:
@@ -877,6 +942,9 @@ class ClusterMapper:
                 # Write to ext4 source file (run-based mapping — all files with
                 # RUN_MAP_THRESHOLD=0 end up here, ensuring writes reach ext4)
                 source_path, file_offset = run_mapping
+                if self._is_source_protected(source_path):
+                    pos += chunk_len
+                    continue
                 write_offset = file_offset + cluster_offset
                 try:
                     with open(source_path, 'r+b') as f:
