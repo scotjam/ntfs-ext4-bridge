@@ -96,6 +96,9 @@ class NTFSBridge:
         file_count = 0
         for dirpath, dirnames, filenames in os.walk(self.source_dir, followlinks=True):
             rel_root = os.path.relpath(dirpath, self.source_dir)
+            if rel_root == '.':
+                dirnames[:] = [d for d in dirnames if self._should_expose_source_root(d)]
+                filenames[:] = [f for f in filenames if self._should_expose_source_root(f)]
             dirnames[:] = [d for d in dirnames
                            if not self._should_exclude(os.path.join(rel_root, d) if rel_root != '.' else d)]
             for f in filenames:
@@ -1107,6 +1110,9 @@ class NTFSBridge:
 
             for root, dirs, files in os.walk(self.source_dir, followlinks=True):
                 rel_root = os.path.relpath(root, self.source_dir)
+                if rel_root == '.':
+                    dirs[:] = [d for d in dirs if self._should_expose_source_root(d)]
+                    files[:] = [f for f in files if self._should_expose_source_root(f)]
                 dirs[:] = [d for d in dirs
                            if not self._should_exclude(os.path.join(rel_root, d) if rel_root != '.' else d)]
 
@@ -1243,6 +1249,9 @@ class NTFSBridge:
 
         for root, dirs, files in os.walk(self.source_dir, followlinks=True):
             rel_root = os.path.relpath(root, self.source_dir)
+            if rel_root == '.':
+                dirs[:] = [d for d in dirs if self._should_expose_source_root(d)]
+                files[:] = [f for f in files if self._should_expose_source_root(f)]
             dirs[:] = [d for d in dirs
                        if not self._should_exclude(os.path.join(rel_root, d) if rel_root != '.' else d)]
 
@@ -1380,6 +1389,22 @@ class NTFSBridge:
             if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(rel_path, pattern):
                 return True
         return False
+
+    def _should_expose_source_root(self, name: str) -> bool:
+        """Return True if a top-level source_dir entry should be exposed.
+
+        --protected-roots is the authoritative list of source_dir shares
+        the bridge exposes at the NTFS root. Anything not on it is skipped
+        at populate time and never appears in the NTFS view.
+
+        If --protected-roots is empty (or unset), no source_dir entries
+        are exposed at all — only overflow_dir contents reach F:\\. This
+        is the safe default: source_dir must be opted into explicitly,
+        so a misconfigured bridge cannot accidentally expose shares
+        read-write.
+        """
+        wanted = {p.lower() for p in (self.protected_roots or [])}
+        return name.lower() in wanted
 
     @staticmethod
     def _get_dir_size(path: str) -> int:
