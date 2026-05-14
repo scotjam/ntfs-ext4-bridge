@@ -45,3 +45,8 @@ venv/
 /tests/test_large_files.sh
 /tests/test_new_large.sh
 /tests/test_ntfs3g_mount.py
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

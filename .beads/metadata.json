@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "ntfs_ext4_bridge",
+  "project_id": "c1b1796a-afd4-4238-90d5-b9a071136794"
+}
