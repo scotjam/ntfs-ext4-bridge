@@ -819,6 +819,16 @@ class ClusterMapper:
                 if record_num in self._protected_ia_sizes:
                     ia_off_in_rec, target_ds, ib_off_in_rec, ib_val_off, bitmap = \
                         self._protected_ia_sizes[record_num]
+                    # Re-patch non-resident flag at +8: INDEX_ALLOCATION MUST
+                    # always be non-resident per NTFS spec. Windows journal
+                    # replay or ntfs-3g may write back a resident-flagged
+                    # version, which corrupts the attribute layout and trips
+                    # ntfsfix "Corrupt resident attribute 0xa0" on next mount.
+                    # Byte +8 of any 8-byte-aligned attr never collides with
+                    # USA fixup positions (510-511, 1022-1023), so direct
+                    # patching is safe.
+                    nr_off = rec_abs + ia_off_in_rec + 8
+                    self.image[nr_off:nr_off + 1] = b'\x01'
                     # Re-patch data_size and init_size
                     ds_off = rec_abs + ia_off_in_rec + 48
                     is_off = rec_abs + ia_off_in_rec + 56

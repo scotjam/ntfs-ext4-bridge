@@ -905,20 +905,35 @@ class NTFSBridge:
                     continue
 
                 rec = self._undo_fixups_raw(bytearray(raw))
-                flags = _struct.unpack_from('<H', rec, 22)[0]
-                if not (flags & 0x2):  # Not a directory
-                    continue
+                # Scan ALL MFT records — including extent records (linked via
+                # ATTRIBUTE_LIST). When a directory's attributes overflow a
+                # single 1024-byte MFT record, INDEX_ALLOC moves to an extent
+                # record which doesn't carry the directory flag (0x2). The
+                # previous flag-based filter was missing those records and
+                # leaving their INDEX_ALLOC unprotected.
 
                 # Parse INDEX_ALLOC (0xA0) and INDEX_BITMAP (0xB0) attrs
                 ia_off = None; ia_alloc = 0; ia_data = 0; ia_runs = []
                 ib_off = None; ib_val_off = 0; ib_val_len = 0
+                flag_repaired = False
 
                 p = _struct.unpack_from('<H', rec, 20)[0]
                 while p < MFT_RECORD_SIZE - 8:
                     at = _struct.unpack_from('<I', rec, p)[0]
                     al = _struct.unpack_from('<I', rec, p + 4)[0]
                     if at == 0xFFFFFFFF or al == 0: break
-                    if at == 0xA0 and rec[p + 8]:  # nonresident INDEX_ALLOC
+                    if at == 0xA0:
+                        # INDEX_ALLOCATION MUST be non-resident per NTFS spec.
+                        # If the non-resident byte at +8 has been cleared
+                        # (Windows journal replay / ntfs-3g consolidation
+                        # incorrectly flipped the bit), the rest of the
+                        # non-resident header is normally still intact — repair
+                        # the flag in-place and continue parsing as non-res.
+                        if not rec[p + 8]:
+                            rec[p + 8] = 1
+                            flag_repaired = True
+                            log(f"  Record {rec_num}: REPAIRED INDEX_ALLOC "
+                                f"non-resident flag at attr offset 0x{p:x}")
                         ia_off = p
                         ia_alloc = _struct.unpack_from('<Q', rec, p + 40)[0]
                         ia_data  = _struct.unpack_from('<Q', rec, p + 48)[0]
@@ -931,6 +946,12 @@ class NTFSBridge:
                     p += al
 
                 if ia_off is None or not ia_runs or ia_data >= ia_alloc:
+                    # Still write back if we repaired the non-resident flag,
+                    # even if no data_size extension is needed.
+                    if flag_repaired and ia_off is not None:
+                        on_disk = redo_fixups(rec)
+                        img[mft_file_off:mft_file_off + MFT_RECORD_SIZE] = bytes(on_disk)
+                        fixed_count += 1
                     continue
 
                 # Read current INDEX_BITMAP before scanning so we can start
