@@ -2560,6 +2560,45 @@ class ClusterMapper:
 
         return None
 
+    def _extract_init_size(self, record: bytearray) -> Optional[int]:
+        """Extract init_size (initialized data length) from non-resident $DATA.
+
+        init_size is the byte offset up to which the data stream has real
+        bytes; bytes from init_size..data_size are uninitialized and read as
+        zero per NTFS semantics. While Windows is actively writing a file,
+        init_size < data_size; once writes complete, init_size == data_size.
+
+        Returns None for resident $DATA or if $DATA is not found.
+        """
+        first_attr = struct.unpack('<H', record[20:22])[0]
+        off = first_attr
+
+        while off < MFT_RECORD_SIZE - 8:
+            attr_type = struct.unpack('<I', record[off:off + 4])[0]
+            if attr_type == 0xFFFFFFFF:
+                break
+
+            attr_len = struct.unpack('<I', record[off + 4:off + 8])[0]
+            if attr_len == 0 or attr_len > MFT_RECORD_SIZE:
+                break
+
+            name_len = record[off + 9]
+            attr_name = ''
+            if name_len > 0:
+                name_offset = struct.unpack('<H', record[off + 10:off + 12])[0]
+                attr_name = record[off + name_offset:off + name_offset + name_len * 2].decode(
+                    'utf-16-le', errors='ignore')
+
+            if attr_type == 0x80 and not attr_name:  # $DATA (unnamed)
+                non_res = record[off + 8]
+                if non_res:
+                    return struct.unpack('<Q', record[off + 56:off + 64])[0]
+                return None  # resident — init_size not meaningful
+
+            off += attr_len
+
+        return None
+
     def _extract_resident_data(self, record: bytearray) -> Optional[bytes]:
         """Extract resident data from $DATA attribute."""
         first_attr = struct.unpack('<H', record[20:22])[0]
@@ -4316,6 +4355,20 @@ class ClusterMapper:
             data_runs = self._extract_data_runs(record)
             resident_data = None if data_runs else self._extract_resident_data(record)
             file_size = self._extract_file_size(record) if data_runs else None
+            # Defer materialization until Windows has finished writing.
+            # For non-resident $DATA, init_size (+56) is bytes containing real data;
+            # data_size (+48) is total file length. If init_size < data_size, Windows
+            # is still streaming; reading clusters from self.image now would capture
+            # zeros at the un-written tail, which then become the persistent ext4
+            # content once cluster_map is set up. Return None to leave the record
+            # untracked so the worker re-checks it on the next MFT update.
+            if data_runs:
+                init_size = self._extract_init_size(record)
+                if (file_size is not None and init_size is not None
+                        and init_size < file_size):
+                    log(f"  Deferring materialization (init_size={init_size} < "
+                        f"data_size={file_size}): {rel_path}")
+                    return None
             self.ntfs_sync_in_progress.add(rel_path)
             self.ntfs_sync_timestamps[rel_path] = time.time()
 
