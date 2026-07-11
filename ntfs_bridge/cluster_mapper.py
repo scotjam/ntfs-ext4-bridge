@@ -535,8 +535,14 @@ class ClusterMapper:
                         if self.lazy_allocator:
                             rel_path = self._get_rel_path(source_path)
                             self.lazy_allocator.record_read(rel_path)
-                    except OSError:
-                        pass  # Keep zeros on error
+                    except OSError as e:
+                        # Never serve zeros for a mapped source file: the
+                        # client would treat silently corrupt data as valid.
+                        # Fail the whole NBD read with EIO instead.
+                        log(f"READ FAILED (EIO to client): {source_path} "
+                            f"offset={read_offset} len={chunk_len}: {e}")
+                        raise IOError(
+                            f"mapped source read failed: {source_path}: {e}")
 
                 pos += chunk_len
 
@@ -555,8 +561,13 @@ class ClusterMapper:
                     if self.lazy_allocator:
                         rel_path = self._get_rel_path(source_path)
                         self.lazy_allocator.record_read(rel_path)
-                except OSError:
-                    pass  # Keep zeros on error
+                except OSError as e:
+                    # See the cluster_map read path above: mapped reads must
+                    # fail loudly (EIO), never silently return zeros.
+                    log(f"READ FAILED (EIO to client): {source_path} "
+                        f"offset={read_offset} len={chunk_len}: {e}")
+                    raise IOError(
+                        f"mapped source read failed: {source_path}: {e}")
                 pos += chunk_len
 
             elif byte_offset < len(self.image):
@@ -2231,6 +2242,11 @@ class ClusterMapper:
         self.mft_record_to_dir.clear()
         self.resident_file_data.clear()
         self._direct_run_map.clear()
+        # In-use user file records seen by this scan; the bridge compares this
+        # against len(mft_record_to_source) to refuse serving a volume whose
+        # source data is missing (e.g. bridge started before the data disk
+        # mounted and every symlink was dangling).
+        self.scanned_file_records = 0
 
         # First pass: find all directories
         for record_num in range(self._mft_total_records):
@@ -2359,6 +2375,8 @@ class ClusterMapper:
         # Skip system files
         if filename.startswith('$'):
             return
+
+        self.scanned_file_records += 1
 
         # Determine path using directory mapping
         parent_record = parent_ref & 0xFFFFFFFFFFFF
@@ -4209,8 +4227,8 @@ class ClusterMapper:
         proper subtree.
 
         We only flag this specific fallthrough — *not* a legitimate root
-        write where parent_record == 5. Backblaze and other apps may freely
-        create new top-level entries (.bzvol, working dirs, etc) and those
+        write where parent_record == 5. Windows apps may freely create new
+        top-level entries (working dirs, metadata folders, etc) and those
         go through the normal write path.
         """
         if parent_record == 5:

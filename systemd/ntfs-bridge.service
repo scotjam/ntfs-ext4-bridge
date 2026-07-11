@@ -1,0 +1,33 @@
+# NTFS-ext4 bridge systemd unit (template)
+#
+# Install: copy to /etc/systemd/system/ntfs-bridge.service, adjust paths,
+# then: systemctl daemon-reload && systemctl enable --now ntfs-bridge
+#
+# IMPORTANT: set RequiresMountsFor= to the real filesystem(s) your source
+# directory's data lives on (including symlink targets). local-fs.target is
+# NOT enough when the data disk mounts late (encrypted disks, USB, network
+# unlock): without this dependency the bridge can start against dangling
+# symlinks and serve an empty volume. The bridge also refuses to start in
+# that state (dangling-symlink and MFT-tracking guards), and Restart=
+# below retries until the mount appears.
+
+[Unit]
+Description=NTFS-ext4 bridge (NBD server)
+After=local-fs.target network-online.target
+Wants=network-online.target
+RequiresMountsFor=/srv/CHANGE-ME-data-mount
+Before=libvirtd.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ntfs-ext4-bridge
+ExecStart=/opt/ntfs-ext4-bridge/scripts/start_bridge_for_vm.sh
+ExecStartPost=/bin/bash -c 'for i in $(seq 1 60); do ss -tln | grep -q ":10809 " && exit 0; sleep 1; done; echo "Bridge did not start listening on :10809 within 60s" >&2; exit 1'
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

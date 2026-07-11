@@ -88,6 +88,24 @@ class NTFSBridge:
             log(f"ERROR: Source directory does not exist: {self.source_dir}")
             sys.exit(1)
 
+        # Refuse to start with dangling source symlinks. If the bridge starts
+        # before the data disk is mounted (boot ordering), every top-level
+        # symlink is dangling, the MFT scan maps nothing to ext4, and the
+        # whole volume silently reads as zeros — which a backup client would
+        # upload as valid data. Better to fail hard here.
+        dangling = []
+        for entry in sorted(os.listdir(self.source_dir)):
+            full = os.path.join(self.source_dir, entry)
+            if os.path.islink(full) and not os.path.exists(full):
+                dangling.append(f"{entry} -> {os.readlink(full)}")
+        if dangling:
+            log("FATAL: source directory has dangling symlinks (data disk "
+                "not mounted yet?). Refusing to serve a volume that would "
+                "read as zeros:")
+            for d in dangling:
+                log(f"  {d}")
+            sys.exit(1)
+
         # Dynamically calculate image size from ext4 source content.
         # The image must be large enough to represent all file clusters in the
         # NTFS bitmap. Since we use truncate (sparse file), the actual disk
@@ -176,6 +194,19 @@ class NTFSBridge:
         self.mapper = ClusterMapper(self.image_path, self.source_dir,
                                      overflow_dir=self.overflow_dir,
                                      protected_roots=self.protected_roots)
+
+        # Sanity check: if the MFT holds many user file records but almost
+        # none could be mapped to an ext4 source, the source data is missing
+        # (unmounted disk, moved tree, broken symlinks). Serving in this state
+        # would present every file as valid-looking zeros, so refuse.
+        scanned = getattr(self.mapper, 'scanned_file_records', 0)
+        tracked = len(self.mapper.mft_record_to_source)
+        if scanned >= 100 and tracked < scanned * 0.5:
+            log(f"FATAL: MFT scan saw {scanned} user file records but only "
+                f"{tracked} resolved to ext4 source files. Source data "
+                f"appears to be missing — refusing to serve a volume that "
+                f"would read as zeros.")
+            sys.exit(1)
 
         # Step 4: Create LazyAllocator if enabled
         if self.lazy_alloc:
