@@ -75,7 +75,7 @@ if [ -n "${PROTECTED_ROOTS:-}" ]; then
 fi
 
 # Optional: send root-level entries Windows creates outside the source tree
-# (e.g. .bzvol, System Volume Information, $RECYCLE.BIN) to a separate
+# (e.g. System Volume Information, $RECYCLE.BIN, app metadata dirs) to a separate
 # overflow directory rather than the source-dir root. Set OVERFLOW_DIR=path
 # in a local wrapper (not committed) to point at a partition with room.
 OVERFLOW_FLAG=()
