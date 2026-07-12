@@ -187,6 +187,7 @@ class ConsistencyGate:
             self.mapper.reload_from_image()
             self.bridge._allocate_new_sparse_files()
             self.bridge._fix_index_alloc_data_sizes()
+            self.mapper.clear_dirty_bit()
             self.journal.clear_dirty()
         finally:
             self.mapper.gate_active.clear()

@@ -995,26 +995,32 @@ class ClusterMapper:
                 if record_num in self._protected_ia_sizes:
                     ia_off_in_rec, target_ds, ib_off_in_rec, ib_val_off, bitmap = \
                         self._protected_ia_sizes[record_num]
-                    # Re-patch non-resident flag at +8: INDEX_ALLOCATION MUST
-                    # always be non-resident per NTFS spec. Windows journal
-                    # replay or ntfs-3g may write back a resident-flagged
-                    # version, which corrupts the attribute layout and trips
-                    # ntfsfix "Corrupt resident attribute 0xa0" on next mount.
-                    # Byte +8 of any 8-byte-aligned attr never collides with
-                    # USA fixup positions (510-511, 1022-1023), so direct
-                    # patching is safe.
-                    nr_off = rec_abs + ia_off_in_rec + 8
-                    self.image[nr_off:nr_off + 1] = b'\x01'
-                    # Re-patch data_size and init_size
-                    ds_off = rec_abs + ia_off_in_rec + 48
-                    is_off = rec_abs + ia_off_in_rec + 56
-                    packed = struct.pack('<Q', target_ds)
-                    self.image[ds_off:ds_off + 8] = packed
-                    self.image[is_off:is_off + 8] = packed
-                    # Re-patch INDEX_BITMAP (ensures Windows sees all blocks as allocated)
-                    if ib_off_in_rec >= 0 and bitmap:
-                        bm_abs = rec_abs + ib_off_in_rec + ib_val_off
-                        self.image[bm_abs:bm_abs + len(bitmap)] = bitmap
+                    ia_abs = rec_abs + ia_off_in_rec
+                    # Guard: only patch if $INDEX_ALLOCATION (0xA0) is still at
+                    # the stored offset. If Windows restructured the record so
+                    # 0xA0 moved, patching here would clobber a DIFFERENT
+                    # attribute. The next _fix_index_alloc_data_sizes (restart
+                    # or consistency gate) re-registers the correct offset.
+                    at_ia = struct.unpack('<I', self.image[ia_abs:ia_abs + 4])[0]
+                    if at_ia == 0xA0:
+                        # Re-patch non-resident flag at +8: 0xA0 MUST be
+                        # non-resident; a resident-flagged write trips ntfsfix
+                        # "Corrupt resident attribute 0xa0" on next mount.
+                        self.image[ia_abs + 8:ia_abs + 9] = b'\x01'
+                        # Only RESTORE data_size when Windows shrank it below
+                        # the protected value (the corruption case that hides
+                        # INDX blocks). Never shrink a legitimate growth —
+                        # forcing target_ds unconditionally hid new files added
+                        # to the directory.
+                        cur_ds = struct.unpack(
+                            '<Q', self.image[ia_abs + 48:ia_abs + 56])[0]
+                        if cur_ds < target_ds:
+                            packed = struct.pack('<Q', target_ds)
+                            self.image[ia_abs + 48:ia_abs + 56] = packed
+                            self.image[ia_abs + 56:ia_abs + 64] = packed
+                            if ib_off_in_rec >= 0 and bitmap:
+                                bm_abs = rec_abs + ib_off_in_rec + ib_val_off
+                                self.image[bm_abs:bm_abs + len(bitmap)] = bitmap
 
                 # Keep $MFTMirr in sync: if this record falls within the
                 # mirror's range, copy the full record to the mirror cluster.
@@ -1188,6 +1194,50 @@ class ClusterMapper:
         """Flush the entire image to disk (before an offline external mount)."""
         if self.image:
             self.image.flush_all()
+
+    def clear_dirty_bit(self):
+        """Clear the NTFS volume dirty bit ($Volume / $VOLUME_INFORMATION).
+
+        ntfsfix deliberately sets the dirty bit so Windows runs chkdsk on
+        first mount. The bridge's image is internally consistent (its own
+        fixups), and letting Windows auto-chkdsk the bridge volume is a
+        safety hazard — chkdsk would rewrite metadata underneath the bridge.
+        Clear it after each ntfsfix so Windows mounts clean.
+
+        The flags field sits early in record 3 (well before the USA fixup
+        positions at 510/1022), so it can be patched directly in the image
+        without re-doing fixups.
+        """
+        try:
+            rec_abs = self._rec_offset(3)
+            if rec_abs is None or rec_abs + MFT_RECORD_SIZE > len(self.image):
+                return
+            raw = self._undo_fixups(bytearray(
+                self.image[rec_abs:rec_abs + MFT_RECORD_SIZE]))
+            if raw[:4] != b'FILE':
+                return
+            off = struct.unpack('<H', raw[20:22])[0]
+            while off < MFT_RECORD_SIZE - 8:
+                atype = struct.unpack('<I', raw[off:off + 4])[0]
+                if atype == 0xFFFFFFFF:
+                    break
+                alen = struct.unpack('<I', raw[off + 4:off + 8])[0]
+                if alen == 0 or alen > MFT_RECORD_SIZE:
+                    break
+                if atype == 0x70 and raw[off + 8] == 0:  # $VOLUME_INFORMATION
+                    val_off = struct.unpack('<H', raw[off + 20:off + 22])[0]
+                    flags_abs = rec_abs + off + val_off + 0x0A
+                    if flags_abs + 2 > len(self.image):
+                        return
+                    cur = struct.unpack('<H', self.image[flags_abs:flags_abs + 2])[0]
+                    if cur & 0x0001:
+                        self.image[flags_abs:flags_abs + 2] = \
+                            struct.pack('<H', cur & ~0x0001)
+                        log("Cleared NTFS volume dirty bit")
+                    return
+                off += alen
+        except Exception as e:
+            log(f"clear_dirty_bit error: {e}")
 
     def durability_barrier(self):
         """Make all acknowledged writes durable — the NBD FLUSH contract.
@@ -1479,6 +1529,16 @@ class ClusterMapper:
                         pass
 
                 off += attr_len
+
+        # Reserve the virtual-INDX region at the top of the volume so
+        # allocate_file_direct never hands those clusters to a user file
+        # (which would cross-link with a directory's synthesized INDX block).
+        # Only matters in --virtual mode, but reserving is harmless otherwise.
+        total_clusters = len(self.image) // self.cluster_size
+        vstart = getattr(self, 'next_virtual_indx_cluster', total_clusters)
+        if 0 < vstart < total_clusters:
+            self._free_index_remove(vstart, total_clusters - vstart)
+            total_reserved += total_clusters - vstart
 
         log(f"  System file reservation: removed {total_reserved:,} clusters from free-run index")
 
@@ -5168,7 +5228,13 @@ class ClusterMapper:
                                 self.mft_record_to_source[record_num] = new_path
                                 self._note_file_seq(record_num, record)
                         else:
-                            # Sync in progress - just update tracking
+                            # Echo of a guest-executed rename (ext4 already
+                            # moved). Release the suppression window early so
+                            # the coordinator doesn't rely on the wall-clock
+                            # timeout (which Windows' lazy MFT flush can
+                            # outlast). Just update tracking, don't re-move.
+                            self._notify_echo_observed(new_rel_path)
+                            self._notify_echo_observed(old_rel)
                             if old_rel in self.path_to_mft_record:
                                 del self.path_to_mft_record[old_rel]
                             self.path_to_mft_record[new_rel_path] = record_num
