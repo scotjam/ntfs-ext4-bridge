@@ -156,12 +156,37 @@ Operations:
 | Crash mid-gate | `gate-state.json` records the phase; guest disk stays offline until a successful gate end |
 | ext4 changes during a gate | Keep flowing into the (new-epoch) journal; sync via the live path after `gate_end` |
 
+## Status
+
+Verified end-to-end on a real Windows 11 guest (nested KVM under WSL2,
+2026-07-12):
+
+- **ext4→NTFS live path — working.** File create, directory create, and
+  rename on ext4 propagate to the guest within seconds; content hashes match
+  byte-for-byte (proves `createnew`+`setvaliddata` serves real device data,
+  not zeros); no echo duplicates appear on ext4.
+- **NTFS→ext4 write-through — working.** Files written in the guest to an
+  exposed (non-protected) share land on ext4 with matching hashes.
+- **Consistency gate — mechanics working, one known bug.** The agent
+  offline→apply→online→epoch handshake all fire correctly, but the gate's
+  refresh-phase `rescan_mft()` drops tracked files when run concurrently
+  with an active live-sync path, leaving gate-created files unmapped and the
+  volume degraded. See the "Consistency gate corrupts cluster mapping"
+  issue. **Do not rely on the gate against a live VM until fixed;** the live
+  path alone is sound.
+
 ## Testing
 
 - **Unit/protocol (no root, no VM):**
   `python -m pytest tests/test_op_journal.py tests/test_control_protocol.py`
 - **Gate integration (Linux root, no VM):**
   `sudo python -m pytest tests/test_consistency_gate.py -v`
+  (passes in isolation; does NOT exercise concurrent live-path activity —
+  that's the untested path where the known gate bug lives)
+- **Live VM (nested KVM):** clone a Windows guest, boot with the bridge NBD
+  export as a second disk and a slirp `guestfwd` to the control endpoint,
+  install the agent, then run the create/rename/delete/write-through checks
+  in the runbook below.
 
 ## Live VM runbook
 

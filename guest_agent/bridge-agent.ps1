@@ -186,7 +186,18 @@ while ($true) {
         }
 
         $cursor = Get-Cursor
-        $resp = Invoke-Bridge '/v1/poll' @{ cursor = $cursor } 40
+        # The server long-polls up to ~25s; use a comfortably larger client
+        # timeout and treat a timeout as a normal empty poll (do NOT reset the
+        # epoch, or the agent thrashes re-hello/disk-cycle while idle).
+        try {
+            $resp = Invoke-Bridge '/v1/poll' @{ cursor = $cursor } 90
+        } catch [System.Net.WebException] {
+            if ($_.Exception.Status -eq [System.Net.WebExceptionStatus]::Timeout) {
+                continue
+            }
+            throw
+        }
+        if ($null -eq $resp) { continue }
 
         if ($resp.epoch -ne $epoch) {
             # Bridge restarted or a gate completed: our cached NTFS state may
