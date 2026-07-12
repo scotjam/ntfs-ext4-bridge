@@ -54,6 +54,7 @@ def test_gate_reconciles_ext4_changes(tmp_path):
         image_path=image, source_dir=str(source), ntfs_mount=mount,
         port=0, lazy_alloc=True, dealloc_timeout=10**9,
         roots=['Share'], two_way=True,
+        control_host='127.0.0.1', control_port=0,
     )
     bridge.setup()
     bridge._start_two_way()
