@@ -109,7 +109,9 @@ def test_move_emits_mv(env):
     assert ops[0]['path'] == 'Share\\a.txt'
     assert ops[0]['dst'] == 'Share\\b.txt'
     # The bridge remaps its own cluster mappings before dispatching the mv.
-    assert ('Share/a.txt', 'Share/b.txt') in mapper.remapped
+    norm = [(o.replace(os.sep, '/'), n.replace(os.sep, '/'))
+            for o, n in mapper.remapped]
+    assert ('Share/a.txt', 'Share/b.txt') in norm
 
 
 def test_dir_delete_subsumes_children(env):
