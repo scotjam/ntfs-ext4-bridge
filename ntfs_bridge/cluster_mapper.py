@@ -334,6 +334,12 @@ class ClusterMapper:
         # all during a gate (the guest disk is offline); this is a hard guard.
         self.gate_active = threading.Event()
 
+        # Set while _scan_mft clears+rebuilds the cluster maps (rescan_mft).
+        # Reads serialize behind self.lock while set so a lockless data read
+        # can't observe the maps mid-rebuild (and serve zeros for a mapped
+        # cluster). Unlike gate_active it does NOT block writes.
+        self._map_rebuild = threading.Event()
+
         # Persistent MFT->ext4 op journal. Capture any un-materialized ops
         # left by a previous (crashed) run BEFORE opening it fresh, so a
         # crash between ack and materialization is recovered by replay (see
@@ -598,9 +604,11 @@ class ClusterMapper:
         For virtual files (ext4 only), synthesizes MFT records and data on-the-fly.
         """
         # Lock MFT-region reads to prevent torn reads during concurrent writes.
-        # While a consistency gate is active, serialize ALL reads behind the
-        # lock so none can race the gate's map rebuild.
-        if self.gate_active.is_set() or self.is_mft_region(offset, length):
+        # While a consistency gate is active OR the cluster maps are being
+        # rebuilt (rescan_mft), serialize ALL reads behind the lock so a
+        # lockless data read can't observe half-cleared maps.
+        if (self.gate_active.is_set() or self._map_rebuild.is_set()
+                or self.is_mft_region(offset, length)):
             with self.lock:
                 return self._read_inner(offset, length)
         return self._read_inner(offset, length)
@@ -1289,26 +1297,33 @@ class ClusterMapper:
 
         Called after ext4->NTFS sync operations complete.
         """
-        with self.lock:
-            old_cluster_count = len(self.cluster_map)
-            old_file_count = len(self.mft_record_to_source)
-            old_files = set(self.mft_record_to_source.values())
-            self._recompute_allowed_roots()
-            self._scan_mft()
-            self._build_path_mappings()
-            new_cluster_count = len(self.cluster_map)
-            new_file_count = len(self.mft_record_to_source)
-            new_files = set(self.mft_record_to_source.values())
-            added_files = new_files - old_files
-            removed_files = old_files - new_files
-            log(f"Rescan: {old_cluster_count}->{new_cluster_count} clusters, "
-                f"{old_file_count}->{new_file_count} files")
-            if added_files:
-                for f in added_files:
-                    log(f"  + {os.path.basename(f)}")
-            if removed_files:
-                for f in removed_files:
-                    log(f"  - {os.path.basename(f)}")
+        # Serialize reads for the duration so a lockless data read can't
+        # observe the maps mid clear-and-rebuild (would serve zeros for a
+        # mapped cluster). read() checks _map_rebuild and takes self.lock.
+        self._map_rebuild.set()
+        try:
+            with self.lock:
+                old_cluster_count = len(self.cluster_map)
+                old_file_count = len(self.mft_record_to_source)
+                old_files = set(self.mft_record_to_source.values())
+                self._recompute_allowed_roots()
+                self._scan_mft()
+                self._build_path_mappings()
+                new_cluster_count = len(self.cluster_map)
+                new_file_count = len(self.mft_record_to_source)
+                new_files = set(self.mft_record_to_source.values())
+                added_files = new_files - old_files
+                removed_files = old_files - new_files
+                log(f"Rescan: {old_cluster_count}->{new_cluster_count} clusters, "
+                    f"{old_file_count}->{new_file_count} files")
+                if added_files:
+                    for f in added_files:
+                        log(f"  + {os.path.basename(f)}")
+                if removed_files:
+                    for f in removed_files:
+                        log(f"  - {os.path.basename(f)}")
+        finally:
+            self._map_rebuild.clear()
 
     # =========================================================================
     # Direct allocation (no ntfs-3g, no data copy)
@@ -2782,7 +2797,26 @@ class ClusterMapper:
         return filename, parent_ref
 
     def _extract_data_runs(self, record: bytearray) -> Optional[List[Tuple[int, int]]]:
-        """Extract data runs from MFT record's $DATA attribute."""
+        """Extract $DATA runs, following $ATTRIBUTE_LIST for fragmented files.
+
+        A file fragmented enough that ntfs-3g spills its $DATA runs into
+        extension MFT records has an $ATTRIBUTE_LIST (0x20) in the base
+        record; the base $DATA then covers only the first extent. Reading
+        only the base record would map just that extent and serve zeros for
+        the tail. When an $ATTRIBUTE_LIST is present we gather every unnamed
+        $DATA extent (base + extension records), ordered by VCN. On any
+        parsing anomaly we fall back to the base record's runs — that only
+        loses the tail, never returns wrong clusters.
+        """
+        attrlist = self._find_attribute_list(record)
+        if attrlist is not None:
+            combined = self._extract_data_runs_via_attrlist(attrlist)
+            if combined is not None:
+                return combined
+        return self._extract_data_runs_base(record)
+
+    def _extract_data_runs_base(self, record: bytearray) -> Optional[List[Tuple[int, int]]]:
+        """Extract data runs from a single MFT record's unnamed $DATA."""
         first_attr = struct.unpack('<H', record[20:22])[0]
         off = first_attr
 
@@ -2814,6 +2848,104 @@ class ClusterMapper:
             off += attr_len
 
         return None
+
+    def _find_attribute_list(self, record: bytearray) -> Optional[bytes]:
+        """Return the raw $ATTRIBUTE_LIST (0x20) value, or None if absent.
+
+        Handles resident and non-resident $ATTRIBUTE_LIST (the latter by
+        reading its data-run clusters from the image). Returns None on any
+        anomaly so the caller falls back to the base record.
+        """
+        off = struct.unpack('<H', record[20:22])[0]
+        while off < MFT_RECORD_SIZE - 8:
+            attr_type = struct.unpack('<I', record[off:off + 4])[0]
+            if attr_type == 0xFFFFFFFF:
+                return None
+            attr_len = struct.unpack('<I', record[off + 4:off + 8])[0]
+            if attr_len == 0 or attr_len > MFT_RECORD_SIZE:
+                return None
+            if attr_type == 0x20:
+                non_res = record[off + 8]
+                if not non_res:
+                    val_len = struct.unpack('<I', record[off + 16:off + 20])[0]
+                    val_off = struct.unpack('<H', record[off + 20:off + 22])[0]
+                    if off + val_off + val_len > MFT_RECORD_SIZE:
+                        return None
+                    return bytes(record[off + val_off:off + val_off + val_len])
+                # Non-resident: read its clusters from the image.
+                try:
+                    runs_off = struct.unpack('<H', record[off + 32:off + 34])[0]
+                    real_size = struct.unpack('<Q', record[off + 48:off + 56])[0]
+                    runs = self._parse_data_runs(
+                        record[off + runs_off:off + attr_len], real_size)
+                    if not runs:
+                        return None
+                    buf = bytearray()
+                    for lcn, count in runs:
+                        if lcn is None or lcn < 0:
+                            return None  # sparse attr list — bail
+                        start = lcn * self.cluster_size
+                        buf += self.image[start:start + count * self.cluster_size]
+                    return bytes(buf[:real_size])
+                except Exception:
+                    return None
+            off += attr_len
+        return None
+
+    def _extract_data_runs_via_attrlist(
+            self, attrlist: bytes) -> Optional[List[Tuple[int, int]]]:
+        """Gather all unnamed $DATA extents referenced by an $ATTRIBUTE_LIST.
+
+        Returns the concatenated (lcn, count) run list ordered by VCN, or
+        None on any anomaly (caller falls back to the base record).
+        """
+        # Collect (start_vcn, mft_ref) for unnamed $DATA (0x80) entries.
+        entries = []
+        pos = 0
+        n = len(attrlist)
+        guard = 0
+        while pos + 26 <= n:
+            guard += 1
+            if guard > 4096:
+                return None
+            atype = struct.unpack_from('<I', attrlist, pos)[0]
+            rec_len = struct.unpack_from('<H', attrlist, pos + 4)[0]
+            if rec_len < 26 or pos + rec_len > n:
+                break
+            name_len = attrlist[pos + 6]
+            if atype == 0x80 and name_len == 0:  # unnamed $DATA
+                start_vcn = struct.unpack_from('<Q', attrlist, pos + 8)[0]
+                mft_ref = struct.unpack_from('<Q', attrlist, pos + 16)[0] & 0xFFFFFFFFFFFF
+                entries.append((start_vcn, mft_ref))
+            pos += rec_len
+
+        if not entries:
+            return None
+        if len(entries) > 4096:
+            return None
+
+        # Read each referenced record once and extract its unnamed $DATA runs.
+        rec_cache = {}
+        fragments = []  # (start_vcn, runs)
+        for start_vcn, mft_ref in entries:
+            if mft_ref not in rec_cache:
+                ext_off = self._rec_offset(mft_ref)
+                if ext_off is None or ext_off + MFT_RECORD_SIZE > len(self.image):
+                    return None
+                raw = bytes(self.image[ext_off:ext_off + MFT_RECORD_SIZE])
+                if raw[:4] != b'FILE':
+                    return None
+                rec_cache[mft_ref] = self._undo_fixups(bytearray(raw))
+            runs = self._extract_data_runs_base(rec_cache[mft_ref])
+            if runs is None:
+                return None
+            fragments.append((start_vcn, runs))
+
+        fragments.sort(key=lambda f: f[0])
+        combined = []
+        for _vcn, runs in fragments:
+            combined.extend(runs)
+        return combined if combined else None
 
     def _extract_file_size(self, record: bytearray) -> Optional[int]:
         """Extract file size from $DATA attribute (resident or non-resident)."""
