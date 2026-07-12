@@ -347,6 +347,18 @@ class PartitionWrapper:
         """Flush any pending writes to the underlying mapper."""
         self.mapper.flush()
 
+    def flush_all(self):
+        """Pass through full-image flush to the underlying mapper."""
+        self.mapper.flush_all()
+
+    def durability_barrier(self):
+        """Pass through the NBD FLUSH durability barrier to the mapper."""
+        self.mapper.durability_barrier()
+
+    def clear_dirty_bit(self):
+        """Pass through the volume dirty-bit clear to the mapper."""
+        self.mapper.clear_dirty_bit()
+
     def rescan_mft(self):
         """Pass through MFT rescan to underlying mapper."""
         self.mapper.rescan_mft()
