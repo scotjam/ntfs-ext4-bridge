@@ -13,6 +13,18 @@ if sys.platform == 'win32':
 # Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Standalone script for the DEPRECATED TemplateSynthesizer path (used only by
+# the legacy dynamic_server/partitioned_server standalone servers, NOT by the
+# production `ntfs_bridge.bridge --two-way` path). Its test_* functions take
+# manually-built args (not pytest fixtures), so run it directly:
+#     python tests/test_synthesizer.py
+# Skip it under pytest so its non-fixture functions don't error the suite.
+if "pytest" in sys.modules:
+    import pytest
+    pytest.skip("standalone script for the deprecated TemplateSynthesizer path; "
+                "run directly with `python tests/test_synthesizer.py`",
+                allow_module_level=True)
+
 from ntfs_bridge.template_synth import TemplateSynthesizer, MFT_RECORD_SIZE
 
 SECTOR_SIZE = 512
