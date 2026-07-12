@@ -1,4 +1,20 @@
-"""Dynamic NBD server - auto-generates NTFS template from source directory."""
+"""Dynamic NBD server - auto-generates NTFS template from source directory.
+
+DEPRECATED AND UNSAFE — DO NOT USE FOR BACKING UP REAL DATA.
+
+This is the old TemplateSynthesizer-based prototype, superseded by the
+production bridge (`python -m ntfs_bridge.bridge --two-way`). A 2026-07 review
+found it fails 6 of 9 corruption-safety checkpoints, including several that
+SILENTLY corrupt backups or damage the wrong ext4 file:
+  - reads of a failed/missing ext4 source return zeros, not an error;
+  - files are resolved by basename only, so it can serve/write the WRONG file;
+  - a recycled MFT record is misread as a rename and moves the wrong ext4 file;
+  - reads run lockless while the cluster map mutates → another file's bytes;
+  - cluster allocation ignores $Bitmap → cross-linked (shared) clusters.
+It also loads the ENTIRE image into RAM (cannot handle multi-TB volumes),
+NBD FLUSH is a no-op (no durability), and writes live in a RAM-only overlay
+lost on crash. Use the production bridge instead.
+"""
 
 import os
 import sys
@@ -358,11 +374,24 @@ class DynamicNBDServer:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='Dynamic NTFS NBD Server')
+    parser = argparse.ArgumentParser(
+        description='DEPRECATED/UNSAFE Dynamic NTFS NBD Server (do not use for '
+                    'real backups; use `python -m ntfs_bridge.bridge --two-way`)')
     parser.add_argument('source', help='Source directory')
     parser.add_argument('-p', '--port', type=int, default=10809)
     parser.add_argument('-s', '--size', type=int, default=100, help='Volume size MB')
+    parser.add_argument('--i-understand-this-is-unsafe', action='store_true',
+                        help='Required: acknowledge this prototype can silently '
+                             'corrupt backups (see module docstring).')
     args = parser.parse_args()
+
+    if not args.i_understand_this_is_unsafe:
+        print("REFUSING TO START: dynamic_server is a DEPRECATED, UNSAFE prototype "
+              "that can silently corrupt backups and cannot handle multi-TB volumes.\n"
+              "Use the production bridge: python -m ntfs_bridge.bridge --two-way\n"
+              "If you really need this prototype for experimentation, pass "
+              "--i-understand-this-is-unsafe.")
+        sys.exit(2)
 
     if os.geteuid() != 0:
         print("Error: Must run as root (for mount)")

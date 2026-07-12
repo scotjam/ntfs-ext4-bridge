@@ -1,6 +1,14 @@
 """NBD server that presents NTFS with MBR partition table.
 
-Supports bidirectional synchronization:
+DEPRECATED AND UNSAFE — DO NOT USE FOR BACKING UP REAL DATA. See the warning
+in ntfs_bridge/dynamic_server.py: this shares the TemplateSynthesizer core and
+fails the same corruption-safety checkpoints (silent-zeros reads, basename
+wrong-file mapping, MFT-recycle-as-rename, lockless reads during mutation,
+$Bitmap-blind cross-linking, no-op FLUSH, RAM-only overlay/template that
+can't scale past a few GB). Its ext4->NTFS watcher is unguarded and races the
+read path. Use `python -m ntfs_bridge.bridge --two-way` instead.
+
+Supports bidirectional synchronization (unsafely):
 - Windows -> ext4: MFT writes detected and synced to ext4 files
 - ext4 -> Windows: FileWatcher detects changes and updates NTFS view
 """
@@ -425,13 +433,25 @@ class PartitionedNBDServer:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='Partitioned NBD server')
+    parser = argparse.ArgumentParser(
+        description='DEPRECATED/UNSAFE Partitioned NBD server (do not use for '
+                    'real backups; use `python -m ntfs_bridge.bridge --two-way`)')
     parser.add_argument('template', help='NTFS template file')
     parser.add_argument('source', help='Source directory')
     parser.add_argument('-p', '--port', type=int, default=10809, help='Port')
     parser.add_argument('--no-watch', action='store_true',
                         help='Disable file watcher (ext4 -> NTFS sync)')
+    parser.add_argument('--i-understand-this-is-unsafe', action='store_true',
+                        help='Required: acknowledge this prototype can silently '
+                             'corrupt backups (see module docstring).')
     args = parser.parse_args()
+
+    if not args.i_understand_this_is_unsafe:
+        print("REFUSING TO START: partitioned_server is a DEPRECATED, UNSAFE "
+              "prototype that can silently corrupt backups.\n"
+              "Use the production bridge: python -m ntfs_bridge.bridge --two-way\n"
+              "To run this prototype anyway, pass --i-understand-this-is-unsafe.")
+        sys.exit(2)
 
     log("Creating partitioned synthesizer...")
     synth = PartitionedSynthesizer(args.template, args.source,
