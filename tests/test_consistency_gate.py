@@ -80,11 +80,13 @@ def test_gate_reconciles_ext4_changes(tmp_path):
         expected_files = {'keep.bin', 'new.bin', 'grow.bin'}
         expected_files |= {f'file{i:03d}.bin' for i in range(60)}
 
-        # Drive the REAL gate cycle. Pre-confirm the agent offline/online
-        # phases (no VM to actually take a disk offline).
+        # Drive the REAL gate cycle. Stub the agent-side offline/online steps
+        # (no VM here to take a disk offline); everything else — barrier,
+        # quiesce, full msync, offline ntfs-3g apply, reload_from_image,
+        # re-allocate, epoch bump — runs for real.
         gate = bridge.consistency_gate
-        gate._agent_confirmed.set()
-        gate._agent_online_confirmed.set()
+        gate._go_offline = lambda: True
+        gate._go_online = lambda via_agent: None
         gate.run_gate('test-bulk')
 
         # After a real gate, the mapper must track every ext4 file under the
