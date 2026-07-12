@@ -166,12 +166,14 @@ class ConsistencyGate:
         agent_did_offline = self._go_offline()
 
         try:
-            # 3. quiesce — drain the MFT worker, block I/O, and msync the
-            # WHOLE image so the offline ntfs-3g mount reads a complete
-            # picture (including writes beyond the 64MB hot region).
+            # 3. quiesce — block new I/O FIRST (gate_active makes writes
+            # EROFS), THEN drain the MFT worker, so no straggler write can
+            # enqueue an op during/after the drain. Finally msync the WHOLE
+            # image so the offline ntfs-3g mount reads a complete picture
+            # (including writes beyond the 64MB hot region).
             self._set_phase('quiesce')
-            self.mapper._mft_queue.join()
             self.mapper.gate_active.set()
+            self.mapper._mft_queue.join()
             self.mapper.flush_all()
 
             # 4. apply

@@ -575,10 +575,17 @@ class NTFSBridge:
         if self.nbd_server:
             self.nbd_server.stop()
 
-        # Save image changes
+        # Save image changes. Drain any queued MFT->ext4 ops FIRST (the
+        # worker is a daemon thread and dies at process exit, so unqueued
+        # ops would be lost), then fully msync the image and close.
         if self.mapper:
-            log("Saving image...")
-            self.mapper.flush()
+            log("Draining MFT sync queue and saving image...")
+            try:
+                self.mapper.durability_barrier()
+                self.mapper.flush_all()
+                self.mapper.close()
+            except Exception as e:
+                log(f"Error during final flush: {e}")
 
         log("Bridge stopped")
 

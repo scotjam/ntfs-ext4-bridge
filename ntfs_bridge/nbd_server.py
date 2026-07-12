@@ -355,7 +355,10 @@ class NBDServer:
 
             elif cmd == NBD_CMD_FLUSH:
                 t0 = time.monotonic()
-                self.mapper.flush()
+                # Full durability barrier: drain the MFT->ext4 queue, fsync
+                # dirty ext4 sources, and msync the image (hot + dirty
+                # chunks). A bare hot-region flush was not a real barrier.
+                self.mapper.durability_barrier()
                 elapsed = time.monotonic() - t0
                 if elapsed > 5.0:
                     log(f"SLOW FLUSH: took {elapsed:.1f}s")
