@@ -11,6 +11,7 @@ Supports lazy allocation: large files can start as sparse (no clusters),
 get allocated on first read, and deallocated after a timeout.
 """
 import bisect
+import errno
 import mmap
 import os
 import queue
@@ -160,7 +161,8 @@ class ClusterMapper:
 
     def __init__(self, image_path: str, source_dir: str,
                  overflow_dir: Optional[str] = None,
-                 protected_roots: Optional[Iterable[str]] = None):
+                 protected_roots: Optional[Iterable[str]] = None,
+                 roots: Optional[Iterable[str]] = None):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
 
@@ -190,22 +192,37 @@ class ClusterMapper:
             log(f"Overflow directory: {self.overflow_dir}")
 
         # Known top-level entries in the source directory (for root path
-        # resolution). protected_roots is the authoritative allowlist: only
-        # source_dir top-level entries named there are recognised. Anything
-        # else at source_dir root is ignored, and _resolve_source_path
-        # consequently routes its rel_paths to overflow_dir. When
-        # protected_roots is empty, source_dir contributes nothing -- a
-        # misconfigured bridge can't accidentally expose shares.
+        # resolution). `roots` is the exposure allowlist: only source_dir
+        # top-level entries named there are recognised. Anything else at
+        # source_dir root is ignored, and _resolve_source_path consequently
+        # routes its rel_paths to overflow_dir. Exposure (roots) is
+        # independent of write-protection (protected_roots); when `roots`
+        # is not given, it falls back to protected_roots for backwards
+        # compatibility. When both are empty, source_dir contributes
+        # nothing -- a misconfigured bridge can't accidentally expose shares.
+        self._exposed_top_dirs: Set[str] = set()
+        if roots:
+            self._exposed_top_dirs = {r.lower() for r in roots if r}
+        else:
+            self._exposed_top_dirs = set(self._protected_top_dirs)
         self.known_root_entries: Set[str] = set()
-        if self._protected_top_dirs:
+        if self._exposed_top_dirs:
             try:
                 entries = set(os.listdir(self.source_dir))
             except OSError:
                 entries = set()
             self.known_root_entries = {
                 name for name in entries
-                if name.lower() in self._protected_top_dirs
+                if name.lower() in self._exposed_top_dirs
             }
+
+        # Realpath whitelist for _validate_path. Top-level share entries are
+        # commonly symlinks to other filesystems; realpath() resolves through
+        # them, so containment must be checked against the resolved TARGETS,
+        # not just source_dir itself (otherwise every path under a symlinked
+        # share is rejected as traversal).
+        self._allowed_realpath_roots: Set[str] = set()
+        self._recompute_allowed_roots()
 
         # Memory-map the image file, then wrap with a hot RAM cache.
         # The hot cache keeps the first 64MB in a bytearray so NTFS metadata
@@ -251,6 +268,13 @@ class ClusterMapper:
         # Thread safety
         self.lock = threading.RLock()
 
+        # Consistency-gate quiescence. While set, the image is being modified
+        # offline (ntfs-3g apply with the guest disk offline): writes are
+        # refused with EROFS and all reads serialize behind self.lock so
+        # nothing races _scan_mft's map rebuild. There should be no I/O at
+        # all during a gate (the guest disk is offline); this is a hard guard.
+        self.gate_active = threading.Event()
+
         # Background MFT sync queue: write() puts (offset, data) here so that
         # the NBD reply goes out immediately; ext4 operations run asynchronously.
         self._mft_queue: queue.Queue = queue.Queue()
@@ -265,6 +289,13 @@ class ClusterMapper:
         self._sync_lock = threading.Lock()
         self.ext4_sync_in_progress: Set[str] = set()
         self.ntfs_sync_in_progress: Set[str] = set()
+
+        # Optional callback (set by the two-way SyncCoordinator) invoked with
+        # rel_path whenever the MFT worker observes the echo of a guest op —
+        # i.e. it skips ext4 materialization because the path is in
+        # ext4_sync_in_progress. Lets the coordinator clear suppression as
+        # soon as the echo lands instead of waiting for a timeout.
+        self.echo_observed_callback = None
 
         # Time-based loop prevention: records when NTFS→ext4 sync last wrote
         # each file.  The instant set (ntfs_sync_in_progress) is cleared as
@@ -451,8 +482,10 @@ class ClusterMapper:
         For sparse files, triggers lazy allocation on first access.
         For virtual files (ext4 only), synthesizes MFT records and data on-the-fly.
         """
-        # Lock MFT-region reads to prevent torn reads during concurrent writes
-        if self.is_mft_region(offset, length):
+        # Lock MFT-region reads to prevent torn reads during concurrent writes.
+        # While a consistency gate is active, serialize ALL reads behind the
+        # lock so none can race the gate's map rebuild.
+        if self.gate_active.is_set() or self.is_mft_region(offset, length):
             with self.lock:
                 return self._read_inner(offset, length)
         return self._read_inner(offset, length)
@@ -718,6 +751,11 @@ class ClusterMapper:
         Data cluster writes go to ext4 source files synchronously.
         Other metadata writes go to the image.
         """
+        if self.gate_active.is_set():
+            # Consistency gate in progress: the image is being modified
+            # offline. The guest disk should be offline too, so no writes
+            # are expected; refuse any stragglers rather than corrupt.
+            raise OSError(errno.EROFS, "consistency gate active")
         if self.is_mft_region(offset, len(data)):
             with self.lock:
                 # Phase 1 (fast): write MFT data to image so NTFS sees it
@@ -1039,6 +1077,7 @@ class ClusterMapper:
             old_cluster_count = len(self.cluster_map)
             old_file_count = len(self.mft_record_to_source)
             old_files = set(self.mft_record_to_source.values())
+            self._recompute_allowed_roots()
             self._scan_mft()
             self._build_path_mappings()
             new_cluster_count = len(self.cluster_map)
@@ -2754,11 +2793,38 @@ class ClusterMapper:
             return os.path.join(self.source_dir, rel_path)
         return os.path.join(self.overflow_dir, rel_path)
 
+    def _notify_echo_observed(self, rel_path: str):
+        """Tell the SyncCoordinator (if any) that a guest-op echo landed."""
+        cb = self.echo_observed_callback
+        if cb is not None:
+            try:
+                cb(rel_path)
+            except Exception as e:
+                log(f"  echo_observed_callback error: {e}")
+
+
+    def _recompute_allowed_roots(self):
+        """Rebuild the realpath whitelist used by _validate_path.
+
+        Includes source_dir, overflow_dir, and the resolved target of every
+        exposed top-level entry (shares are commonly symlinks into other
+        filesystems). Called at init and again after rescans/gates because
+        symlink targets can change between sessions.
+        """
+        roots = {os.path.realpath(self.source_dir),
+                 os.path.realpath(self.overflow_dir)}
+        for entry in self.known_root_entries:
+            target = os.path.realpath(os.path.join(self.source_dir, entry))
+            roots.add(target)
+        self._allowed_realpath_roots = roots
+
     def _validate_path(self, source_path: str, context: str = '') -> bool:
         """Validate that a resolved path stays within allowed directories.
 
         Returns True if the path is safe, False if it escapes the allowed
-        directories (path traversal) or contains null bytes.
+        directories (path traversal) or contains null bytes. A path is
+        allowed when its realpath falls under source_dir, overflow_dir, or
+        the resolved target of any exposed top-level share entry.
         """
         # Reject null bytes in the path
         if '\x00' in source_path:
@@ -2766,13 +2832,8 @@ class ClusterMapper:
             return False
 
         resolved = os.path.realpath(source_path)
-        source_real = os.path.realpath(self.source_dir)
-        overflow_real = os.path.realpath(self.overflow_dir)
-
-        if resolved.startswith(source_real + os.sep) or resolved == source_real:
-            return True
-        if overflow_real != source_real:
-            if resolved.startswith(overflow_real + os.sep) or resolved == overflow_real:
+        for root in self._allowed_realpath_roots:
+            if resolved == root or resolved.startswith(root + os.sep):
                 return True
 
         log(f"  PATH REJECTED (traversal){' in ' + context if context else ''}: {source_path} -> {resolved}")
@@ -4026,6 +4087,7 @@ class ClusterMapper:
 
             if rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping delete (ext4 sync in progress): {rel_path}")
+                self._notify_echo_observed(rel_path)
                 del self.mft_record_to_source[record_num]
                 self.resident_file_data.pop(record_num, None)
                 self.path_to_mft_record.pop(rel_path, None)
@@ -4126,6 +4188,7 @@ class ClusterMapper:
 
             if new_rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping dir rename (ext4 sync in progress): {new_rel_path}")
+                self._notify_echo_observed(new_rel_path)
                 self.mft_record_to_dir[record_num] = new_rel_path
                 self.path_to_mft_record.pop(old_rel_path, None)
                 self.path_to_mft_record[new_rel_path] = record_num
@@ -4285,6 +4348,7 @@ class ClusterMapper:
 
             if rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping new dir (ext4 sync in progress): {rel_path}")
+                self._notify_echo_observed(rel_path)
                 self.mft_record_to_dir[record_num] = rel_path
                 self._dir_mft_seq[record_num] = seq
                 self.path_to_mft_record[rel_path] = record_num
@@ -4360,12 +4424,15 @@ class ClusterMapper:
 
             if rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping new file (ext4 sync in progress): {rel_path}")
+                self._notify_echo_observed(rel_path)
                 self.mft_record_to_source[record_num] = source_path
+                self.path_to_mft_record[rel_path] = record_num
                 self._track_file_data(record, record_num, source_path)
                 return None
 
             if os.path.exists(source_path):
                 self.mft_record_to_source[record_num] = source_path
+                self.path_to_mft_record[rel_path] = record_num
                 self._track_file_data(record, record_num, source_path)
                 return None
 
