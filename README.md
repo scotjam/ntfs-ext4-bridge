@@ -204,6 +204,56 @@ Items redirected to overflow:
 Items that stay in source:
 - Top-level entries that existed when the bridge started (e.g. `Documents`, `KidsMovies`, `KidsTV`)
 
+## Two-Way Live Sync (`--two-way`)
+
+Full two-way sync keeps the NTFS view live as ext4 changes (seconds-level),
+without the unsafe dual-mount that the old SyncDaemon needed. Windows performs
+**all** NTFS metadata mutations itself, so its caches stay coherent:
+
+1. **Live path** — a tiny guest agent (`guest_agent/bridge-agent.ps1`, a
+   SYSTEM scheduled task) long-polls the bridge's control endpoint and
+   executes coalesced namespace ops natively on the volume: directory
+   creates, deletes, renames, `fsutil file createnew` + `setvaliddata` for
+   new files (no data copied — the bridge maps the clusters to the ext4
+   source), resizes, and mtime bumps. The bridge recognizes the resulting
+   MFT writes as echoes and maps them instead of re-materializing.
+2. **Consistency gate** — for bulk changes, agent outages, or scheduled
+   reconciliation: the guest takes the disk offline, the bridge applies the
+   accumulated delta offline via ntfs-3g on the image file, refreshes its
+   mappings, and the guest brings the disk back online (Windows re-reads
+   all metadata from scratch). WinRM is used as fallback when the agent is
+   unreachable (`--winrm-url/-user/-password`).
+
+Setup:
+
+```bash
+# Host: enable two-way mode (also decouples exposure from write protection)
+sudo python3 -m ntfs_bridge.bridge \
+    --source /export/bridge-source \
+    --image /var/lib/ntfs-bridge/image.raw \
+    --mount /mnt/ntfs-bridge \
+    --partitioned --lazy --dealloc-timeout 31536000 \
+    --roots ShareA,ShareB \
+    --two-way
+# The agent token is generated at <image>.agent-token on first start.
+```
+
+```powershell
+# Guest (once, elevated): install the agent
+.\install-agent.ps1 -ControlUrl "http://192.168.122.1:10810" -Token "<token>"
+```
+
+Notes:
+
+- `--roots` is the exposure list (which top-level source entries appear on
+  the volume). `--protected-roots` now *only* controls read-only protection
+  and is optional; for full two-way leave it unset so Windows-side writes
+  into the shares propagate to ext4.
+- Conflict policy: ext4 wins for share content; NTFS wins for the overflow
+  dir and Windows-owned trees (System Volume Information etc.).
+- Trigger a manual gate with `SIGUSR1`, monitor via
+  `GET /v1/health` on the control endpoint.
+
 ## Adding Folders to an Existing Volume
 
 ### Adding new source folders
