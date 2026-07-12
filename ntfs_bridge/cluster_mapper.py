@@ -255,6 +255,10 @@ class ClusterMapper:
         # entity.  If it changes, _check_directory_rename is looking at a
         # recycled record – not a rename – and must not move anything.
         self._dir_mft_seq: Dict[int, int] = {}
+        # MFT sequence numbers of tracked FILE records; mirrors
+        # _dir_mft_seq and guards against record-slot recycling being
+        # misread as a rename (which would shutil.move the wrong file).
+        self._file_mft_seq: Dict[int, int] = {}
         self.dir_children: Dict[int, Set[int]] = {}
         self.removed_mft_records: Set[int] = set()
 
@@ -282,7 +286,7 @@ class ClusterMapper:
                               name="MFTSyncWorker")
         _t.start()
 
-        # Loop prevention sets (shared with SyncDaemon)
+        # Loop prevention sets (shared with the two-way sync components)
         # Individual set operations (add, discard, `in`) are thread-safe under
         # CPython's GIL.  A lock is provided for any compound operations or
         # future iteration that may need atomicity.
@@ -300,7 +304,7 @@ class ClusterMapper:
         # Time-based loop prevention: records when NTFS→ext4 sync last wrote
         # each file.  The instant set (ntfs_sync_in_progress) is cleared as
         # soon as the write finishes, but the FileWatcher fires asynchronously
-        # later.  SyncDaemon checks these timestamps to suppress cascade events
+        # later.  OpJournal checks these timestamps to suppress cascade events
         # for a grace period after the sync.
         self.ntfs_sync_timestamps: Dict[str, float] = {}
 
@@ -2281,6 +2285,7 @@ class ClusterMapper:
         self.mft_record_to_dir.clear()
         self.resident_file_data.clear()
         self._direct_run_map.clear()
+        self._file_mft_seq.clear()
         # In-use user file records seen by this scan; the bridge compares this
         # against len(mft_record_to_source) to refuse serving a volume whose
         # source data is missing (e.g. bridge started before the data disk
@@ -2429,9 +2434,11 @@ class ClusterMapper:
 
         source_path = self._resolve_source_path(rel_path)
 
-        # Find source file
+        # Find source file. The fallback walk requires a size match (or a
+        # unique basename) so an ambiguous name can't map to the wrong file.
         if not os.path.isfile(source_path):
-            found = self._find_source_file(filename)
+            expected_size = self._extract_file_size(record)
+            found = self._find_source_file(filename, expected_size)
             if not found:
                 return
             source_path = found
@@ -2456,6 +2463,7 @@ class ClusterMapper:
                 # This is a sparse file - track it but don't map the minimal clusters
                 self.sparse_files[rel_path] = (source_path, file_size, record_num)
                 self.mft_record_to_source[record_num] = source_path
+                self._note_file_seq(record_num, record)
                 # Record the allocated clusters so we can detect reads to them
                 for start_cluster, count in data_runs:
                     if start_cluster > 0:  # Skip sparse runs
@@ -2468,6 +2476,7 @@ class ClusterMapper:
                     log(f"  Mapping new file: {rel_path} (record {record_num}, {real_cluster_count} clusters)")
                 self._map_clusters(data_runs, source_path)
                 self.mft_record_to_source[record_num] = source_path
+                self._note_file_seq(record_num, record)
                 # Remove from sparse tracking if it was there
                 self.sparse_files.pop(rel_path, None)
         else:
@@ -2486,6 +2495,7 @@ class ClusterMapper:
                 if source_size > resident_loc[2]:  # too large to be truly resident
                     self.sparse_files[rel_path] = (source_path, source_size, record_num)
                     self.mft_record_to_source[record_num] = source_path
+                    self._note_file_seq(record_num, record)
                 else:
                     self.resident_file_data[record_num] = {
                         'source_path': source_path,
@@ -2494,6 +2504,7 @@ class ClusterMapper:
                         'available': resident_loc[2],      # max bytes available for data
                     }
                     self.mft_record_to_source[record_num] = source_path
+                    self._note_file_seq(record_num, record)
             else:
                 # No data runs and no resident data - check if it's a large sparse file
                 try:
@@ -2501,6 +2512,7 @@ class ClusterMapper:
                     if file_size > 700:  # Large file with no allocation = sparse
                         self.sparse_files[rel_path] = (source_path, file_size, record_num)
                         self.mft_record_to_source[record_num] = source_path
+                        self._note_file_seq(record_num, record)
                 except OSError:
                     pass
 
@@ -2848,16 +2860,55 @@ class ClusterMapper:
             return os.path.relpath(source_path, self.overflow_dir)
         return os.path.relpath(source_path, self.source_dir)
 
-    def _find_source_file(self, filename: str) -> Optional[str]:
-        """Find matching file in source directory."""
+    def _find_source_file(self, filename: str,
+                          expected_size: Optional[int] = None
+                          ) -> Optional[str]:
+        """Find a matching file in the source directory.
+
+        The tree-walk fallback is deliberately strict: a bare basename can
+        match many files (e.g. episode files with identical names in
+        different season folders), and mapping the wrong one silently serves
+        another file's content. It only returns a match when the basename is
+        unique in the tree, or when exactly one candidate matches
+        expected_size (the NTFS record's data_size).
+        """
         path = os.path.join(self.source_dir, filename)
         if os.path.isfile(path):
             return path
 
+        matches = []
         for root, dirs, files in os.walk(self.source_dir, followlinks=True):
             if filename in files:
-                return os.path.join(root, filename)
+                matches.append(os.path.join(root, filename))
+                if len(matches) > 8:
+                    break  # ambiguity already certain
 
+        if not matches:
+            return None
+        if len(matches) == 1:
+            if expected_size is not None:
+                try:
+                    if os.path.getsize(matches[0]) != expected_size:
+                        log(f"  _find_source_file({filename}): single match "
+                            f"has wrong size; refusing")
+                        return None
+                except OSError:
+                    return None
+            return matches[0]
+
+        if expected_size is not None:
+            sized = []
+            for m in matches:
+                try:
+                    if os.path.getsize(m) == expected_size:
+                        sized.append(m)
+                except OSError:
+                    pass
+            if len(sized) == 1:
+                return sized[0]
+
+        log(f"  _find_source_file({filename}): {len(matches)} ambiguous "
+            f"matches; refusing to guess")
         return None
 
     def _map_clusters(self, data_runs: List[Tuple[int, int]], source_path: str):
@@ -4076,7 +4127,20 @@ class ClusterMapper:
                 return False
 
             flags = struct.unpack('<H', record[22:24])[0]
-            if flags & 0x01:  # Still in use - not deleted
+            if flags & 0x01:  # Still in use
+                # Recycled slot? The tracked file was deleted and the record
+                # reused for a new file before this worker pass observed the
+                # freed state. Drop the stale tracking (never touch ext4 on
+                # inference alone; the gate reconciles the leftover file).
+                seq = struct.unpack('<H', bytes(record[16:18]))[0]
+                expected_seq = self._file_mft_seq.get(record_num)
+                source_path = self.mft_record_to_source.get(record_num)
+                if (source_path and expected_seq is not None
+                        and seq != expected_seq):
+                    log(f"  _check_file_deleted({record_num}): seq changed "
+                        f"{expected_seq}->{seq}, record recycled; dropping "
+                        f"stale tracking for {self._get_rel_path(source_path)}")
+                    self._drop_file_tracking(record_num, source_path)
                 return False
 
             source_path = self.mft_record_to_source.get(record_num)
@@ -4089,12 +4153,14 @@ class ClusterMapper:
                 log(f"  Skipping delete (ext4 sync in progress): {rel_path}")
                 self._notify_echo_observed(rel_path)
                 del self.mft_record_to_source[record_num]
+                self._file_mft_seq.pop(record_num, None)
                 self.resident_file_data.pop(record_num, None)
                 self.path_to_mft_record.pop(rel_path, None)
                 return True
 
             # Remove tracking before releasing lock
             del self.mft_record_to_source[record_num]
+            self._file_mft_seq.pop(record_num, None)
             self.resident_file_data.pop(record_num, None)
             self.path_to_mft_record.pop(rel_path, None)
             if source_path in self.source_to_clusters:
@@ -4426,12 +4492,14 @@ class ClusterMapper:
                 log(f"  Skipping new file (ext4 sync in progress): {rel_path}")
                 self._notify_echo_observed(rel_path)
                 self.mft_record_to_source[record_num] = source_path
+                self._note_file_seq(record_num, record)
                 self.path_to_mft_record[rel_path] = record_num
                 self._track_file_data(record, record_num, source_path)
                 return None
 
             if os.path.exists(source_path):
                 self.mft_record_to_source[record_num] = source_path
+                self._note_file_seq(record_num, record)
                 self.path_to_mft_record[rel_path] = record_num
                 self._track_file_data(record, record_num, source_path)
                 return None
@@ -4489,6 +4557,7 @@ class ClusterMapper:
             with self.lock:
                 self.ntfs_sync_in_progress.discard(rel_path)
                 self.mft_record_to_source[record_num] = source_path
+                self._note_file_seq(record_num, record)
                 self.path_to_mft_record[rel_path] = record_num
                 self._track_file_data(record, record_num, source_path)
             return source_path
@@ -4497,6 +4566,35 @@ class ClusterMapper:
             with self.lock:
                 self.ntfs_sync_in_progress.discard(rel_path)
             return None
+
+    def _note_file_seq(self, record_num: int, record) -> None:
+        """Remember a tracked FILE record's MFT sequence number."""
+        try:
+            self._file_mft_seq[record_num] = struct.unpack(
+                '<H', record[16:18])[0]
+        except (struct.error, TypeError):
+            pass
+
+    def _drop_file_tracking(self, record_num: int, source_path: str):
+        """Remove every mapping for a stale/recycled tracked file record.
+
+        Leaves the ext4 source untouched — when tracking is stale the only
+        safe action is to forget it; _check_new_file will pick up the
+        record's new occupant on its next MFT update, and the consistency
+        gate reconciles any leftover drift. Caller holds self.lock.
+        """
+        rel_path = self._get_rel_path(source_path)
+        self.mft_record_to_source.pop(record_num, None)
+        self._file_mft_seq.pop(record_num, None)
+        self.resident_file_data.pop(record_num, None)
+        if self.path_to_mft_record.get(rel_path) == record_num:
+            self.path_to_mft_record.pop(rel_path, None)
+        if source_path in self.source_to_clusters:
+            for cluster in self.source_to_clusters[source_path]:
+                self.cluster_map.pop(cluster, None)
+            del self.source_to_clusters[source_path]
+        self._direct_run_map = [r for r in self._direct_run_map
+                                if r[2] != source_path]
 
     def _track_file_data(self, record: bytearray, record_num: int, source_path: str):
         """Track file data - either cluster mapping or resident tracking."""
@@ -4537,6 +4635,24 @@ class ClusterMapper:
             record = self._undo_fixups(bytearray(
                 self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
             if record[0:4] != b'FILE':
+                return
+
+            # Guard: record recycled for a different file entity. Windows can
+            # free a record (delete) and reuse it (new file) between MFT
+            # worker passes; without this check the reuse is misread as a
+            # rename and shutil.move relocates the OLD file's ext4 source
+            # onto the NEW file's path. Mirrors the directory guard in
+            # _check_directory_rename.
+            cur_flags = struct.unpack('<H', record[22:24])[0]
+            cur_seq = struct.unpack('<H', record[16:18])[0]
+            expected_seq = self._file_mft_seq.get(record_num)
+            if (cur_flags & 0x01) and expected_seq is not None \
+                    and cur_seq != expected_seq:
+                stale_rel = self._get_rel_path(source_path)
+                log(f"  _reparse({record_num}): seq changed "
+                    f"{expected_seq}->{cur_seq}, record recycled "
+                    f"(was {stale_rel}); dropping stale tracking")
+                self._drop_file_tracking(record_num, source_path)
                 return
 
             # Determine rename
@@ -4583,6 +4699,7 @@ class ClusterMapper:
                                 self.path_to_mft_record[new_rel_path] = record_num
                                 source_path = new_path
                                 self.mft_record_to_source[record_num] = new_path
+                                self._note_file_seq(record_num, record)
                         else:
                             # Sync in progress - just update tracking
                             if old_rel in self.path_to_mft_record:
@@ -4590,6 +4707,7 @@ class ClusterMapper:
                             self.path_to_mft_record[new_rel_path] = record_num
                             source_path = new_path
                             self.mft_record_to_source[record_num] = new_path
+                            self._note_file_seq(record_num, record)
                     else:
                         # File doesn't exist at old path - just update tracking
                         if old_rel in self.path_to_mft_record:
@@ -4597,6 +4715,7 @@ class ClusterMapper:
                         self.path_to_mft_record[new_rel_path] = record_num
                         source_path = new_path
                         self.mft_record_to_source[record_num] = new_path
+                        self._note_file_seq(record_num, record)
 
         # --- Phase 2: slow filesystem op outside the lock ---
         if do_move:
@@ -4621,6 +4740,7 @@ class ClusterMapper:
                 self.path_to_mft_record[new_rel_path] = record_num
                 source_path = new_path
                 self.mft_record_to_source[record_num] = new_path
+                self._note_file_seq(record_num, record)
                 if old_source in self.source_to_clusters:
                     clusters = self.source_to_clusters.pop(old_source)
                     self.source_to_clusters[new_path] = clusters

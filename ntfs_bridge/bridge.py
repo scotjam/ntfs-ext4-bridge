@@ -28,7 +28,6 @@ import time
 
 from .cluster_mapper import ClusterMapper
 from .nbd_server import NBDServer
-from .sync_daemon import SyncDaemon
 from .lazy_allocator import LazyAllocator
 from .partition_wrapper import PartitionWrapper
 from .virtual_files import VirtualFileManager
@@ -40,7 +39,7 @@ def log(msg):
 
 
 class NTFSBridge:
-    """Main bridge tying together ClusterMapper, NBD server, and SyncDaemon."""
+    """Main bridge tying together ClusterMapper, NBD server, and two-way sync."""
 
     def __init__(self, image_path: str, source_dir: str,
                  ntfs_mount: str, port: int = 10809,
@@ -93,7 +92,6 @@ class NTFSBridge:
         self.mapper = None
         self.partition_wrapper = None
         self.nbd_server = None
-        self.sync_daemon = None
         self.lazy_allocator = None
         self.virtual_file_manager = None
         self._file_watcher = None
@@ -458,14 +456,10 @@ class NTFSBridge:
                 log("Post-mount: fixing INDX cluster bitmap entries...")
                 self.mapper.fix_indx_clusters()
 
-                # Start sync daemon for ntfs-3g based sync
-                if not self.virtual_mode:
-                    self.sync_daemon = SyncDaemon(
-                        self.source_dir, self.ntfs_mount, self.mapper,
-                        lazy_allocator=self.lazy_allocator
-                    )
-                    self.sync_daemon.start()
-                    log("Sync daemon started")
+                # NOTE: the old SyncDaemon (live ext4->NTFS via this local
+                # ntfs-3g mount) was removed: writing NTFS metadata through a
+                # second driver while a VM has the volume mounted corrupts
+                # Windows' cached state. Use --two-way instead.
 
                 # Run catch-up populate in background via production mount.
                 # The temp-mount populate may have failed for files in large
@@ -572,9 +566,6 @@ class NTFSBridge:
 
         if self._file_watcher:
             self._file_watcher.stop()
-
-        if self.sync_daemon:
-            self.sync_daemon.stop()
 
         if self.lazy_allocator:
             self.lazy_allocator.stop()
