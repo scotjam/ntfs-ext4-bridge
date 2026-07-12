@@ -294,9 +294,15 @@ class PartitionWrapper:
                     pos += remaining
 
             else:
-                # Reading from partition - offset and pass to mapper
+                # Reading from partition - offset and pass to mapper.
+                # Clamp so a read that starts in the partition body doesn't
+                # run past it into the backup-GPT trailer (which would then
+                # be served as zeros from the mapper instead of trailer_area).
                 partition_offset = current_offset - PARTITION_OFFSET_BYTES
-                data = self.mapper.read(partition_offset, remaining)
+                part_read = remaining
+                if self.trailer_area and current_offset < self.trailer_offset:
+                    part_read = min(remaining, self.trailer_offset - current_offset)
+                data = self.mapper.read(partition_offset, part_read)
                 if not data or len(data) == 0:
                     break  # Prevent infinite loop
                 result[pos:pos + len(data)] = data

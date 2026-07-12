@@ -268,6 +268,10 @@ class NTFSBridge:
         # server (which starts next) immediately serves the corrected data.
         self._fix_index_alloc_data_sizes()
 
+        # Clear the dirty bit ntfsfix set, so Windows mounts the bridge
+        # volume clean and never auto-runs chkdsk against it.
+        self.mapper.clear_dirty_bit()
+
         # Step 6: Create NBD server
         # Use PartitionWrapper for Windows VM mode (adds MBR partition table)
         if self.partitioned:

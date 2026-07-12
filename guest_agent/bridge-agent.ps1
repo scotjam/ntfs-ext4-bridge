@@ -108,6 +108,13 @@ function Execute-Op($op, $driveLetter) {
                 if ($LASTEXITCODE -ne 0) { throw "fsutil createnew failed" }
             }
             if ([int64]$op.size -gt 0) {
+                # Flush the newly-written MFT (cluster allocation) to the
+                # bridge BEFORE raising Valid Data Length, so the bridge maps
+                # those clusters to the ext4 source first. Otherwise a read
+                # in the gap between setvaliddata and the bridge's async
+                # cluster mapping could serve stale image bytes. This shrinks
+                # that window (does not fully eliminate the async race).
+                Write-VolumeCache -DriveLetter $driveLetter -ErrorAction SilentlyContinue
                 # Raise Valid Data Length so reads hit the device (the bridge
                 # serves the mapped ext4 bytes) instead of returning zeros.
                 & fsutil file setvaliddata $path $op.size | Out-Null
