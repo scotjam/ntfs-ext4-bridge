@@ -1,5 +1,14 @@
 """Template-based NTFS synthesizer with MFT tracking.
 
+DEPRECATED AND UNSAFE — superseded by ntfs_bridge.cluster_mapper.ClusterMapper.
+This prototype loads the ENTIRE image into RAM (cannot scale past a few GB),
+returns silent zeros on read errors, resolves files by basename (wrong-file
+risk), has no MFT-record recycle guard (wrong-file renames), reads its cluster
+map locklessly while mutating it, and allocates clusters without consulting
+$Bitmap (cross-links). Do not use it to back up real data — use the production
+bridge (`python -m ntfs_bridge.bridge --two-way`). Kept only as a reference for
+the two standalone experiment servers (dynamic_server / partitioned_server).
+
 Uses a pre-populated NTFS template and swaps file content from ext4 at read time.
 Tracks MFT changes to dynamically update cluster mappings when ntfs-3g reallocates.
 Supports dynamic file addition/removal from ext4 side.
