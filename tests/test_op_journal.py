@@ -28,6 +28,10 @@ class FakeMapper:
         self._sync_lock = threading.Lock()
         self.ext4_sync_in_progress = set()
         self.echo_observed_callback = None
+        self.remapped = []
+
+    def remap_source_path(self, old_rel, new_rel):
+        self.remapped.append((old_rel, new_rel))
 
 
 @pytest.fixture
@@ -104,6 +108,8 @@ def test_move_emits_mv(env):
     assert op_kinds(ops) == ['mv', 'flush_volume']
     assert ops[0]['path'] == 'Share\\a.txt'
     assert ops[0]['dst'] == 'Share\\b.txt'
+    # The bridge remaps its own cluster mappings before dispatching the mv.
+    assert ('Share/a.txt', 'Share/b.txt') in mapper.remapped
 
 
 def test_dir_delete_subsumes_children(env):
