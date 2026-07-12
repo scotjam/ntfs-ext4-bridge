@@ -59,7 +59,7 @@ def test_gate_reconciles_ext4_changes(tmp_path):
     bridge.setup()
     bridge._start_two_way()
     try:
-        # Mutate ext4 while "the VM" would normally be attached
+        # Mutate ext4 while "the VM" would normally be attached.
         (share / 'gone.bin').unlink()
         (share / 'new.bin').write_bytes(os.urandom(8192))
         with open(share / 'grow.bin', 'ab') as f:
@@ -68,26 +68,38 @@ def test_gate_reconciles_ext4_changes(tmp_path):
         newdir.mkdir()
         (newdir / 'nested.bin').write_bytes(os.urandom(512))
 
-        # Run the gate directly (fake agent: no disk to offline). Force the
-        # offline step to no-op by pre-confirming the agent phase.
-        gate = bridge.consistency_gate
-        gate.journal = bridge.op_journal
-        gate._agent_confirmed.set()          # pretend agent confirmed
-        gate._agent_online_confirmed.set()
-        bridge.op_journal.pause()
-        gate.gate_id = 'test-gate'
-        gate.mapper._mft_queue.join()
-        gate.mapper.gate_active.set()
-        gate.mapper.flush()
-        try:
-            gate._apply_offline()
-            gate.mapper.image.reload()
-            gate.mapper.rescan_mft()
-            bridge._allocate_new_sparse_files()
-        finally:
-            gate.mapper.gate_active.clear()
+        # Bulk create: enough files that the offline ntfs-3g apply may grow
+        # or relocate the $MFT. This is the case that exposed the "10->3
+        # files" geometry-staleness bug — the gate refresh must re-derive
+        # MFT geometry, not reuse the geometry captured at __init__.
+        bulk = share / 'bulk'
+        bulk.mkdir()
+        for i in range(60):
+            (bulk / f'file{i:03d}.bin').write_bytes(os.urandom(1500))
 
-        # Verify by mounting the image read-only
+        expected_files = {'keep.bin', 'new.bin', 'grow.bin'}
+        expected_files |= {f'file{i:03d}.bin' for i in range(60)}
+
+        # Drive the REAL gate cycle. Pre-confirm the agent offline/online
+        # phases (no VM to actually take a disk offline).
+        gate = bridge.consistency_gate
+        gate._agent_confirmed.set()
+        gate._agent_online_confirmed.set()
+        gate.run_gate('test-bulk')
+
+        # After a real gate, the mapper must track every ext4 file under the
+        # share (this is what regressed to 3 before the fix).
+        tracked = {os.path.basename(p)
+                   for p in bridge.mapper.mft_record_to_source.values()}
+        tracked |= {os.path.basename(bridge.mapper.source_dir + '/' + p)
+                    for p in bridge.mapper.sparse_files}
+        missing = expected_files - tracked
+        assert not missing, (
+            f"gate dropped {len(missing)} tracked files (geometry-staleness "
+            f"regression): {sorted(missing)[:8]}")
+        assert 'gone.bin' not in tracked
+
+        # Verify the NTFS image itself is consistent and complete.
         verify_mnt = str(tmp_path / 'verify')
         os.makedirs(verify_mnt)
         subprocess.run(['ntfsfix', image], capture_output=True)
@@ -99,14 +111,13 @@ def test_gate_reconciles_ext4_changes(tmp_path):
             ntfs_share = os.path.join(verify_mnt, 'Share')
             names = set(os.listdir(ntfs_share))
             assert 'gone.bin' not in names
-            assert {'keep.bin', 'new.bin', 'grow.bin', 'newdir'} <= names
+            assert {'keep.bin', 'new.bin', 'grow.bin', 'newdir', 'bulk'} <= names
             assert os.path.getsize(os.path.join(ntfs_share, 'grow.bin')) \
                 == os.path.getsize(share / 'grow.bin')
             assert os.path.isfile(
                 os.path.join(ntfs_share, 'newdir', 'nested.bin'))
-            # NOTE: content hashes are validated through the NBD path in the
-            # live runbook; the direct image mount only holds metadata for
-            # bridge-mapped files, so only sizes/names are asserted here.
+            bulk_names = set(os.listdir(os.path.join(ntfs_share, 'bulk')))
+            assert len(bulk_names) == 60, f"bulk dir has {len(bulk_names)}/60"
         finally:
             subprocess.run(['umount', verify_mnt], capture_output=True)
     finally:
