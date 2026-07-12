@@ -256,6 +256,17 @@ class OpJournal:
 
             # 1) moves, in arrival order
             for old_rel, new_rel, _ts in ready_moves:
+                # Proactively remap the bridge's own cluster mappings from the
+                # old ext4 path to the new one. The rename already happened on
+                # ext4, so reads of the file's clusters must resolve to the
+                # new path now — otherwise they fail with EIO (old path gone)
+                # until the guest echo or a consistency gate catches up.
+                try:
+                    self.mapper.remap_source_path(
+                        old_rel.replace('/', os.sep),
+                        new_rel.replace('/', os.sep))
+                except Exception as e:
+                    log(f"remap_source_path error ({old_rel}->{new_rel}): {e}")
                 new_ops.append({'op': 'mv', 'path': _to_ntfs(old_rel),
                                 'dst': _to_ntfs(new_rel),
                                 '_rel': new_rel, '_rel_old': old_rel})

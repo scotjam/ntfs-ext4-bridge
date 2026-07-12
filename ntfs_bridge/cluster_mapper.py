@@ -2863,6 +2863,64 @@ class ClusterMapper:
             return os.path.join(self.source_dir, rel_path)
         return os.path.join(self.overflow_dir, rel_path)
 
+    def remap_source_path(self, old_rel: str, new_rel: str):
+        """Rename a tracked ext4 source across every mapping structure.
+
+        Called when an ext4-side rename is detected (the bridge emits the
+        guest 'mv' op, so it knows the file moved before the guest echo
+        arrives). Without this, cluster mappings keep pointing at the old
+        ext4 path, which no longer exists, and every read of the file's
+        data fails with EIO until a consistency gate reconciles it.
+
+        rel paths are share-relative with the OS separator (as stored in
+        path_to_mft_record / sparse_files).
+        """
+        old_source = self._resolve_source_path(old_rel)
+        new_source = self._resolve_source_path(new_rel)
+        if old_source == new_source:
+            return
+        with self.lock:
+            # Per-cluster map (small files) + source_to_clusters
+            clusters = self.source_to_clusters.pop(old_source, None)
+            if clusters is not None:
+                self.source_to_clusters[new_source] = clusters
+            for c, m in list(self.cluster_map.items()):
+                if isinstance(m, tuple) and len(m) == 2 \
+                        and m[0] == old_source:
+                    self.cluster_map[c] = (new_source, m[1])
+
+            # Run-based map (large files, the RUN_MAP_THRESHOLD=0 default)
+            self._direct_run_map = [
+                (s, e, new_source if sp == old_source else sp, o)
+                for s, e, sp, o in self._direct_run_map
+            ]
+
+            # Record <-> path tracking
+            rec = self.path_to_mft_record.pop(old_rel, None)
+            for rn, sp in list(self.mft_record_to_source.items()):
+                if sp == old_source:
+                    self.mft_record_to_source[rn] = new_source
+                    if rec is None:
+                        rec = rn
+            if rec is not None:
+                self.path_to_mft_record[new_rel] = rec
+
+            # Sparse-file tracking
+            sp_entry = self.sparse_files.pop(old_rel, None)
+            if sp_entry is not None:
+                _src, sz, rn = sp_entry
+                self.sparse_files[new_rel] = (new_source, sz, rn)
+            for c, rp in list(self.sparse_file_clusters.items()):
+                if rp == old_rel:
+                    self.sparse_file_clusters[c] = new_rel
+
+            # Resident-file tracking
+            for info in self.resident_file_data.values():
+                if info.get('source_path') == old_source:
+                    info['source_path'] = new_source
+
+            log(f"  Remapped source: {old_rel} -> {new_rel}")
+
     def _notify_echo_observed(self, rel_path: str):
         """Tell the SyncCoordinator (if any) that a guest-op echo landed."""
         cb = self.echo_observed_callback
