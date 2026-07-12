@@ -177,10 +177,16 @@ Verified end-to-end on a real Windows 11 guest (nested KVM under WSL2,
   "10→3 files" bug — `rescan_mft()` reusing stale MFT geometry — is fixed by
   `reload_from_image()` + a full-image msync before the offline mount.)
 
-Two minor, non-corrupting issues remain (tracked separately): a renamed
-file can show size 0 in the guest until the next gate (rename data-run
-remap nuance), and ntfs-3g leaves the NTFS dirty bit set so Windows reports
-the volume "Scan Needed / Warning" (reads/writes are unaffected).
+Renames are handled correctly: on an ext4-side rename the bridge proactively
+remaps its own cluster mappings to the new path (`remap_source_path`), so
+reads of the renamed file resolve immediately instead of failing on the gone
+old path. Verified live: rename a 300KB file on ext4 → guest shows the new
+name at full size, content hash matches, zero read failures.
+
+One minor, non-corrupting issue remains (tracked separately): ntfs-3g leaves
+the NTFS dirty bit set, so Windows reports the volume "Scan Needed / Warning"
+— reads and writes are unaffected (all content hashes verified in that
+state).
 
 ## Testing
 
