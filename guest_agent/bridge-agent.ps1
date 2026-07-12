@@ -186,16 +186,17 @@ while ($true) {
         }
 
         $cursor = Get-Cursor
-        # The server long-polls up to ~25s; use a comfortably larger client
-        # timeout and treat a timeout as a normal empty poll (do NOT reset the
-        # epoch, or the agent thrashes re-hello/disk-cycle while idle).
+        # The server long-polls up to ~25s. Any poll failure (timeout,
+        # transient connection reset) is non-fatal: just retry. Never reset
+        # the epoch here — a genuine bridge restart/gate is detected via the
+        # epoch field in a SUCCESSFUL response below, not via an exception.
+        # (Resetting on poll errors caused re-hello/disk-cycle thrash.)
+        $resp = $null
         try {
             $resp = Invoke-Bridge '/v1/poll' @{ cursor = $cursor } 90
-        } catch [System.Net.WebException] {
-            if ($_.Exception.Status -eq [System.Net.WebExceptionStatus]::Timeout) {
-                continue
-            }
-            throw
+        } catch {
+            Start-Sleep -Seconds 2
+            continue
         }
         if ($null -eq $resp) { continue }
 
