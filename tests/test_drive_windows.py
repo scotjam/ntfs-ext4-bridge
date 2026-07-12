@@ -18,6 +18,18 @@ import time
 import argparse
 import tempfile
 import uuid
+
+# Windows-only manual drive test (run as: python test_drive_windows.py E:).
+# It loads kernel32 via ctypes.windll at import time, which does not exist on
+# Linux — skip the whole module under pytest on non-Windows so it doesn't
+# abort collection of the rest of the suite.
+if sys.platform != 'win32':
+    try:
+        import pytest
+        pytest.skip("Windows-only manual drive test", allow_module_level=True)
+    except ImportError:
+        raise SystemExit("test_drive_windows.py is Windows-only")
+
 from ctypes import wintypes
 
 # Try to import paramiko for SSH verification
