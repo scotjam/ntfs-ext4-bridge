@@ -51,12 +51,30 @@ class _HotImageCache:
     flush() writes the hot bytearray back to the mmap and syncs to disk.
     """
 
+    # Track beyond-hot writes in coarse aligned chunks so a durability
+    # barrier (NBD FLUSH) can msync exactly what changed, instead of either
+    # only the 64MB hot region (loses metadata on a multi-TB volume) or the
+    # whole multi-TB mapping (too slow, trips the WNBD 30s timeout).
+    _DIRTY_CHUNK = 1 << 20  # 1 MiB, page-aligned
+
     def __init__(self, mm: mmap.mmap, hot_size: int):
         self._mm = mm
         self._hot_size = min(hot_size, len(mm))
         log(f"Loading {self._hot_size // (1024 * 1024)}MB image metadata into RAM...")
         self._hot = bytearray(mm[:self._hot_size])
+        self._dirty_chunks = set()   # chunk indices written beyond hot_size
+        self._hot_dirty = False      # hot region has unflushed changes
         log("Image metadata cached (reads/writes are now RAM-speed)")
+
+    def _mark_dirty(self, start, stop):
+        if start < self._hot_size:
+            self._hot_dirty = True
+        beyond_start = max(start, self._hot_size)
+        if beyond_start < stop:
+            c0 = beyond_start // self._DIRTY_CHUNK
+            c1 = (stop - 1) // self._DIRTY_CHUNK
+            for c in range(c0, c1 + 1):
+                self._dirty_chunks.add(c)
 
     def __len__(self) -> int:
         return len(self._mm)
@@ -74,6 +92,7 @@ class _HotImageCache:
     def __setitem__(self, s: slice, value: bytes):
         start = s.start if s.start is not None else 0
         stop = s.stop if s.stop is not None else start + len(value)
+        self._mark_dirty(start, stop)
         if stop <= self._hot_size:
             self._hot[start:stop] = value
         elif start >= self._hot_size:
@@ -89,20 +108,37 @@ class _HotImageCache:
         self._hot = bytearray(self._mm[:self._hot_size])
 
     def flush(self):
-        """Flush hot cache to mmap and sync the hot region to disk."""
+        """Durability barrier: msync the hot region AND every beyond-hot
+        chunk written since the last flush.
+
+        The hot 64MB alone is not enough on a multi-TB volume — MFT records,
+        $Bitmap, and directory INDX blocks live beyond it. Syncing only the
+        dirty chunks keeps this fast enough for the WNBD 30s I/O timeout
+        while still making all acknowledged metadata durable.
+        """
         self._mm[:self._hot_size] = bytes(self._hot)
         self._mm.flush(0, self._hot_size)
+        self._hot_dirty = False
+        if self._dirty_chunks:
+            total = len(self._mm)
+            for c in sorted(self._dirty_chunks):
+                off = c * self._DIRTY_CHUNK
+                size = min(self._DIRTY_CHUNK, total - off)
+                if size > 0:
+                    self._mm.flush(off, size)
+            self._dirty_chunks.clear()
 
     def flush_all(self):
         """Flush hot cache to mmap and msync the ENTIRE image to disk.
 
-        flush() only syncs the hot 64MB. Before an offline ntfs-3g mount the
-        whole image must be on disk — including data-cluster and directory
-        index writes beyond the hot region — so the external tool reads a
-        complete, consistent image.
+        Used before an offline ntfs-3g mount (the consistency gate), where
+        the whole image must be on disk and the guest is offline so the
+        cost of a full msync is acceptable.
         """
         self._mm[:self._hot_size] = bytes(self._hot)
         self._mm.flush()
+        self._hot_dirty = False
+        self._dirty_chunks.clear()
 
     def close(self):
         self._mm.close()
@@ -283,6 +319,12 @@ class ClusterMapper:
         # Thread safety
         self.lock = threading.RLock()
 
+        # ext4 source files written since the last durability barrier. On an
+        # NBD FLUSH these get fsync'd so acknowledged file data is actually on
+        # disk (a plain write() leaves it in ext4 page cache). Add is
+        # GIL-atomic; the barrier snapshots+clears under self.lock.
+        self._dirty_sources: Set[str] = set()
+
         # Consistency-gate quiescence. While set, the image is being modified
         # offline (ntfs-3g apply with the guest disk offline): writes are
         # refused with EROFS and all reads serialize behind self.lock so
@@ -460,27 +502,51 @@ class ClusterMapper:
         """Cleanup on deletion."""
         self.close()
 
+    def _run_map_insert(self, entries):
+        """Insert run entries into _direct_run_map by REBINDING, not mutating.
+
+        Lock-free data reads snapshot the _direct_run_map reference (see
+        _run_map_lookup); an in-place bisect.insort would shift elements
+        under a concurrent searcher and let it return a wrong run. Building a
+        new sorted list and rebinding makes the update atomic for readers.
+        Callers hold self.lock, so concurrent writers don't lose entries.
+        """
+        if not entries:
+            return
+        new_list = list(self._direct_run_map)
+        for entry in entries:
+            bisect.insort(new_list, entry)
+        self._direct_run_map = new_list
+
     def _run_map_lookup(self, cluster: int) -> Optional[Tuple[str, int]]:
         """Binary search in _direct_run_map for a cluster.
 
         Returns (source_path, file_offset) or None.
         O(log n) in number of runs, not clusters.
+
+        Data reads run without self.lock, so this snapshots the list
+        reference once and searches that snapshot — writers replace the list
+        by rebinding (never in-place mutation, see _run_map_replace), so the
+        snapshot is a consistent immutable view. The final `start <= cluster
+        < end` check is explicit (both bounds) so a stale-but-consistent
+        snapshot can only return None, never a wrong run.
         """
-        if not self._direct_run_map:
+        runs = self._direct_run_map  # atomic reference grab (GIL)
+        if not runs:
             return None
         # Find rightmost entry with start <= cluster
-        lo, hi = 0, len(self._direct_run_map)
+        lo, hi = 0, len(runs)
         while lo < hi:
             mid = (lo + hi) // 2
-            if self._direct_run_map[mid][0] <= cluster:
+            if runs[mid][0] <= cluster:
                 lo = mid + 1
             else:
                 hi = mid
         idx = lo - 1
         if idx < 0:
             return None
-        start, end, path, base_offset = self._direct_run_map[idx]
-        if cluster < end:
+        start, end, path, base_offset = runs[idx]
+        if start <= cluster < end:
             return (path, base_offset + (cluster - start) * self.cluster_size)
         return None
 
@@ -1021,6 +1087,7 @@ class ClusterMapper:
                         with open(source_path, 'r+b') as f:
                             f.seek(write_offset)
                             f.write(chunk_data)
+                        self._dirty_sources.add(source_path)
                         if not hasattr(self, '_write_logged'):
                             self._write_logged = set()
                         if source_path not in self._write_logged:
@@ -1041,6 +1108,7 @@ class ClusterMapper:
                     with open(source_path, 'r+b') as f:
                         f.seek(write_offset)
                         f.write(chunk_data)
+                    self._dirty_sources.add(source_path)
                     if not hasattr(self, '_write_logged'):
                         self._write_logged = set()
                     if source_path not in self._write_logged:
@@ -1061,7 +1129,7 @@ class ClusterMapper:
         return len(self.image)
 
     def flush(self):
-        """Flush image changes to disk (hot region only)."""
+        """Flush image changes to disk (hot region + dirty beyond-hot chunks)."""
         if self.image:
             self.image.flush()
 
@@ -1069,6 +1137,43 @@ class ClusterMapper:
         """Flush the entire image to disk (before an offline external mount)."""
         if self.image:
             self.image.flush_all()
+
+    def durability_barrier(self):
+        """Make all acknowledged writes durable — the NBD FLUSH contract.
+
+        Windows sends NBD_CMD_FLUSH expecting everything acknowledged so far
+        to survive a power loss. That requires three things, none of which a
+        bare image.flush() of the hot region did:
+          1. drain the async MFT->ext4 worker queue, so acknowledged
+             create/rename/delete metadata ops have actually reached ext4;
+          2. fsync every ext4 source file written since the last barrier
+             (a plain write() only dirties the ext4 page cache);
+          3. msync the image (hot region + every dirty beyond-hot chunk —
+             MFT/$Bitmap/INDX on a multi-TB volume live beyond 64MB).
+        """
+        # 1. drain queued metadata ops
+        try:
+            self._mft_queue.join()
+        except Exception as e:
+            log(f"durability_barrier: queue drain error: {e}")
+
+        # 2. fsync dirty ext4 sources
+        with self.lock:
+            dirty = list(self._dirty_sources)
+            self._dirty_sources.clear()
+        for path in dirty:
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass  # file may have been renamed/deleted since the write
+
+        # 3. msync the image (dirty regions)
+        if self.image:
+            self.image.flush()
 
     def reload_from_image(self):
         """Fully re-derive bridge state from the on-disk image.
@@ -2128,18 +2233,19 @@ class ClusterMapper:
         return False
 
     def allocate_file_direct(self, rel_path: str) -> bool:
-        """Allocate clusters for a sparse file directly (no ntfs-3g).
+        """Allocate clusters for a sparse file (locked wrapper).
 
-        This updates:
-        1. Cluster bitmap (marks clusters as used)
-        2. MFT data runs (points to allocated clusters)
-        3. cluster_map (routes reads to ext4 file)
-
-        No data is copied - reads will return ext4 content.
-        Uses run-based allocation for efficiency with large files (40GB+).
-
-        Returns True if successful.
+        Takes self.lock so the bitmap / free-run index / _direct_run_map /
+        cluster_map / MFT mutations are atomic against concurrent reads and
+        the MFT worker. Reachable from the lockless data-read path (via
+        _check_sparse_file_read → _trigger_sparse_allocation), so the lock
+        here is what prevents two readers double-allocating the same free
+        clusters (cross-linked files).
         """
+        with self.lock:
+            return self._allocate_file_direct_impl(rel_path)
+
+    def _allocate_file_direct_impl(self, rel_path: str) -> bool:
         if rel_path not in self.sparse_files:
             return False
 
@@ -2202,10 +2308,12 @@ class ClusterMapper:
         last_cluster = runs[-1][0] + runs[-1][1] - 1
         log(f"  Mapping clusters {first_cluster}-{last_cluster} to {os.path.basename(source_path)}")
         file_offset = 0
+        _run_entries = []
         for start, count in runs:
-            bisect.insort(self._direct_run_map, (start, start + count, source_path, file_offset))
+            _run_entries.append((start, start + count, source_path, file_offset))
             file_offset += count * self.cluster_size
             self._alloc_watermark = max(self._alloc_watermark, start + count)
+        self._run_map_insert(_run_entries)
 
         # Ensure source_to_clusters has an entry (empty set; runs are in _direct_run_map)
         if source_path not in self.source_to_clusters:
@@ -2275,6 +2383,11 @@ class ClusterMapper:
             off += attr_len
 
     def deallocate_file_direct(self, rel_path: str) -> bool:
+        """Deallocate clusters for a file (locked wrapper)."""
+        with self.lock:
+            return self._deallocate_file_direct_impl(rel_path)
+
+    def _deallocate_file_direct_impl(self, rel_path: str) -> bool:
         """Deallocate clusters for a file (reverse of allocate_file_direct).
 
         Restores the file to sparse state.
@@ -2867,57 +2980,109 @@ class ClusterMapper:
         """Rename a tracked ext4 source across every mapping structure.
 
         Called when an ext4-side rename is detected (the bridge emits the
-        guest 'mv' op, so it knows the file moved before the guest echo
+        guest 'mv' op, so it knows the path moved before the guest echo
         arrives). Without this, cluster mappings keep pointing at the old
         ext4 path, which no longer exists, and every read of the file's
         data fails with EIO until a consistency gate reconciles it.
 
+        Handles BOTH file and directory renames. For a directory rename the
+        move is a single ext4/inotify event covering the whole subtree, so
+        every child mapping (whose source is under old_source) must be
+        rewritten too — otherwise the children read as EIO after a dir move.
+
         rel paths are share-relative with the OS separator (as stored in
-        path_to_mft_record / sparse_files).
+        path_to_mft_record / sparse_files / mft_record_to_dir).
         """
         old_source = self._resolve_source_path(old_rel)
         new_source = self._resolve_source_path(new_rel)
         if old_source == new_source:
             return
+        old_src_pre = old_source + os.sep
+        old_rel_pre = old_rel + os.sep
+
+        def remap_source(sp):
+            if sp == old_source:
+                return new_source
+            if sp.startswith(old_src_pre):
+                return new_source + os.sep + sp[len(old_src_pre):]
+            return sp
+
+        def remap_rel(rp):
+            if rp == old_rel:
+                return new_rel
+            if rp.startswith(old_rel_pre):
+                return new_rel + os.sep + rp[len(old_rel_pre):]
+            return rp
+
+        def affects_source(sp):
+            return sp == old_source or sp.startswith(old_src_pre)
+
         with self.lock:
-            # Per-cluster map (small files) + source_to_clusters
-            clusters = self.source_to_clusters.pop(old_source, None)
-            if clusters is not None:
-                self.source_to_clusters[new_source] = clusters
+            # Overwrite-rename cleanup: if new_source was already tracked by a
+            # DIFFERENT record (ext4 `mv -f A B` over an existing B), Windows
+            # frees B's old MFT record. Drop that stale tracking now so a late
+            # "record freed" echo can't fire _check_file_deleted and os.remove
+            # the just-renamed-in B source (wrong-file delete). The record
+            # being remapped keeps its mapping.
+            keep_recs = {rn for rn, sp in self.mft_record_to_source.items()
+                         if affects_source(sp)}
+            for rn, sp in list(self.mft_record_to_source.items()):
+                if rn not in keep_recs and (sp == new_source
+                                            or sp.startswith(new_source + os.sep)):
+                    log(f"  Dropping overwritten target tracking: record {rn} "
+                        f"({os.path.basename(sp)})")
+                    self.mft_record_to_source.pop(rn, None)
+                    self._file_mft_seq.pop(rn, None)
+                    self.resident_file_data.pop(rn, None)
+
+            # source_to_clusters (keyed by source path)
+            for sp in [s for s in self.source_to_clusters if affects_source(s)]:
+                self.source_to_clusters[remap_source(sp)] = \
+                    self.source_to_clusters.pop(sp)
+
+            # Per-cluster map (small files)
             for c, m in list(self.cluster_map.items()):
                 if isinstance(m, tuple) and len(m) == 2 \
-                        and m[0] == old_source:
-                    self.cluster_map[c] = (new_source, m[1])
+                        and affects_source(m[0]):
+                    self.cluster_map[c] = (remap_source(m[0]), m[1])
 
             # Run-based map (large files, the RUN_MAP_THRESHOLD=0 default)
             self._direct_run_map = [
-                (s, e, new_source if sp == old_source else sp, o)
+                (s, e, remap_source(sp), o)
                 for s, e, sp, o in self._direct_run_map
             ]
 
-            # Record <-> path tracking
-            rec = self.path_to_mft_record.pop(old_rel, None)
+            # Record -> source path
             for rn, sp in list(self.mft_record_to_source.items()):
-                if sp == old_source:
-                    self.mft_record_to_source[rn] = new_source
-                    if rec is None:
-                        rec = rn
-            if rec is not None:
-                self.path_to_mft_record[new_rel] = rec
+                if affects_source(sp):
+                    self.mft_record_to_source[rn] = remap_source(sp)
 
-            # Sparse-file tracking
-            sp_entry = self.sparse_files.pop(old_rel, None)
-            if sp_entry is not None:
-                _src, sz, rn = sp_entry
-                self.sparse_files[new_rel] = (new_source, sz, rn)
+            # Record -> directory rel path (for directories and their subdirs)
+            for rn, rp in list(self.mft_record_to_dir.items()):
+                if rp == old_rel or rp.startswith(old_rel_pre):
+                    self.mft_record_to_dir[rn] = remap_rel(rp)
+
+            # path_to_mft_record (keyed by rel path)
+            for rp in [r for r in self.path_to_mft_record
+                       if r == old_rel or r.startswith(old_rel_pre)]:
+                self.path_to_mft_record[remap_rel(rp)] = \
+                    self.path_to_mft_record.pop(rp)
+
+            # Sparse-file tracking (rel-keyed; value carries source path)
+            for rp in [r for r in self.sparse_files
+                       if r == old_rel or r.startswith(old_rel_pre)]:
+                _src, sz, rn = self.sparse_files.pop(rp)
+                self.sparse_files[remap_rel(rp)] = (
+                    remap_source(_src), sz, rn)
             for c, rp in list(self.sparse_file_clusters.items()):
-                if rp == old_rel:
-                    self.sparse_file_clusters[c] = new_rel
+                if rp == old_rel or rp.startswith(old_rel_pre):
+                    self.sparse_file_clusters[c] = remap_rel(rp)
 
             # Resident-file tracking
             for info in self.resident_file_data.values():
-                if info.get('source_path') == old_source:
-                    info['source_path'] = new_source
+                sp = info.get('source_path')
+                if sp and affects_source(sp):
+                    info['source_path'] = remap_source(sp)
 
             log(f"  Remapped source: {old_rel} -> {new_rel}")
 
@@ -3052,9 +3217,8 @@ class ClusterMapper:
                 new_entries.append((lcn, lcn + count, source_path, file_offset))
                 file_offset += count * self.cluster_size
                 self._alloc_watermark = max(self._alloc_watermark, lcn + count)
-            # Insert maintaining sort order
-            for entry in new_entries:
-                bisect.insort(self._direct_run_map, entry)
+            # Insert maintaining sort order (rebind, not in-place)
+            self._run_map_insert(new_entries)
             return
 
         file_offset = 0
@@ -4156,8 +4320,14 @@ class ClusterMapper:
             else:
                 offset_bytes = ((-offset).bit_length() + 8) // 8
 
-            count_bytes = max(1, min(count_bytes, 4))
-            offset_bytes = max(1, min(offset_bytes, 4))
+            # Cap at 8 (the data-run header nibble allows 0-15 bytes). The
+            # previous cap of 4 silently truncated the LCN delta for volumes
+            # with >2^31 clusters (>~8.8TB @ 4KB) — and virtual INDX clusters
+            # live at the TOP of the volume, so their delta IS the absolute
+            # top LCN — making the run point at a mid-volume cluster
+            # (cross-link / unreadable directory).
+            count_bytes = max(1, min(count_bytes, 8))
+            offset_bytes = max(1, min(offset_bytes, 8))
 
             header = (offset_bytes << 4) | count_bytes
             runs.append(header)
