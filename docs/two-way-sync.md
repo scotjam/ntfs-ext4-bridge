@@ -167,13 +167,20 @@ Verified end-to-end on a real Windows 11 guest (nested KVM under WSL2,
   not zeros); no echo duplicates appear on ext4.
 - **NTFS→ext4 write-through — working.** Files written in the guest to an
   exposed (non-protected) share land on ext4 with matching hashes.
-- **Consistency gate — mechanics working, one known bug.** The agent
-  offline→apply→online→epoch handshake all fire correctly, but the gate's
-  refresh-phase `rescan_mft()` drops tracked files when run concurrently
-  with an active live-sync path, leaving gate-created files unmapped and the
-  volume degraded. See the "Consistency gate corrupts cluster mapping"
-  issue. **Do not rely on the gate against a live VM until fixed;** the live
-  path alone is sound.
+- **Consistency gate — working.** Verified against the live VM: a bulk
+  60-file ext4 change grows the `$MFT`, the agent takes the disk offline,
+  the bridge applies the delta offline via ntfs-3g, re-derives the grown
+  MFT geometry (`Reloaded from image: 151 MFT records, 68 files tracked`),
+  re-allocates all sparse files, and the agent brings the disk back online.
+  Post-gate: 60/60 files visible in the guest, all sampled content hashes
+  match, pre-existing files still read correctly. (The earlier
+  "10→3 files" bug — `rescan_mft()` reusing stale MFT geometry — is fixed by
+  `reload_from_image()` + a full-image msync before the offline mount.)
+
+Two minor, non-corrupting issues remain (tracked separately): a renamed
+file can show size 0 in the guest until the next gate (rename data-run
+remap nuance), and ntfs-3g leaves the NTFS dirty bit set so Windows reports
+the volume "Scan Needed / Warning" (reads/writes are unaffected).
 
 ## Testing
 
