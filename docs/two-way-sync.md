@@ -1,5 +1,32 @@
 # Two-Way Live Sync: Design, Operations, and Runbook
 
+## Corruption-safety status (2026-07-12)
+
+A four-dimension corruption review (durability, concurrency, NTFS structure,
+two-way sync) plus crash-consistency research drove a hardening pass. Fixed
+and verified:
+
+- **Reads never silently return zeros** — a failed mapped-source read is EIO,
+  not zero-fill.
+- **Renames** (file and directory, incl. nested children) remap the bridge's
+  cluster mappings proactively; overwrite-renames drop the orphaned target
+  record (no wrong-file delete).
+- **Concurrency** — lock-free run-map reads snapshot an immutable list and
+  check both bounds; the direct allocators take the lock; the gate blocks I/O
+  before draining.
+- **Durability** — a persistent MFT op journal replays acked-but-unmaterialized
+  ops on restart; NBD FLUSH is a real barrier (drain queue → fsync ext4
+  sources → msync image incl. dirty beyond-64MB chunks); `stop()` drains +
+  full-flushes.
+- **NTFS structure** — data-run LCN encoding handles >2^31-cluster (>8.8TB)
+  volumes; `$ATTRIBUTE_LIST` is followed so fragmented file tails map fully;
+  the volume dirty bit is cleared so Windows mounts clean and never
+  auto-chkdsks the bridge volume.
+
+Remaining known item: a narrow, transient stale-read window right after a
+new file's `setvaliddata` and before the bridge maps its clusters
+(mitigated, tracked separately). See the bug tracker for full details.
+
 ## The problem
 
 The bridge presents ext4 data to Windows as a real local NTFS block device.
