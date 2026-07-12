@@ -22,6 +22,8 @@ import time
 import traceback
 from typing import Dict, Iterable, List, Tuple, Optional, Set, TYPE_CHECKING
 
+from . import mft_op_journal
+
 if TYPE_CHECKING:
     from .lazy_allocator import LazyAllocator
     from .virtual_files import VirtualFileManager
@@ -332,8 +334,16 @@ class ClusterMapper:
         # all during a gate (the guest disk is offline); this is a hard guard.
         self.gate_active = threading.Event()
 
-        # Background MFT sync queue: write() puts (offset, data) here so that
-        # the NBD reply goes out immediately; ext4 operations run asynchronously.
+        # Persistent MFT->ext4 op journal. Capture any un-materialized ops
+        # left by a previous (crashed) run BEFORE opening it fresh, so a
+        # crash between ack and materialization is recovered by replay (see
+        # _replay_op_journal at the end of __init__).
+        self._op_journal_path = self.image_path + '.mftops'
+        self._op_journal_recovery = mft_op_journal.recover(self._op_journal_path)
+        self._op_journal = mft_op_journal.MftOpJournal(self._op_journal_path)
+
+        # Background MFT sync queue: write() puts (seq, offset, data) here so
+        # the NBD reply goes out immediately; ext4 operations run async.
         self._mft_queue: queue.Queue = queue.Queue()
         _t = threading.Thread(target=self._mft_worker, daemon=True,
                               name="MFTSyncWorker")
@@ -488,8 +498,32 @@ class ClusterMapper:
             log(f"Protected (read-only at bridge): {sorted(self._protected_top_dirs)} "
                 f"-> {protected_files} files, {protected_dirs} dirs")
 
+        # Replay any MFT ops a previous crashed run acknowledged but never
+        # materialized to ext4 (ack-before-durable recovery). Runs
+        # synchronously here, before the bridge starts serving.
+        self._replay_op_journal()
+
+    def _replay_op_journal(self):
+        """Materialize un-done ops recovered from a crashed run's journal."""
+        pending = getattr(self, '_op_journal_recovery', None)
+        if not pending:
+            return
+        log(f"Replaying {len(pending)} un-materialized MFT op(s) from "
+            f"a previous run...")
+        replayed = 0
+        for seq, offset, data in pending:
+            try:
+                self._mft_sync_ext4_passes(offset, data)
+                replayed += 1
+            except Exception as e:
+                log(f"  replay op seq={seq} error: {e}")
+        log(f"Op-journal replay complete: {replayed}/{len(pending)} applied")
+        self._op_journal_recovery = []
+
     def close(self):
         """Close the memory-mapped image file."""
+        if hasattr(self, '_op_journal') and self._op_journal:
+            self._op_journal.close()
         if hasattr(self, 'image') and self.image:
             self.image.flush()
             self.image.close()
@@ -838,11 +872,15 @@ class ClusterMapper:
             # are expected; refuse any stragglers rather than corrupt.
             raise OSError(errno.EROFS, "consistency gate active")
         if self.is_mft_region(offset, len(data)):
+            data = bytes(data)
+            # Journal the op durably-recoverable BEFORE acking, so a crash
+            # between ack and materialization is replayed on restart.
+            seq = self._op_journal.append_op(offset, data)
             with self.lock:
                 # Phase 1 (fast): write MFT data to image so NTFS sees it
                 self._mft_write_to_image(offset, data)
             # Phase 2 (slow): sync changes to ext4 in background thread
-            self._mft_queue.put((offset, bytes(data)))
+            self._mft_queue.put((seq, offset, data))
         else:
             self._write_inner(offset, data)
 
@@ -991,13 +1029,18 @@ class ClusterMapper:
         it before slow filesystem operations so concurrent reads are not blocked.
         """
         while True:
-            offset, data = self._mft_queue.get()
+            seq, offset, data = self._mft_queue.get()
             try:
                 self._mft_sync_ext4_passes(offset, data)
             except Exception as e:
                 log(f"MFT sync worker error: {e}")
                 traceback.print_exc()
             finally:
+                # Mark the op materialized even on error: retrying it on the
+                # next restart cannot help (the failure is deterministic given
+                # the same image state) and the consistency gate reconciles
+                # any residual drift. Leaving it pending would replay forever.
+                self._op_journal.append_done(seq)
                 self._mft_queue.task_done()
 
     def _mft_sync_ext4_passes(self, offset: int, data: bytes):
@@ -1151,11 +1194,17 @@ class ClusterMapper:
           3. msync the image (hot region + every dirty beyond-hot chunk —
              MFT/$Bitmap/INDX on a multi-TB volume live beyond 64MB).
         """
-        # 1. drain queued metadata ops
+        # 1. drain queued metadata ops (materializes them to ext4 and marks
+        #    them done in the op journal)
         try:
             self._mft_queue.join()
         except Exception as e:
             log(f"durability_barrier: queue drain error: {e}")
+
+        # 1b. fsync the op journal so its now-empty/all-done state is durable
+        #     before the image is made durable — nothing to replay after a
+        #     post-FLUSH crash.
+        self._op_journal.sync()
 
         # 2. fsync dirty ext4 sources
         with self.lock:
