@@ -89,9 +89,20 @@ class _HotImageCache:
         self._hot = bytearray(self._mm[:self._hot_size])
 
     def flush(self):
-        """Flush hot cache to mmap and sync to disk."""
+        """Flush hot cache to mmap and sync the hot region to disk."""
         self._mm[:self._hot_size] = bytes(self._hot)
         self._mm.flush(0, self._hot_size)
+
+    def flush_all(self):
+        """Flush hot cache to mmap and msync the ENTIRE image to disk.
+
+        flush() only syncs the hot 64MB. Before an offline ntfs-3g mount the
+        whole image must be on disk — including data-cluster and directory
+        index writes beyond the hot region — so the external tool reads a
+        complete, consistent image.
+        """
+        self._mm[:self._hot_size] = bytes(self._hot)
+        self._mm.flush()
 
     def close(self):
         self._mm.close()
@@ -1050,9 +1061,56 @@ class ClusterMapper:
         return len(self.image)
 
     def flush(self):
-        """Flush image changes to disk."""
+        """Flush image changes to disk (hot region only)."""
         if self.image:
             self.image.flush()
+
+    def flush_all(self):
+        """Flush the entire image to disk (before an offline external mount)."""
+        if self.image:
+            self.image.flush_all()
+
+    def reload_from_image(self):
+        """Fully re-derive bridge state from the on-disk image.
+
+        Used after an offline ntfs-3g modification (the consistency gate),
+        where the $MFT may have grown or relocated, the $Bitmap changed, and
+        $MFTMirr moved. A shallow rescan_mft() is NOT enough: it reuses the
+        MFT geometry captured in __init__, so a grown/rewritten MFT is read
+        at stale record offsets and most records are missed (the "10->3
+        files" gate bug). This re-reads everything the way __init__ does.
+
+        Caller must ensure no NBD I/O is in flight (gate_active set, guest
+        disk offline).
+        """
+        with self.lock:
+            # Pull the externally-modified image back into the hot cache.
+            self.image.reload()
+
+            # Re-parse the boot sector and MFT geometry — both may differ
+            # after ntfs-3g rewrote the volume.
+            boot = self.image[0:512]
+            self.bytes_per_sector = struct.unpack('<H', boot[0x0B:0x0D])[0]
+            self.sectors_per_cluster = boot[0x0D]
+            self.cluster_size = self.bytes_per_sector * self.sectors_per_cluster
+            self.mft_cluster = struct.unpack('<Q', boot[0x30:0x38])[0]
+            self.mft_offset = self.mft_cluster * self.cluster_size
+            self._mft_runs, self._mft_total_records = self._get_mft_runs()
+            self._alloc_watermark = max(16, self.mft_cluster + 100)
+            self._recompute_allowed_roots()
+
+            # Re-run the same derivation __init__ does after the image is set.
+            self._scan_mft()
+            self._find_bitmap_location()
+            self._load_bitmap_cache()
+            self._build_free_run_index()
+            self._reserve_system_file_clusters()
+            self._load_mft_mirror_info()
+            self._build_path_mappings()
+
+            log(f"Reloaded from image: {self._mft_total_records} MFT records, "
+                f"{len(self.mft_record_to_source)} files tracked, "
+                f"{len(self.sparse_files)} sparse")
 
     def protect_ia_size(self, record_num: int, ia_off: int, data_size: int,
                         ib_off: int = -1, ib_val_off: int = 0, bitmap: bytes = b''):
