@@ -204,6 +204,46 @@ Items redirected to overflow:
 Items that stay in source:
 - Top-level entries that existed when the bridge started (e.g. `Documents`, `KidsMovies`, `KidsTV`)
 
+## Safe Mode (`--safe-mode`)
+
+Safe mode is the low-risk write option: Windows can **read** the entire ext4
+tree (one-way), but may only **create, write, and delete its own new files**.
+Every file and directory that already existed in ext4 is strictly read-only at
+the bridge — writes to their MFT records and data clusters are dropped — so
+**existing ext4 data can never be modified or corrupted**. The only files at
+risk are the ones Windows itself creates.
+
+Because every pre-existing directory is read-only, Windows can only insert new
+entries into the volume **root** (the one writable existing directory) or into
+subdirectories it created itself. In practice this makes the volume a safe
+drop-zone: copy new files onto the drive root and they land on ext4; you can
+never accidentally overwrite or delete what was already there.
+
+Unlike `--two-way`, safe mode needs **no guest agent and no consistency gate**.
+It is mutually exclusive with `--two-way`.
+
+```bash
+sudo python3 -m ntfs_bridge.bridge \
+    --source /export/bridge-source \
+    --image /var/lib/ntfs-bridge/image.raw \
+    --mount /mnt/ntfs-bridge \
+    --partitioned --lazy --dealloc-timeout 31536000 \
+    --roots ShareA,ShareB \
+    --safe-mode
+```
+
+Notes:
+
+- New files/dirs Windows creates are written through to ext4 by the same MFT
+  worker used in normal operation; reads of existing files pass straight
+  through to ext4 live.
+- Windows-created files are tracked in memory. **After a bridge restart** a
+  previously Windows-created file is treated as pre-existing (read-only) — its
+  data is already safely on ext4; create a fresh file for further writes.
+- Attempts to modify/rename/delete existing ext4 content are silently dropped
+  at the bridge (Windows' cached view may briefly diverge until a remount);
+  the ext4 source is never touched.
+
 ## Two-Way Live Sync (`--two-way`)
 
 Full two-way sync keeps the NTFS view live as ext4 changes (seconds-level),
