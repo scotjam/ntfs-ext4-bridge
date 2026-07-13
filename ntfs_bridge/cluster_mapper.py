@@ -211,9 +211,28 @@ class ClusterMapper:
     def __init__(self, image_path: str, source_dir: str,
                  overflow_dir: Optional[str] = None,
                  protected_roots: Optional[Iterable[str]] = None,
-                 roots: Optional[Iterable[str]] = None):
+                 roots: Optional[Iterable[str]] = None,
+                 safe_mode: bool = False):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
+
+        # Safe mode (--safe-mode). One-way read of the whole ext4 tree, plus
+        # write access ONLY to objects Windows creates itself this session.
+        # Every file and directory that already existed in ext4 is strictly
+        # read-only at the bridge: writes to their MFT records and data
+        # clusters are dropped. Because every pre-existing directory is
+        # read-only, Windows can only insert new entries into the volume root
+        # (the one writable existing directory) or into its own freshly
+        # created subdirectories — so new content can only attach at the root.
+        # Guarantee: existing ext4 data can never be corrupted; the only files
+        # at risk are the ones Windows created in the root. No guest agent or
+        # consistency gate is involved. See _is_source_protected /
+        # _is_record_protected for the enforcement, keyed on the set below.
+        self._safe_mode = bool(safe_mode)
+        # Absolute source paths the bridge itself created for Windows this
+        # session (via _check_new_file / _check_new_directory). In safe mode
+        # these are the ONLY writable source objects.
+        self._windows_created_sources: Set[str] = set()
 
         # Top-level subdirectories of source_dir whose contents are presented
         # read-only at the bridge level. Writes that target an MFT record
@@ -899,7 +918,28 @@ class ClusterMapper:
         its relative path, then checks the top-level component against
         self._protected_top_dirs. Resident files have their data inside the MFT
         record, so blocking the record write also protects the file content.
+
+        In safe mode every pre-existing record is protected (see __init__);
+        only the root directory and objects Windows created this session stay
+        writable.
         """
+        if self._safe_mode:
+            # Root directory (record 5) must accept new entries so Windows can
+            # create files/dirs at the volume root; never protect it.
+            if record_num == 5:
+                return False
+            src = self.mft_record_to_source.get(record_num)
+            if src is not None:
+                # Pre-existing ext4 file -> protected; Windows-created -> writable.
+                return src not in self._windows_created_sources
+            rel = self.mft_record_to_dir.get(record_num)
+            if rel is not None:
+                dpath = self._resolve_source_path(rel)
+                return dpath not in self._windows_created_sources
+            # Untracked / free record: Windows is writing a brand-new file's
+            # MFT record. Allow it (it becomes a Windows-created object once
+            # _check_new_file materializes it).
+            return False
         if not self._protected_top_dirs:
             return False
         rel_path = None
@@ -916,7 +956,13 @@ class ClusterMapper:
         """Return True if source_path lies under a protected top-level dir of source_dir.
 
         Case-insensitive comparison; see _protected_top_dirs note.
+
+        In safe mode this returns True for every source object except the ones
+        Windows created this session, making all pre-existing ext4 file data
+        strictly read-only at the bridge.
         """
+        if self._safe_mode:
+            return source_path not in self._windows_created_sources
         if not self._protected_top_dirs:
             return False
         prefix = self.source_dir + os.sep
@@ -4966,6 +5012,11 @@ class ClusterMapper:
             with self.lock:
                 if do_create:
                     self.ntfs_sync_in_progress.discard(rel_path)
+                    # Safe mode: a directory Windows created this session is
+                    # writable (Windows may nest its own new files under it);
+                    # everything that pre-existed in ext4 stays read-only.
+                    if self._safe_mode:
+                        self._windows_created_sources.add(source_path)
                 self.mft_record_to_dir[record_num] = rel_path
                 self._dir_mft_seq[record_num] = seq
                 self.path_to_mft_record[rel_path] = record_num
@@ -5087,6 +5138,11 @@ class ClusterMapper:
                 self._note_file_seq(record_num, record)
                 self.path_to_mft_record[rel_path] = record_num
                 self._track_file_data(record, record_num, source_path)
+                # Safe mode: this file was just created by Windows, so its
+                # data clusters and MFT record remain writable (everything
+                # pre-existing is read-only).
+                if self._safe_mode:
+                    self._windows_created_sources.add(source_path)
             return source_path
         except OSError as e:
             log(f"  Failed to create file {rel_path}: {e}")

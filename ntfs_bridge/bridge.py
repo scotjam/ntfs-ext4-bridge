@@ -54,6 +54,7 @@ class NTFSBridge:
                  protected_roots=None,
                  roots=None,
                  two_way=False,
+                 safe_mode=False,
                  control_host='192.168.122.1',
                  control_port=10810,
                  agent_token_file=None,
@@ -80,6 +81,15 @@ class NTFSBridge:
 
         # Two-way live sync (guest-agent architecture)
         self.two_way = two_way
+
+        # Safe mode: one-way read of all ext4 + write only to Windows-created
+        # objects (which can only attach at the volume root, since every
+        # pre-existing ext4 file/dir is read-only at the bridge). Mutually
+        # exclusive with two-way; needs no guest agent or consistency gate.
+        self.safe_mode = safe_mode
+        if self.safe_mode and self.two_way:
+            raise ValueError("--safe-mode and --two-way are mutually exclusive")
+
         self.control_host = control_host
         self.control_port = control_port
         self.agent_token_file = agent_token_file
@@ -219,7 +229,8 @@ class NTFSBridge:
         self.mapper = ClusterMapper(self.image_path, self.source_dir,
                                      overflow_dir=self.overflow_dir,
                                      protected_roots=self.protected_roots,
-                                     roots=self.roots)
+                                     roots=self.roots,
+                                     safe_mode=self.safe_mode)
 
         # Sanity check: if the MFT holds many user file records but almost
         # none could be mapped to an ext4 source, the source data is missing
@@ -446,6 +457,10 @@ class NTFSBridge:
         mount_success = False
         if self.two_way:
             log("Two-way mode: skipping local nbd-client/mount and SyncDaemon")
+        elif self.safe_mode:
+            log("Safe mode: skipping local nbd-client/mount (VM connects "
+                "directly; existing ext4 is read-only, new root files sync "
+                "via the MFT worker)")
         elif self.partitioned and self.virtual_mode:
             log("VM mode: skipping local nbd-client/mount (VM connects directly)")
         else:
@@ -493,7 +508,11 @@ class NTFSBridge:
         if self.two_way:
             log(f"  Two-way sync: ENABLED (control endpoint "
                 f"{self.control_host}:{self.control_port})")
-        if not mount_success and not self.virtual_mode and not self.two_way:
+        if self.safe_mode:
+            log("  Safe mode: ENABLED (read-all; writes only to files "
+                "Windows creates at the volume root; existing ext4 read-only)")
+        if (not mount_success and not self.virtual_mode and not self.two_way
+                and not self.safe_mode):
             log("  WARNING: ntfs-3g mount failed, ext4→NTFS sync disabled")
             log(f"  Connect manually: sudo nbd-client -N '' 127.0.0.1 {self.port} /dev/nbdX")
         log("  Press Ctrl+C to stop")
@@ -1653,6 +1672,13 @@ def main():
                         help='Enable full two-way live sync via the guest '
                              'agent (see guest_agent/). Replaces the local '
                              'ntfs-3g mount + SyncDaemon.')
+    parser.add_argument('--safe-mode', action='store_true',
+                        help='Read-only for all existing ext4 content; Windows '
+                             'may only create/write/delete its OWN new files at '
+                             'the volume root. Existing ext4 files and '
+                             'directories can never be modified or corrupted. '
+                             'No guest agent or consistency gate. Mutually '
+                             'exclusive with --two-way.')
     parser.add_argument('--control-host', default='192.168.122.1',
                         help='Bind address for the agent control endpoint '
                              '(default: 192.168.122.1, the libvirt NAT gateway)')
@@ -1693,6 +1719,7 @@ def main():
         protected_roots=protected_roots,
         roots=roots,
         two_way=args.two_way,
+        safe_mode=args.safe_mode,
         control_host=args.control_host,
         control_port=args.control_port,
         agent_token_file=args.agent_token_file,
