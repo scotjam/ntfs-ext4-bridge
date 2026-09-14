@@ -1286,6 +1286,7 @@ class NTFSBridge:
             log("Populating NTFS image from ext4 source...")
             files_created = 0
             files_skipped = 0
+            files_resized = 0
             dirs_created = 0
 
             for root, dirs, files in os.walk(self.source_dir, followlinks=True):
@@ -1314,15 +1315,38 @@ class NTFSBridge:
                     source_file = os.path.join(root, f)
                     ntfs_file = os.path.join(tmp_mount, rel_file)
 
-                    # Skip files that already exist on the NTFS mount
-                    # (avoids re-creating sparse files that were already allocated)
+                    try:
+                        file_size = os.path.getsize(source_file)
+                    except OSError as e:
+                        log(f"  Warning: cannot stat {rel_file}: {e}")
+                        continue
+
+                    # An existing entry is reused as is - unless the source
+                    # has changed size since the entry was made. Reads always
+                    # come from ext4, but the SIZE Windows sees is the one in
+                    # the MFT, so a file that grew at the source was served
+                    # cut short and one that shrank was padded with garbage.
+                    # Sixteen files drifted this way while live sync was down.
                     if os.path.exists(ntfs_file):
-                        files_skipped += 1
+                        try:
+                            ntfs_size = os.path.getsize(ntfs_file)
+                        except OSError:
+                            ntfs_size = -1
+                        if ntfs_size == file_size:
+                            files_skipped += 1
+                            continue
+                        try:
+                            if self.lazy_alloc and file_size > 700:
+                                os.truncate(ntfs_file, file_size)
+                            else:
+                                shutil.copy2(source_file, ntfs_file)
+                            files_resized += 1
+                        except OSError as e:
+                            log(f"  Warning: could not resize {rel_file} "
+                                f"({ntfs_size} -> {file_size}): {e}")
                         continue
 
                     try:
-                        file_size = os.path.getsize(source_file)
-
                         if self.lazy_alloc and file_size > 700:
                             # Large file with lazy alloc - create truly sparse NTFS entry.
                             # os.truncate (rather than seek+write) sets the file size in
@@ -1340,6 +1364,7 @@ class NTFSBridge:
                         log(f"  Warning: could not create file {rel_file}: {e}")
 
             log(f"Populated: {dirs_created} dirs, {files_created} files"
+                f"{f', {files_resized} resized' if files_resized else ''}"
                 f"{f', {files_skipped} skipped (existing)' if files_skipped else ''}")
 
             # Also populate overflow_dir items at NTFS root
