@@ -128,8 +128,36 @@ class NTFSBridge:
                     file_count += 1
                 except OSError:
                     pass
-        # Add 25% overhead for NTFS metadata (MFT zone reserves 12.5% by default) + round up to nearest 64MB
-        needed_mb = int((total_bytes * 1.25) / (1024 * 1024)) + 64
+        # Size the volume as content + the free space of the drive Windows
+        # can actually write to.
+        #
+        # The old 25%-of-content headroom was untethered from reality: with
+        # 1.8 TB of media it advertised ~509 GB free while the only writable
+        # area - the overflow dir - had 32 GB. Windows sizes its own writes
+        # (System Volume Information, search indexes, a backup client's
+        # working files) against what the volume claims, so overstating it
+        # invites ENOSPC from a drive reporting itself three-quarters empty.
+        # Understating it merely leaves capacity unused.
+        #
+        # Everything under the source roots is read-only, so no write can
+        # land anywhere but the overflow filesystem: its free space IS the
+        # volume's free space, by construction rather than by estimate.
+        writable_dir = self.overflow_dir or self.source_dir
+        try:
+            st = os.statvfs(writable_dir)
+            writable_free = st.f_bavail * st.f_frsize
+        except OSError as e:
+            # Never guess here. Falling back to a headroom figure would
+            # reintroduce the overstatement this replaces, so claim no free
+            # space at all and let the log say why.
+            log(f"WARNING: cannot stat {writable_dir} ({e}); "
+                f"reporting no free space")
+            writable_free = 0
+        # +64MB covers NTFS metadata not attributable to file data.
+        needed_mb = int((total_bytes + writable_free) / (1024 * 1024)) + 64
+        log(f"Volume sizing: {total_bytes/(1024**3):.1f}GB content + "
+            f"{writable_free/(1024**3):.1f}GB writable ({writable_dir}) "
+            f"-> {needed_mb}MB")
         if needed_mb > self.image_size_mb:
             log(f"Auto-sizing image: {total_bytes/(1024**3):.1f}GB in {file_count} files -> {needed_mb}MB virtual image")
             self.image_size_mb = needed_mb
