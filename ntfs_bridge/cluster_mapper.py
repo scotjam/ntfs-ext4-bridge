@@ -300,6 +300,18 @@ class ClusterMapper:
         # Loaded once in _load_bitmap_cache() after MFT scan.
         self._bitmap_cache: Optional[bytearray] = None
 
+        # Clusters that belong to NTFS structure rather than to a file's own
+        # data: system files, every directory's index blocks, attribute
+        # lists, security descriptors, extension records. Filled by
+        # _collect_metadata_clusters(). Reads and writes here always go to
+        # the image, and the allocator never hands them out. The set is for
+        # per-cluster lookups on the read path; the intervals for overlap
+        # tests against whole data runs.
+        self._metadata_clusters: Set[int] = set()
+        self._metadata_runs: List[Tuple[int, int]] = []
+        self._metadata_intervals: List[Tuple[int, int]] = []
+        self._meta_starts: List[int] = []
+
         # Sorted list of (start_cluster, count) free run intervals.
         # Built once from the bitmap in _build_free_run_index(); maintained
         # incrementally by _free_index_remove() / _free_index_add().
@@ -377,6 +389,15 @@ class ClusterMapper:
         # space without marking those clusters used in $Bitmap; this prevents
         # allocate_file_direct() from clobbering them.
         self._reserve_system_file_clusters()
+
+        # A cluster is either a file's own data or NTFS structure, never
+        # both. Collect the structure, keep it out of the allocator, and
+        # move any file that already sits on it. Until this existed, a file
+        # allocated over a directory's index block made the directory read
+        # as garbage through the bridge while looking intact on disk.
+        self._collect_metadata_clusters()
+        self._reserve_metadata_clusters()
+        self._repair_cross_links()
 
         # Find $MFTMirr data cluster so _mft_write_to_image() can keep it in sync.
         self._load_mft_mirror_info()
@@ -471,6 +492,10 @@ class ClusterMapper:
             cluster = byte_offset // self.cluster_size
             cluster_offset = byte_offset % self.cluster_size
 
+            # NTFS structure is always read from the image, even if a
+            # file's stale data runs still claim the cluster.
+            meta = cluster in self._metadata_clusters
+
             # Check for virtual cluster first (from VirtualFileManager)
             virtual_data = None
             if self.virtual_file_manager:
@@ -509,7 +534,7 @@ class ClusterMapper:
                 result[pos:pos + len(data)] = data
                 pos += chunk_len
 
-            elif cluster in self.cluster_map:
+            elif not meta and cluster in self.cluster_map:
                 mapping = self.cluster_map[cluster]
                 chunk_len = min(remaining, self.cluster_size - cluster_offset)
 
@@ -546,7 +571,7 @@ class ClusterMapper:
 
                 pos += chunk_len
 
-            elif (run_mapping := self._run_map_lookup(cluster)) is not None:
+            elif not meta and (run_mapping := self._run_map_lookup(cluster)) is not None:
                 # Read from ext4 source file via run-based map (large files)
                 source_path, file_offset = run_mapping
                 chunk_len = min(remaining, self.cluster_size - cluster_offset)
@@ -950,7 +975,10 @@ class ClusterMapper:
             chunk_len = min(remaining, cluster_size - cluster_offset)
             chunk_data = data[pos:pos + chunk_len]
 
-            if cluster in self.cluster_map:
+            # NTFS structure is written to the image, never into a file.
+            meta = cluster in self._metadata_clusters
+
+            if not meta and cluster in self.cluster_map:
                 mapping = self.cluster_map[cluster]
                 if isinstance(mapping, tuple) and mapping[0] == 'bytes':
                     # Write to INDX block
@@ -976,7 +1004,7 @@ class ClusterMapper:
                     except OSError as e:
                         log(f"Write error for {source_path}: {e}")
                         # Don't fall back to image - that would be silently lost on next read
-            elif (run_mapping := self._run_map_lookup(cluster)) is not None:
+            elif not meta and (run_mapping := self._run_map_lookup(cluster)) is not None:
                 # Write to ext4 source file (run-based mapping — all files with
                 # RUN_MAP_THRESHOLD=0 end up here, ensuring writes reach ext4)
                 source_path, file_offset = run_mapping
@@ -1000,6 +1028,7 @@ class ClusterMapper:
                 # Write to image (metadata region)
                 if byte_offset + chunk_len <= len(self.image):
                     self.image[byte_offset:byte_offset + chunk_len] = chunk_data
+                    self._mirror_bitmap_write(byte_offset, chunk_data)
 
             pos += chunk_len
 
@@ -1211,6 +1240,275 @@ class ClusterMapper:
                 off += attr_len
 
         log(f"  System file reservation: removed {total_reserved:,} clusters from free-run index")
+
+    # =========================================================================
+    # Metadata clusters: NTFS structure is never file data
+    # =========================================================================
+
+    def _iter_nonresident_runs(self, record: bytearray):
+        """Yield (attr_type, name, [(lcn, count), ...]) for every non-resident
+        attribute in an MFT record. Sparse runs come back with lcn == -1."""
+        off = struct.unpack('<H', record[20:22])[0]
+        while off < MFT_RECORD_SIZE - 8:
+            attr_type = struct.unpack('<I', record[off:off + 4])[0]
+            if attr_type == 0xFFFFFFFF:
+                return
+            attr_len = struct.unpack('<I', record[off + 4:off + 8])[0]
+            if attr_len == 0 or attr_len > MFT_RECORD_SIZE - off:
+                return
+            if record[off + 8]:
+                name_len = record[off + 9]
+                name = ''
+                if name_len:
+                    name_off = struct.unpack('<H', record[off + 10:off + 12])[0]
+                    name = record[off + name_off:off + name_off + name_len * 2].decode(
+                        'utf-16-le', errors='ignore')
+                try:
+                    runs_off = struct.unpack('<H', record[off + 32:off + 34])[0]
+                    real_size = struct.unpack('<Q', record[off + 48:off + 56])[0]
+                    runs = self._parse_data_runs(
+                        bytes(record[off + runs_off:off + attr_len]), real_size)
+                except Exception:
+                    runs = []
+                yield attr_type, name, runs
+            off += attr_len
+
+    def _collect_metadata_clusters(self):
+        """Find every cluster that belongs to NTFS structure rather than to a
+        file's own data.
+
+        That is all non-resident attributes of: the system files (records
+        0-15), every directory, every extension record (base reference != 0);
+        and for ordinary files everything except the unnamed $DATA that the
+        cluster map serves from ext4 - attribute lists, security descriptors,
+        named streams.
+
+        This is the set the earlier guards each covered a corner of:
+        _reserve_system_file_clusters() only records 0-15, fix_indx_clusters()
+        only directories' $INDEX_ALLOCATION. Attribute lists and security
+        descriptors were covered by neither, and a file allocated over a
+        directory's spilled $ATTRIBUTE_LIST left that directory with no
+        $INDEX_ROOT it could reach - "Index root attribute missing".
+        """
+        meta: Set[int] = set()
+        runs_out: List[Tuple[int, int]] = []
+        records = 0
+        for record_num in range(self._mft_total_records):
+            off = self._rec_offset(record_num)
+            if off is None or off + MFT_RECORD_SIZE > len(self.image):
+                continue
+            raw = self.image[off:off + MFT_RECORD_SIZE]
+            if raw[:4] != b'FILE':
+                continue
+            record = self._undo_fixups(bytearray(raw))
+            flags = struct.unpack('<H', record[22:24])[0]
+            if not flags & 0x01:
+                continue
+            base = struct.unpack('<Q', record[32:40])[0] & 0xFFFFFFFFFFFF
+            whole = record_num < 16 or bool(flags & 0x02) or base != 0
+            for attr_type, name, runs in self._iter_nonresident_runs(record):
+                if not whole and attr_type == 0x80 and not name:
+                    continue        # the file's own data: the one mapped thing
+                for lcn, count in runs:
+                    if lcn >= 0 and count > 0:
+                        runs_out.append((lcn, count))
+                        meta.update(range(lcn, lcn + count))
+            records += 1
+
+        ivs = sorted((lcn, lcn + count) for lcn, count in runs_out)
+        merged: List[Tuple[int, int]] = []
+        for start, end in ivs:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+
+        self._metadata_clusters = meta
+        self._metadata_runs = runs_out
+        self._metadata_intervals = merged
+        self._meta_starts = [start for start, _ in merged]
+        log(f"  Metadata clusters: {len(meta):,} across {records} records "
+            f"({len(merged)} runs) - served from the image, never allocated")
+
+    def _overlaps_metadata(self, lcn: int, count: int) -> bool:
+        """Does [lcn, lcn+count) touch any metadata cluster?"""
+        if count <= 0 or not self._meta_starts:
+            return False
+        i = bisect.bisect_right(self._meta_starts, lcn + count - 1) - 1
+        return i >= 0 and self._metadata_intervals[i][1] > lcn
+
+    def _subtract_metadata(self, start: int, end: int):
+        """Yield the sub-ranges of [start, end) that are NOT metadata."""
+        pos = start
+        i = bisect.bisect_right(self._meta_starts, start) - 1
+        if i < 0:
+            i = 0
+        while pos < end and i < len(self._metadata_intervals):
+            ms, me = self._metadata_intervals[i]
+            if me <= pos:
+                i += 1
+                continue
+            if ms >= end:
+                break
+            if ms > pos:
+                yield pos, ms
+            pos = max(pos, me)
+            i += 1
+        if pos < end:
+            yield pos, end
+
+    def _reserve_metadata_clusters(self):
+        """Keep metadata clusters out of both allocators.
+
+        Removed from the free-run index so allocate_file_direct() cannot pick
+        them, and set in $Bitmap so ntfs-3g cannot either. A metadata cluster
+        showing FREE in $Bitmap is how the same cluster ended up owned by a
+        directory's index block and by a file at once.
+        """
+        if not self._metadata_runs:
+            return
+        for lcn, count in self._metadata_runs:
+            self._free_index_remove(lcn, count)
+        if not self.bitmap_clusters:
+            return
+        bitmap = self._read_bitmap()
+        fixed = 0
+        for lcn, count in self._metadata_runs:
+            for c in range(lcn, min(lcn + count, self.total_clusters)):
+                byte_idx, bit = c // 8, c % 8
+                if byte_idx < len(bitmap) and not (bitmap[byte_idx] & (1 << bit)):
+                    bitmap[byte_idx] |= (1 << bit)
+                    fixed += 1
+        if fixed:
+            self._write_bitmap(bitmap)
+        log(f"  Metadata reservation: {fixed} cluster(s) were FREE in $Bitmap, now set")
+
+    def _repair_cross_links(self):
+        """Move any file whose data runs overlap metadata onto free clusters.
+
+        The bridge never writes file bytes into the image - a mapped file's
+        content lives on ext4 - so giving it new clusters loses nothing. What
+        it fixes is the read path: a directory whose index block a file also
+        claimed read as that file's bytes through the bridge, "Damaged INDX
+        record", while a plain mount of the image showed it intact.
+        """
+        if not self._meta_starts:
+            return
+        moved = failed = 0
+        for record_num, source_path in list(self.mft_record_to_source.items()):
+            rel_path = self._get_rel_path(source_path)
+            if rel_path in self.sparse_files:
+                # Only a placeholder cluster on disk; pre-allocation replaces
+                # its runs wholesale. Just stop reads of the metadata cluster
+                # from triggering that allocation.
+                for c in [c for c, p in self.sparse_file_clusters.items()
+                          if p == rel_path and c in self._metadata_clusters]:
+                    del self.sparse_file_clusters[c]
+                continue
+            off = self._rec_offset(record_num)
+            if off is None:
+                continue
+            record = self._undo_fixups(bytearray(self.image[off:off + MFT_RECORD_SIZE]))
+            runs = self._extract_data_runs(record)
+            if not runs:
+                continue
+            if not any(lcn >= 0 and self._overlaps_metadata(lcn, count)
+                       for lcn, count in runs):
+                continue
+            if self._relocate_file_runs(record_num, source_path, runs):
+                moved += 1
+            else:
+                failed += 1
+        if moved or failed:
+            log(f"  Cross-link repair: moved {moved} file(s) off metadata clusters"
+                + (f"; {failed} could not be moved (no free space) - the "
+                   f"metadata still reads correctly, those files' overlapping "
+                   f"clusters do not" if failed else ""))
+
+    def _relocate_file_runs(self, record_num: int, source_path: str,
+                            old_runs: List[Tuple[int, int]]) -> bool:
+        """Give a mapped file fresh clusters and re-point its MFT record and
+        the read map at them. Old clusters that were genuinely the file's are
+        freed; the ones that are metadata stay used."""
+        real = [(lcn, count) for lcn, count in old_runs if lcn >= 0 and count > 0]
+        needed = sum(count for _, count in real)
+        if needed == 0:
+            return True
+        try:
+            file_size = os.path.getsize(source_path)
+        except OSError:
+            file_size = needed * self.cluster_size
+        rel_path = self._get_rel_path(source_path)
+
+        max_runs = self._max_data_runs_in_record(record_num)
+        new_runs = self._find_free_cluster_runs(needed, max_runs)
+        if not new_runs:
+            log(f"  Cross-link: no room to move {rel_path} ({needed} clusters)")
+            return False
+        self._mark_cluster_runs_used(new_runs)
+        if not self._update_mft_data_runs(
+                record_num, [(count, start) for start, count in new_runs], file_size):
+            self._mark_cluster_runs_free(new_runs)
+            log(f"  Cross-link: could not rewrite MFT record {record_num} for {rel_path}")
+            return False
+
+        # Release what was really the file's; metadata clusters stay used.
+        to_free = []
+        for lcn, count in real:
+            for s, e in self._subtract_metadata(lcn, lcn + count):
+                to_free.append((s, e - s))
+        if to_free:
+            self._mark_cluster_runs_free(to_free)
+
+        # Re-point the read map.
+        for c in self.source_to_clusters.get(source_path, ()):
+            self.cluster_map.pop(c, None)
+        self.source_to_clusters[source_path] = set()
+        self._direct_run_map = [r for r in self._direct_run_map if r[2] != source_path]
+        self._map_clusters([(start, count) for start, count in new_runs], source_path)
+        log(f"  Cross-link: moved {rel_path} off metadata clusters "
+            f"({needed} clusters, {len(new_runs)} runs)")
+        return True
+
+    def _mirror_bitmap_write(self, byte_offset: int, chunk_data: bytes):
+        """Keep the RAM bitmap cache and free-run index in step with a client
+        write that landed inside $Bitmap.
+
+        The cache was loaded once at startup and _write_bitmap() writes it
+        back whole. Every allocation ntfs-3g made through the NBD path - index
+        blocks for new directories, attribute lists, small files - lived only
+        in the image, so the next bridge allocation flushed the stale cache
+        over it and freed those clusters for reuse. That is the origin of
+        every cross-linked cluster this file now defends against.
+        """
+        if self._bitmap_cache is None or not self.bitmap_clusters:
+            return
+        cs = self.cluster_size
+        cache_pos = 0
+        for start_cluster, count in self.bitmap_clusters:
+            run_start = start_cluster * cs
+            run_len = count * cs
+            lo = max(byte_offset, run_start)
+            hi = min(byte_offset + len(chunk_data), run_start + run_len)
+            if lo < hi:
+                new = bytes(chunk_data[lo - byte_offset:hi - byte_offset])
+                cpos = cache_pos + (lo - run_start)
+                old = bytes(self._bitmap_cache[cpos:cpos + len(new)])
+                if old != new:
+                    self._bitmap_cache[cpos:cpos + len(new)] = new
+                    for i in range(len(new)):
+                        if old[i] == new[i]:
+                            continue
+                        diff = old[i] ^ new[i]
+                        for bit in range(8):
+                            if not diff & (1 << bit):
+                                continue
+                            c = (cpos + i) * 8 + bit
+                            if new[i] & (1 << bit):
+                                self._free_index_remove(c, 1)
+                            elif c not in self._metadata_clusters:
+                                self._free_index_add(c, 1)
+            cache_pos += run_len
 
     def _load_mft_mirror_info(self):
         """Find $MFTMirr's data cluster and record count.
@@ -2283,6 +2581,13 @@ class ClusterMapper:
 
             record = self._undo_fixups(bytearray(record))
             flags = struct.unpack('<H', record[22:24])[0]
+
+            # Extension records (base reference != 0) hold attributes that
+            # spilled out of another record - a directory's $INDEX_ROOT once
+            # its base record is full. They carry no $FILE_NAME and are not
+            # files; their runs must never be mapped as file data.
+            if struct.unpack('<Q', record[32:40])[0] & 0xFFFFFFFFFFFF:
+                continue
 
             if flags & 0x01 and not (flags & 0x02):  # In-use file
                 self._process_file_record(record, record_num)
