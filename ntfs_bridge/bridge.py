@@ -39,6 +39,88 @@ def log(msg):
     print(f"[Bridge] {msg}", flush=True)
 
 
+# Refuse to prune a root when more than this share of its entries would go.
+# A source that lost most of its files between two restarts is far more
+# likely an unmounted disk or a dangling symlink than a deliberate purge, and
+# what the volume shows as deleted, backup tools on the Windows side treat as
+# deleted. Nine stale files in a share of thousands sails under this; a share
+# that reads as empty does not.
+PRUNE_MAX_FRACTION = 0.25
+# ...and only when that share is more than a handful. Three stale files in
+# a root of six is a small share tidied, not a disk lost; both conditions
+# must hold before a root is refused.
+PRUNE_REFUSE_FLOOR = 20
+
+
+def prune_stale_entries(ntfs_mount: str, source_dir: str, roots, log) -> int:
+    """Remove files/dirs under `roots` in the NTFS mount that no longer exist
+    under the same root in `source_dir`. Returns how many entries were removed.
+
+    Only the named roots are walked - never the volume root, which is
+    Windows' own space (System Volume Information, .bzvol, recycle bin).
+
+    A root is skipped, with a log line, when its source is not a readable
+    directory, or when pruning would remove more than PRUNE_MAX_FRACTION of
+    what the volume holds under it and more than PRUNE_REFUSE_FLOOR entries.
+    """
+    removed_total = 0
+    for name in roots:
+        src_root = os.path.join(source_dir, name)
+        ntfs_root = os.path.join(ntfs_mount, name)
+        if not os.path.isdir(ntfs_root):
+            continue
+        if not os.path.isdir(src_root):
+            log(f"  Prune: skipping {name}: source is not a readable directory "
+                f"({src_root}) - treating as unavailable, not empty")
+            continue
+
+        stale_files, stale_dirs, total = [], [], 0
+        for root, dirs, files in os.walk(ntfs_root):
+            rel_root = os.path.relpath(root, ntfs_root)
+            keep_dirs = []
+            for d in dirs:
+                total += 1
+                rel = d if rel_root == '.' else os.path.join(rel_root, d)
+                if os.path.isdir(os.path.join(src_root, rel)):
+                    keep_dirs.append(d)
+                else:
+                    stale_dirs.append(os.path.join(root, d))
+            dirs[:] = keep_dirs        # do not descend into what goes anyway
+            for f in files:
+                total += 1
+                rel = f if rel_root == '.' else os.path.join(rel_root, f)
+                if not os.path.exists(os.path.join(src_root, rel)):
+                    stale_files.append(os.path.join(root, f))
+
+        stale = len(stale_files) + len(stale_dirs)
+        if not stale:
+            continue
+        if stale > PRUNE_REFUSE_FLOOR and total and stale > total * PRUNE_MAX_FRACTION:
+            log(f"  Prune: REFUSING to remove {stale} of {total} entries under "
+                f"{name} ({stale * 100 // total}% > "
+                f"{int(PRUNE_MAX_FRACTION * 100)}%) - a source loss this large "
+                f"is treated as a mount problem, not a purge")
+            continue
+
+        removed = 0
+        for path in stale_files:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError as e:
+                log(f"  Prune: could not remove {path}: {e}")
+        for path in stale_dirs:
+            try:
+                shutil.rmtree(path)
+                removed += 1
+            except OSError as e:
+                log(f"  Prune: could not remove {path}: {e}")
+        log(f"  Prune: removed {removed} stale entr{'y' if removed == 1 else 'ies'} "
+            f"under {name} (source no longer has them)")
+        removed_total += removed
+    return removed_total
+
+
 class NTFSBridge:
     """Main bridge tying together ClusterMapper, NBD server, and SyncDaemon."""
 
@@ -282,6 +364,19 @@ class NTFSBridge:
                 log(f"ntfsfix (post-alloc): {fix_result.stdout.strip()}")
                 if fix_result.returncode != 0:
                     log(f"ntfsfix warning: {fix_result.stderr.strip()}")
+                # ntfsfix just rewrote the image behind the hot cache. It
+                # syncs $MFTMirr, empties $LogFile and toggles the $Volume
+                # dirty flag - all inside the first 64MB the cache snapshotted
+                # at ClusterMapper init. Left stale, the NBD server served the
+                # pre-ntfsfix $MFT record 3 while $MFTMirr (over 1TB into the
+                # image, well past the cache) came fresh from the mmap, so
+                # ntfs-3g refused the mount with "$MFTMirr does not match $MFT
+                # (record 3)" and live sync stayed off. Worse, stop() flushed
+                # the stale cache back over the repair, leaving the image
+                # corrupt on disk for the next start to fix and re-break.
+                # Everything written through the cache was flushed above, so
+                # reloading loses nothing.
+                self.mapper.image.reload()
 
             # Register existing allocated files
             for record_num, source_path in self.mapper.mft_record_to_source.items():
@@ -1183,6 +1278,11 @@ class NTFSBridge:
                 log("Image may need manual population")
                 return
 
+            # Remove entries whose source is gone before adding anything, so
+            # a folder renamed at the source does not keep its old name in
+            # the volume as a stale twin.
+            self._prune_stale_entries(tmp_mount)
+
             log("Populating NTFS image from ext4 source...")
             files_created = 0
             files_skipped = 0
@@ -1308,6 +1408,21 @@ class NTFSBridge:
                 os.rmdir(tmp_mount)
             except OSError:
                 pass
+
+    def _prune_stale_entries(self, ntfs_mount: str) -> None:
+        """Drop NTFS entries under the exposed roots whose ext4 source is gone.
+
+        Populate only ever added. A file deleted or moved at the source kept
+        its NTFS entry indefinitely, pointing at nothing: when a share was
+        repointed at a reorganised copy, nine loose archives from the old
+        tree stayed in the volume as entries whose every read could only
+        fail. See prune_stale_entries() for the guards - this is the one
+        step in populate that deletes, and it must not mistake an absent
+        disk for an empty one.
+        """
+        exposed = [name for name in (self.protected_roots or [])
+                   if os.path.lexists(os.path.join(self.source_dir, name))]
+        prune_stale_entries(ntfs_mount, self.source_dir, exposed, log)
 
     def _post_startup_populate(self):
         """Catch-up populate via production ntfs-3g mount.
