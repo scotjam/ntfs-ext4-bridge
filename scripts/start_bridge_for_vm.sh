@@ -55,8 +55,15 @@ for cmd in python3 nbd-client ntfs-3g; do
     fi
 done
 
-# Create directories
+# Create directories. A previous bridge that died under its ntfs-3g mount
+# leaves the mount point as a dead FUSE endpoint: stat fails with
+# "Transport endpoint is not connected", and so did mkdir -p here, which
+# under set -e ended the start before the bridge ran. Detach it lazily.
 mkdir -p "$(dirname "$IMAGE_PATH")"
+if [ -e "$MOUNT_PATH" ] && ! stat "$MOUNT_PATH" >/dev/null 2>&1; then
+    echo "Mount point is a dead endpoint, detaching: $MOUNT_PATH"
+    fusermount -uz "$MOUNT_PATH" 2>/dev/null || umount -l "$MOUNT_PATH" 2>/dev/null || true
+fi
 mkdir -p "$MOUNT_PATH"
 
 # Load nbd kernel module
@@ -83,7 +90,12 @@ if [ -n "${OVERFLOW_DIR:-}" ]; then
     OVERFLOW_FLAG=(--overflow-dir "$OVERFLOW_DIR")
 fi
 
-python3 -m ntfs_bridge.bridge \
+# exec: the bridge becomes the service main process, so SIGTERM from
+# systemctl stop reaches its signal handler and it can unmount, detach
+# the NBD device and stop the server in order. Left as a child of this
+# script, the signal killed the shell and the bridge was later SIGKILLed
+# mid-serve, stranding ntfs-3g on a dead device.
+exec python3 -m ntfs_bridge.bridge \
     --source "$SOURCE_DIR" \
     --image "$IMAGE_PATH" \
     --mount "$MOUNT_PATH" \
@@ -93,4 +105,3 @@ python3 -m ntfs_bridge.bridge \
     --dealloc-timeout 31536000 \
     "${PROTECTED_FLAG[@]}" "${OVERFLOW_FLAG[@]}" >> "$LOG" 2>&1
 
-echo "Bridge exited at $(date) code=$?" >> "$LOG"

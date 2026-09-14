@@ -28,7 +28,7 @@ ExecStartPost=/bin/bash -c 'for i in $(seq 1 60); do ss -tln | grep -q ":10809 "
 # global sync() that blocked forever on the dead device. Whatever state the
 # process is in when it dies, release the mount and the device before the
 # next start. KillMode=mixed lets the bridge run its own stop() first.
-ExecStopPost=/bin/sh -c 'umount /mnt/ntfs-bridge 2>/dev/null; fusermount -u /mnt/ntfs-bridge 2>/dev/null; nbd-client -d /dev/nbd0 2>/dev/null; true'
+ExecStopPost=/bin/sh -c 'fusermount -uz /mnt/ntfs-bridge 2>/dev/null; umount -l /mnt/ntfs-bridge 2>/dev/null; nbd-client -d /dev/nbd0 2>/dev/null; true'
 KillMode=mixed
 TimeoutStopSec=120
 Restart=on-failure
