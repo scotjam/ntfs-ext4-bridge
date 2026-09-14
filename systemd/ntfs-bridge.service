@@ -23,6 +23,14 @@ Type=simple
 WorkingDirectory=/opt/ntfs-ext4-bridge
 ExecStart=/opt/ntfs-ext4-bridge/scripts/start_bridge_for_vm.sh
 ExecStartPost=/bin/bash -c 'for i in $(seq 1 60); do ss -tln | grep -q ":10809 " && exit 0; sleep 1; done; echo "Bridge did not start listening on :10809 within 60s" >&2; exit 1'
+# The first restart of the night wedged: stop killed the NBD server but left
+# /dev/nbd0 attached with an ntfs-3g mount on it, and the next start ran a
+# global sync() that blocked forever on the dead device. Whatever state the
+# process is in when it dies, release the mount and the device before the
+# next start. KillMode=mixed lets the bridge run its own stop() first.
+ExecStopPost=/bin/sh -c 'umount /mnt/ntfs-bridge 2>/dev/null; fusermount -u /mnt/ntfs-bridge 2>/dev/null; nbd-client -d /dev/nbd0 2>/dev/null; true'
+KillMode=mixed
+TimeoutStopSec=120
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=120
