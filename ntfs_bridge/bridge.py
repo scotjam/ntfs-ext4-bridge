@@ -256,33 +256,32 @@ class NTFSBridge:
                 f"(ext4 {max_file_tib}TiB max file size)")
             self.image_size_mb = max_file_mb
 
-        # Step 1: Create NTFS image if it doesn't exist or is too small.
+        # Step 1: Create the NTFS image if it is missing, or grow it in place
+        # when the source no longer fits.
         #
-        # IMPORTANT: Never recreate an existing image whose size has decreased
-        # because the source symlinks were partially inaccessible at startup.
-        # Recreating the image generates a new NTFS volume serial → new partition
-        # GUID → Windows loses the F: drive mapping and requires a full VM reboot.
+        # Never recreate an existing image just to make it bigger. mkfs.ntfs
+        # mints a new volume serial; Windows then sees a different volume,
+        # remaps the drive letter, and Backblaze - which tracks files by path
+        # under that letter, keyed to the .bzvol GUID stored on the volume -
+        # treats every file on it as new and re-uploads the lot.
         #
-        # Safe recreation rules:
-        #   (a) If image does not exist → create it.
-        #   (b) If image exists AND is smaller than the existing image has ever
-        #       been (i.e. needed_mb > existing_size_mb by a large margin that
-        #       cannot be explained by symlink staleness) → recreate only if
-        #       needed_mb > existing_size_mb * 1.5  (source genuinely grew 50%+).
-        #   (c) In all other cases, keep the existing image regardless of whether
-        #       the freshly-calculated needed_mb is smaller than existing.
+        # ntfsresize enlarges the filesystem in place, keeping the serial, the
+        # data, the .bzvol marker and the drive letter. The MBR is synthesized
+        # per run from the image size, so the partition simply reports its new
+        # length. From the backup software's side the partition got bigger and
+        # nothing else changed.
+        #
+        # The old rule only recreated when needed_mb > existing * 1.5, so an
+        # image that was merely somewhat too small was kept forever: every
+        # directory that did not fit failed with EIO during populate and
+        # silently never reached the backup.
         image_is_fresh = False
         if os.path.exists(self.image_path):
             existing_size_mb = os.path.getsize(self.image_path) // (1024 * 1024)
-            if needed_mb > existing_size_mb * 1.5:
-                # Source has genuinely grown to more than 150% of existing image.
-                # Create new image first, only delete old one after success.
-                log(f"Existing image too small ({existing_size_mb}MB, need {needed_mb}MB for "
-                    f"{file_count} files), recreating...")
-                tmp_path = self.image_path + '.new'
-                self._create_ntfs_image(path_override=tmp_path)
-                os.replace(tmp_path, self.image_path)
-                image_is_fresh = True
+            if needed_mb > existing_size_mb:
+                log(f"Image too small ({existing_size_mb}MB, need {needed_mb}MB for "
+                    f"{file_count} files)")
+                self._grow_ntfs_image(needed_mb)
             else:
                 log(f"Using existing image: {self.image_path} ({existing_size_mb}MB, "
                     f"calculated need: {needed_mb}MB for {file_count} files)")
@@ -586,6 +585,55 @@ class NTFSBridge:
             self.mapper.flush()
 
         log("Bridge stopped")
+
+    # Grow past the immediate need so that adding a few files does not resize
+    # the volume on every start.
+    GROW_HEADROOM = 1.05
+
+    def _grow_ntfs_image(self, needed_mb: int) -> bool:
+        """Enlarge the NTFS image in place, preserving the volume's identity.
+
+        Returns True if the image is now at least needed_mb, False if it had
+        to be left at its current size (the caller carries on with what it
+        has, exactly as it did before growing was possible).
+        """
+        current_bytes = os.path.getsize(self.image_path)
+        target_bytes = int(needed_mb * 1024 * 1024 * self.GROW_HEADROOM)
+        if target_bytes <= current_bytes:
+            return True
+
+        log(f"Growing image in place: {current_bytes // (1024 * 1024)}MB -> "
+            f"{target_bytes // (1024 * 1024)}MB (volume serial preserved)")
+
+        # ntfsresize refuses a volume that is not clean.
+        subprocess.run(['ntfsfix', self.image_path], capture_output=True, text=True)
+
+        result = subprocess.run(
+            ['truncate', '-s', str(target_bytes), self.image_path],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            log(f"ERROR: could not extend image file: {result.stderr.strip()}")
+            return False
+
+        # With no --size, ntfsresize enlarges the volume to fill the device.
+        # It asks for confirmation on stdin before it writes anything.
+        result = subprocess.run(
+            ['ntfsresize', '-f', '-P', self.image_path],
+            input='y\n', capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            log("ERROR: ntfsresize failed: "
+                f"{result.stderr.strip() or result.stdout.strip()}")
+            return False
+        log(f"ntfsresize: {result.stdout.strip().splitlines()[-1]}")
+
+        # ntfsresize leaves the volume flagged for a Windows check; clear it
+        # here rather than letting the guest boot into autochk.
+        subprocess.run(['ntfsfix', self.image_path], capture_output=True, text=True)
+
+        self.image_size_mb = target_bytes // (1024 * 1024)
+        return True
 
     def _create_ntfs_image(self, path_override: str = None):
         """Create a new NTFS image file."""
