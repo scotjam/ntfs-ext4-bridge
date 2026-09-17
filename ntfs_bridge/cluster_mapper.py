@@ -28,6 +28,11 @@ if TYPE_CHECKING:
 MFT_RECORD_SIZE = 1024
 CLUSTER_SIZE = 4096  # Standard NTFS cluster size
 
+# $Volume and its $VOLUME_INFORMATION dirty flag (see _clear_volume_dirty_flag)
+MFT_RECORD_VOLUME = 3
+ATTR_VOLUME_INFORMATION = 0x70
+VOLUME_IS_DIRTY = 0x0001
+
 # All files use run-based mapping (_direct_run_map) to avoid per-cluster dict
 # entries that consume hundreds of MB for large file collections.
 # Set to 0 so every file — small or large — uses the O(log n) run lookup.
@@ -188,6 +193,11 @@ class ClusterMapper:
         if self.overflow_dir != self.source_dir:
             os.makedirs(self.overflow_dir, exist_ok=True)
             log(f"Overflow directory: {self.overflow_dir}")
+
+        # Cache for _allowed_real_roots(), keyed on the source_dir listing so a
+        # newly added root symlink is picked up without a restart.
+        self._real_roots_key = None
+        self._real_roots = frozenset()
 
         # Known top-level entries in the source directory (for root path
         # resolution). protected_roots is the authoritative allowlist: only
@@ -844,6 +854,17 @@ class ClusterMapper:
                 data_end = overlap_end - offset
                 chunk = data[data_start:data_end]
                 self.image[overlap_start:overlap_start + len(chunk)] = chunk
+
+                # $Volume carries VOLUME_IS_DIRTY. Windows sets it on mount and
+                # only clears it on a clean dismount, so an abrupt VM stop - or
+                # a plain `virsh reboot`, which keeps this NBD connection open
+                # and so never restarts the bridge - leaves it set, and the next
+                # boot burns hours in autochk. chkdsk cannot repair anything
+                # real here: the volume is synthesized from ext4 on every bridge
+                # start and its NTFS structures are disposable. Mask the flag
+                # out as it is written so the guest always sees a clean volume.
+                if record_num == MFT_RECORD_VOLUME:
+                    self._clear_volume_dirty_flag()
 
                 # Re-patch INDEX_ALLOC data_size and INDEX_BITMAP for protected
                 # directories. Windows journal replay and access-time updates write
@@ -3059,28 +3080,68 @@ class ClusterMapper:
             return os.path.join(self.source_dir, rel_path)
         return os.path.join(self.overflow_dir, rel_path)
 
+    def _allowed_real_roots(self) -> frozenset:
+        """Real directories the exported tree is allowed to resolve into.
+
+        source_dir is a farm of symlinks pointing at the real media/document
+        trees on other filesystems, so realpath() of a legitimate file lands
+        well outside source_dir. The acceptable targets are therefore
+        source_dir and overflow_dir plus the real target of each top-level
+        entry an operator placed in source_dir.
+
+        Recomputed only when the source_dir listing changes.
+        """
+        try:
+            entries = tuple(sorted(os.listdir(self.source_dir)))
+        except OSError:
+            entries = ()
+        if entries != self._real_roots_key:
+            roots = {os.path.realpath(self.source_dir),
+                     os.path.realpath(self.overflow_dir)}
+            for name in entries:
+                roots.add(os.path.realpath(os.path.join(self.source_dir, name)))
+            self._real_roots = frozenset(roots)
+            self._real_roots_key = entries
+        return self._real_roots
+
     def _validate_path(self, source_path: str, context: str = '') -> bool:
         """Validate that a resolved path stays within allowed directories.
 
-        Returns True if the path is safe, False if it escapes the allowed
-        directories (path traversal) or contains null bytes.
+        Two independent checks, because the exported roots are symlinks by
+        design:
+
+          1. Lexically (without resolving symlinks) the path must stay under
+             source_dir or overflow_dir. This is what stops a crafted NTFS
+             name full of ".." from climbing out of the exported tree.
+          2. Its realpath must land under one of the declared roots. This
+             still rejects a hostile symlink *inside* the media tree that
+             points somewhere like /etc, while accepting the operator-placed
+             root symlinks that make the bridge work at all.
+
+        Resolving with realpath() alone (the previous behaviour) rejected
+        every file under every root symlink, which silently dropped those
+        records and drove the parent-untracked root fallthrough that
+        _is_orphan_root_fallthrough exists to detect.
         """
         # Reject null bytes in the path
         if '\x00' in source_path:
             log(f"  PATH REJECTED (null byte){' in ' + context if context else ''}: {source_path!r}")
             return False
 
-        resolved = os.path.realpath(source_path)
-        source_real = os.path.realpath(self.source_dir)
-        overflow_real = os.path.realpath(self.overflow_dir)
+        abs_path = os.path.abspath(source_path)
+        for base in (self.source_dir, self.overflow_dir):
+            if abs_path == base or abs_path.startswith(base + os.sep):
+                break
+        else:
+            log(f"  PATH REJECTED (traversal){' in ' + context if context else ''}: {source_path} -> {abs_path}")
+            return False
 
-        if resolved.startswith(source_real + os.sep) or resolved == source_real:
-            return True
-        if overflow_real != source_real:
-            if resolved.startswith(overflow_real + os.sep) or resolved == overflow_real:
+        resolved = os.path.realpath(source_path)
+        for root_real in self._allowed_real_roots():
+            if resolved == root_real or resolved.startswith(root_real + os.sep):
                 return True
 
-        log(f"  PATH REJECTED (traversal){' in ' + context if context else ''}: {source_path} -> {resolved}")
+        log(f"  PATH REJECTED (outside exported roots){' in ' + context if context else ''}: {source_path} -> {resolved}")
         return False
 
     def _get_rel_path(self, source_path: str) -> str:
@@ -4254,6 +4315,44 @@ class ClusterMapper:
 
         runs.append(0)  # End marker
         return bytes(runs)
+
+    def _clear_volume_dirty_flag(self) -> bool:
+        """Clear VOLUME_IS_DIRTY in the $Volume record, in place in the image.
+
+        Returns True if the flag had been set and is now cleared.
+
+        Called under self.lock from _mft_write_to_image.
+        """
+        rec_abs = self._rec_offset(MFT_RECORD_VOLUME)
+        if rec_abs is None or rec_abs + MFT_RECORD_SIZE > len(self.image):
+            return False
+        record = self._undo_fixups(
+            bytearray(self.image[rec_abs:rec_abs + MFT_RECORD_SIZE]))
+        if record[0:4] != b'FILE':
+            return False
+
+        attr_offset = struct.unpack('<H', record[20:22])[0]
+        while 0 < attr_offset and attr_offset + 8 <= MFT_RECORD_SIZE:
+            attr_type = struct.unpack('<I', record[attr_offset:attr_offset + 4])[0]
+            attr_len = struct.unpack('<I', record[attr_offset + 4:attr_offset + 8])[0]
+            if attr_type == 0xFFFFFFFF or attr_len == 0:
+                break
+            if attr_type == ATTR_VOLUME_INFORMATION and not record[attr_offset + 8]:
+                val_off = struct.unpack('<H', record[attr_offset + 20:attr_offset + 22])[0]
+                # $VOLUME_INFORMATION value: 8 reserved, major, minor, flags
+                flags_abs = attr_offset + val_off + 10
+                if flags_abs + 2 > MFT_RECORD_SIZE:
+                    return False
+                flags = struct.unpack('<H', record[flags_abs:flags_abs + 2])[0]
+                if not flags & VOLUME_IS_DIRTY:
+                    return False
+                struct.pack_into('<H', record, flags_abs, flags & ~VOLUME_IS_DIRTY)
+                self._apply_fixups_to_record(record)
+                self.image[rec_abs:rec_abs + MFT_RECORD_SIZE] = bytes(record)
+                log("  -> cleared VOLUME_IS_DIRTY on $Volume")
+                return True
+            attr_offset += attr_len
+        return False
 
     def _apply_fixups_to_record(self, record: bytearray):
         """Apply NTFS fixups to an MFT record."""
