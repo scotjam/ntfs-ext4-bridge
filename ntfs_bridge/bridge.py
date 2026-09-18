@@ -304,6 +304,16 @@ class NTFSBridge:
                                      overflow_dir=self.overflow_dir,
                                      protected_roots=self.protected_roots)
 
+        # A reused image describes the tree as it was when we last shut down.
+        # ext4 can have moved on since - files added, moved or deleted while the
+        # bridge was down - and _populate_image() skips entries already present,
+        # so stale paths survive. Until the volume has mounted cleanly, ext4 is
+        # the authority and reconciliation may not write back to it.
+        self.mapper.ext4_authoritative = not image_is_fresh
+        if self.mapper.ext4_authoritative:
+            log("Image reused: ext4 is authoritative until the volume mounts "
+                "cleanly (reconciliation will not write back to ext4 yet)")
+
         # Sanity check: if the MFT holds many user file records but almost
         # none could be mapped to an ext4 source, the source data is missing
         # (unmounted disk, moved tree, broken symlinks). Serving in this state
@@ -467,6 +477,13 @@ class NTFSBridge:
                 # "corrupted and unreadable".
                 log("Post-mount: fixing INDX cluster bitmap entries...")
                 self.mapper.fix_indx_clusters()
+
+                # The volume mounted and its INDX bitmap has been reconciled, so
+                # the image is now a fair description of ext4. Reconciliation may
+                # write back from here on.
+                if self.mapper.ext4_authoritative:
+                    self.mapper.ext4_authoritative = False
+                    log("Volume mounted cleanly: reconciliation to ext4 re-enabled")
 
                 # Start sync daemon for ntfs-3g based sync
                 if not self.virtual_mode:

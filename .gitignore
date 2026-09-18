@@ -50,3 +50,8 @@ venv/
 .dolt/
 *.db
 .beads-credential-key
+
+# Editor/ad-hoc backups of source files
+*.bak
+*.bak-*
+*.orig

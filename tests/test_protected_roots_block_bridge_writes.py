@@ -7,7 +7,7 @@ and no guest attached at all, _check_file_deleted saw records it could no longer
 account for and unlinked the ext4 files behind them; _check_new_file rebuilt
 others out of image clusters holding nothing but zeros.
 
-That is how a protected Shows tree lost a file and had four files
+That is how a protected tree lost a file outright and had four others
 rewritten to their exact original size in all-zero bytes, with the VM powered
 off the whole time.
 
@@ -47,8 +47,9 @@ def make_mapper(source_dir, image):
     m.source_dir = source_dir
     m.overflow_dir = source_dir
     m._mft_runs = [(0, TOTAL_RECORDS * MFT_RECORD_SIZE)]
-    m._protected_top_dirs = {"shows"}
+    m._protected_top_dirs = {"media"}
     m._protect_refused = set()
+    m.ext4_authoritative = False
     m.mft_record_to_source = {}
     m.mft_record_to_dir = {}
     m.path_to_mft_record = {}
@@ -81,7 +82,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="bridge-protect-")
 
     # A source_dir shaped like the real one: top-level trees, one protected.
-    prot_dir = os.path.join(tmp, "Shows", "Some Show")
+    prot_dir = os.path.join(tmp, "Media", "Some Show")
     open_dir = os.path.join(tmp, "Scratch", "Some Show")
     os.makedirs(prot_dir)
     os.makedirs(open_dir)
@@ -121,11 +122,11 @@ def main():
     print("\n[3] _refuse_ext4_mutation targeting")
     m2 = make_mapper(tmp, FakeImage(TOTAL_RECORDS * MFT_RECORD_SIZE))
     ok &= check("protected path refused",
-                m2._refuse_ext4_mutation(prot_file, "materialize", "Shows/x") is True)
+                m2._refuse_ext4_mutation(prot_file, "materialize", "Media/x") is True)
     ok &= check("unprotected path allowed",
                 m2._refuse_ext4_mutation(open_file, "materialize", "Scratch/x") is False)
     ok &= check("path outside source_dir allowed",
-                m2._refuse_ext4_mutation("/elsewhere/Shows/x.mkv", "materialize") is False)
+                m2._refuse_ext4_mutation("/elsewhere/Media/x.mkv", "materialize") is False)
     m2._protected_top_dirs = set()
     ok &= check("no protected roots configured -> never refuses",
                 m2._refuse_ext4_mutation(prot_file, "materialize") is False)
@@ -134,7 +135,7 @@ def main():
     print("\n[4] refusal is logged once per path+operation")
     m3 = make_mapper(tmp, FakeImage(TOTAL_RECORDS * MFT_RECORD_SIZE))
     for _ in range(5):
-        m3._refuse_ext4_mutation(prot_file, "materialize", "Shows/x")
+        m3._refuse_ext4_mutation(prot_file, "materialize", "Media/x")
     ok &= check("one entry after five calls", len(m3._protect_refused) == 1,
                 "got %d" % len(m3._protect_refused))
 

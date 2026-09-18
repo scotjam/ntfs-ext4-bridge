@@ -358,6 +358,15 @@ class ClusterMapper:
         # Clusters already reported as allocated-but-unmapped, so a
         # retrying client does not flood the log.
         self._unmapped_reported: Set[int] = set()
+        # Provenance: bit per cluster, set when a client write lands in it.
+        # Materialisation consults this so it never rebuilds an ext4 file out
+        # of image clusters nobody ever wrote.
+        self._guest_written = bytearray()
+        self._materialize_refused: Set[str] = set()
+        # True while the image was reused from a previous run and has not been
+        # re-derived from ext4. ext4 is authoritative in that window and
+        # reconciliation must not push image state onto it.
+        self.ext4_authoritative = False
 
         # $MFTMirr sync: byte offset of the mirror cluster in the image, and
         # how many MFT records it stores. Populated by _load_mft_mirror_info().
@@ -847,6 +856,14 @@ class ClusterMapper:
         projection of it. Refuse the mutation and let the next rescan pick the
         truth back up off disk.
         """
+        if self.ext4_authoritative:
+            key = (source_path, what + " [stale image]")
+            if key not in self._protect_refused:
+                self._protect_refused.add(key)
+                log("  STALE IMAGE: refusing %s on %s (image reused from a "
+                    "previous run, not yet re-derived from ext4)"
+                    % (what, rel_path or source_path))
+            return True
         if not self._is_source_protected(source_path):
             return False
         key = (source_path, what)
@@ -1101,6 +1118,10 @@ class ClusterMapper:
 
             # NTFS structure is written to the image, never into a file.
             meta = cluster in self._metadata_clusters
+
+            # Provenance: a client put these bytes here. Materialisation relies
+            # on this to tell real data from image space nobody ever wrote.
+            self._mark_guest_written(cluster)
 
             if not meta and cluster in self.cluster_map:
                 mapping = self.cluster_map[cluster]
@@ -1909,6 +1930,43 @@ class ClusterMapper:
             j += 1
 
         self._free_run_index[i:j] = [(merge_start, merge_end - merge_start)]
+
+    def _mark_guest_written(self, cluster: int):
+        """Record that a client write landed in this cluster."""
+        byte_i, bit = divmod(cluster, 8)
+        gw = self._guest_written
+        if byte_i >= len(gw):
+            gw.extend(b"\x00" * (byte_i - len(gw) + 4096))
+        gw[byte_i] |= 1 << bit
+
+    def _is_guest_written(self, cluster: int) -> bool:
+        """True if a client has written this cluster since mount."""
+        byte_i, bit = divmod(cluster, 8)
+        gw = self._guest_written
+        if byte_i >= len(gw):
+            return False
+        return bool(gw[byte_i] & (1 << bit))
+
+    def _first_unwritten_cluster(self, data_runs):
+        """First cluster in data_runs that no client has written since mount.
+
+        Materialisation copies image bytes into an ext4 file. If nobody wrote a
+        cluster, whatever the image holds there is not the file's data - it is
+        leftover or never-populated space - and copying it over ext4 destroys
+        the real file. On 2026-09-18 that rewrote four episodes to their exact
+        original size in all-zero bytes, with the VM powered off.
+
+        Sparse runs (start_cluster == -1) are genuine holes, so they are skipped.
+        Returns None when every cluster is accounted for.
+        """
+        for start_cluster, num_clusters in data_runs:
+            if start_cluster == -1:
+                continue
+            for i in range(num_clusters):
+                cluster = start_cluster + i
+                if not self._is_guest_written(cluster):
+                    return cluster
+        return None
 
     def _cluster_is_allocated(self, cluster: int) -> bool:
         """True when $Bitmap marks this cluster in use.
@@ -4962,6 +5020,19 @@ class ClusterMapper:
                         and init_size < file_size):
                     log(f"  Deferring materialization (init_size={init_size} < "
                         f"data_size={file_size}): {rel_path}")
+                    return None
+
+            # Only materialise from clusters a client actually wrote. Without
+            # this the image's own empty space gets copied over a perfectly
+            # good ext4 file.
+            if data_runs:
+                unwritten = self._first_unwritten_cluster(data_runs)
+                if unwritten is not None:
+                    if rel_path not in self._materialize_refused:
+                        self._materialize_refused.add(rel_path)
+                        log(f"  REFUSING materialize: {rel_path} - cluster "
+                            f"{unwritten} was never written by a client since "
+                            f"mount, so the image holds no data for it")
                     return None
             self.ntfs_sync_in_progress.add(rel_path)
             self.ntfs_sync_timestamps[rel_path] = time.time()
