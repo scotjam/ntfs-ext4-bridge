@@ -325,8 +325,14 @@ class NBDServer:
                 if elapsed > 5.0:
                     log(f"SLOW READ: off={offset} len={length} took {elapsed:.1f}s")
                 if len(data) < length:
-                    log(f"Read size mismatch: expected {length}, got {len(data)}, padding with zeros")
-                    data = data + b'\x00' * (length - len(data))
+                    # Padding a short read with zeros hands the client
+                    # fabricated data it cannot distinguish from real content.
+                    # Fail the request instead; the mapper is the only thing
+                    # that knows what belongs here and it did not supply it.
+                    log(f"Read size mismatch: expected {length}, got {len(data)} "
+                        f"- replying EIO rather than padding with zeros")
+                    raise IOError(
+                        f"short mapper read: expected {length}, got {len(data)}")
                 elif len(data) > length:
                     data = data[:length]
 

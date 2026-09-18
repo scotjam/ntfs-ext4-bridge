@@ -355,6 +355,9 @@ class ClusterMapper:
         # (source_path, operation) already refused under a protected root,
         # so a hot path does not flood the log.
         self._protect_refused: Set[Tuple[str, str]] = set()
+        # Clusters already reported as allocated-but-unmapped, so a
+        # retrying client does not flood the log.
+        self._unmapped_reported: Set[int] = set()
 
         # $MFTMirr sync: byte offset of the mirror cluster in the image, and
         # how many MFT records it stores. Populated by _load_mft_mirror_info().
@@ -616,7 +619,29 @@ class ClusterMapper:
                 # Read from image (metadata)
                 chunk_len = min(remaining, self.cluster_size - cluster_offset,
                                 len(self.image) - byte_offset)
-                result[pos:pos + chunk_len] = self.image[byte_offset:byte_offset + chunk_len]
+                chunk = self.image[byte_offset:byte_offset + chunk_len]
+
+                # Nothing mapped this cluster, so the bytes here are whatever
+                # the image happens to hold. If $Bitmap says the cluster is IN
+                # USE and the image holds nothing but zeros, we do not know
+                # what belongs here and must not invent it: that is how
+                # ntfs-3g came to read "magic: 0x00000000" for an index block,
+                # declare the directory corrupt, and "repair" it -- with the
+                # repair flowing back through reconciliation into ext4 as
+                # deletions and zero-filled rewrites. An allocated cluster we
+                # cannot account for is an I/O error, not a hole.
+                if (not meta and chunk and not any(chunk)
+                        and self._cluster_is_allocated(cluster)):
+                    if cluster not in self._unmapped_reported:
+                        self._unmapped_reported.add(cluster)
+                        log(f"READ FAILED (EIO to client): cluster {cluster} is "
+                            f"allocated in $Bitmap but unmapped and empty in the "
+                            f"image - refusing to serve fabricated zeros")
+                    raise IOError(
+                        f"allocated cluster {cluster} is unmapped; refusing to "
+                        f"serve zeros as valid data")
+
+                result[pos:pos + chunk_len] = chunk
                 pos += chunk_len
 
             else:
@@ -1884,6 +1909,21 @@ class ClusterMapper:
             j += 1
 
         self._free_run_index[i:j] = [(merge_start, merge_end - merge_start)]
+
+    def _cluster_is_allocated(self, cluster: int) -> bool:
+        """True when $Bitmap marks this cluster in use.
+
+        Uses the RAM bitmap cache, so this is O(1) and safe on the read path.
+        Returns False when the cache is not loaded yet: unknown must never
+        escalate into an error.
+        """
+        bitmap = self._bitmap_cache
+        if not bitmap:
+            return False
+        byte_i, bit = divmod(cluster, 8)
+        if byte_i >= len(bitmap):
+            return False
+        return bool(bitmap[byte_i] & (1 << bit))
 
     def _read_bitmap(self) -> bytearray:
         """Return the cached cluster bitmap (loaded once at startup)."""
