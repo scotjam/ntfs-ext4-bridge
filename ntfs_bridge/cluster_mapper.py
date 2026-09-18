@@ -352,6 +352,9 @@ class ClusterMapper:
         # stale, so a hot record does not flood the log on every
         # write.
         self._ia_protect_warned: Set[Tuple[int, str]] = set()
+        # (source_path, operation) already refused under a protected root,
+        # so a hot path does not flood the log.
+        self._protect_refused: Set[Tuple[str, str]] = set()
 
         # $MFTMirr sync: byte offset of the mirror cluster in the image, and
         # how many MFT records it stores. Populated by _load_mft_mirror_info().
@@ -799,6 +802,34 @@ class ClusterMapper:
         rel = source_path[len(prefix):]
         top = rel.split(os.sep, 1)[0]
         return top.lower() in self._protected_top_dirs
+
+    def _refuse_ext4_mutation(self, source_path: str, what: str,
+                              rel_path: str = "") -> bool:
+        """True if the bridge must not create/overwrite/move/unlink this path.
+
+        protected_roots is meant to make a top-level tree read-only, but until
+        now it only stopped the GUEST writing: _write_inner and
+        _mft_write_to_image consult it, and nothing else did. The bridge's own
+        MFT reconciliation (_check_file_deleted, _check_new_file,
+        _check_new_directory, _check_directory_rename, _reparse_mft_record)
+        mutates ext4 directly, and with a stale image it will happily "repair"
+        ext4 to match: unlinking files the image has lost track of and
+        rewriting others from image clusters that hold nothing but zeros. That
+        is not repair, it is data loss, and it happens with no guest attached
+        at all.
+
+        Under a protected root ext4 is authoritative and the image is a pure
+        projection of it. Refuse the mutation and let the next rescan pick the
+        truth back up off disk.
+        """
+        if not self._is_source_protected(source_path):
+            return False
+        key = (source_path, what)
+        if key not in self._protect_refused:
+            self._protect_refused.add(key)
+            log("  PROTECTED: refusing %s on %s (ext4 is authoritative here)"
+                % (what, rel_path or source_path))
+        return True
 
     def _mft_write_to_image(self, offset: int, data: bytes):
         """Write MFT record data to the image (fast path, called under self.lock).
@@ -4515,6 +4546,13 @@ class ClusterMapper:
 
             rel_path = self._get_rel_path(source_path)
 
+            if self._refuse_ext4_mutation(source_path, 'delete', rel_path):
+                # Keep the mapping: the ext4 file is still there, so the record
+                # is not really gone. Returning False sends the caller to
+                # _reparse_mft_record, which re-reads the record rather than
+                # touching the file.
+                return False
+
             if rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping delete (ext4 sync in progress): {rel_path}")
                 del self.mft_record_to_source[record_num]
@@ -4635,8 +4673,10 @@ class ClusterMapper:
         # Slow filesystem op outside the lock so reads are not blocked
         if do_move:
             try:
-                shutil.move(old_path, new_path)
-                log(f"  DIR RENAMED: {old_rel_path} -> {new_rel_path}")
+                if not (self._refuse_ext4_mutation(old_path, 'directory rename', old_rel_path)
+                        or self._refuse_ext4_mutation(new_path, 'directory rename', new_rel_path)):
+                    shutil.move(old_path, new_path)
+                    log(f"  DIR RENAMED: {old_rel_path} -> {new_rel_path}")
             except OSError as e:
                 log(f"  Failed to rename dir {old_rel_path}: {e}")
 
@@ -4784,6 +4824,8 @@ class ClusterMapper:
             source_path = self._resolve_source_path(rel_path)
             if not self._validate_path(source_path, '_check_new_directory'):
                 return
+            if self._refuse_ext4_mutation(source_path, 'create directory', rel_path):
+                return
             do_create = not os.path.exists(source_path)
             if do_create:
                 self.ntfs_sync_in_progress.add(rel_path)
@@ -4847,6 +4889,9 @@ class ClusterMapper:
 
             source_path = self._resolve_source_path(rel_path)
             if not self._validate_path(source_path, '_check_new_file'):
+                return None
+
+            if self._refuse_ext4_mutation(source_path, 'materialize', rel_path):
                 return None
 
             if rel_path in self.ext4_sync_in_progress:
@@ -5031,8 +5076,11 @@ class ClusterMapper:
                 except OSError:
                     pass
             try:
-                shutil.move(old_source, new_path)
-                log(f"  FILE RENAMED: {os.path.basename(old_source)} -> {filename}")
+                if not (self._refuse_ext4_mutation(old_source, 'file rename',
+                                                   os.path.basename(old_source))
+                        or self._refuse_ext4_mutation(new_path, 'file rename', filename)):
+                    shutil.move(old_source, new_path)
+                    log(f"  FILE RENAMED: {os.path.basename(old_source)} -> {filename}")
             except OSError as e:
                 log(f"  Failed to rename file: {e}")
 
@@ -5122,7 +5170,8 @@ class ClusterMapper:
                                 if record_num_for_realloc is not None:
                                     self.sparse_files[rel_path] = (source_path, current_size, record_num_for_realloc)
                                     log(f"  Re-queued for allocation: {rel_path}")
-                    else:
+                    elif not self._refuse_ext4_mutation(source_path,
+                                                        'resident write', rel_path):
                         with open(source_path, 'wb') as f:
                             f.write(resident_data)
             except OSError as e:
