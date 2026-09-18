@@ -348,6 +348,10 @@ class ClusterMapper:
         # re-patches these fields after every write to a protected record so the
         # fix is never reverted.
         self._protected_ia_sizes: Dict[int, Tuple[int, int, int, int, bytes]] = {}
+        # (record_num, attribute) pairs already warned about as
+        # stale, so a hot record does not flood the log on every
+        # write.
+        self._ia_protect_warned: Set[Tuple[int, str]] = set()
 
         # $MFTMirr sync: byte offset of the mirror cluster in the image, and
         # how many MFT records it stores. Populated by _load_mft_mirror_info().
@@ -876,26 +880,69 @@ class ClusterMapper:
                 if record_num in self._protected_ia_sizes:
                     ia_off_in_rec, target_ds, ib_off_in_rec, ib_val_off, bitmap = \
                         self._protected_ia_sizes[record_num]
-                    # Re-patch non-resident flag at +8: INDEX_ALLOCATION MUST
-                    # always be non-resident per NTFS spec. Windows journal
-                    # replay or ntfs-3g may write back a resident-flagged
-                    # version, which corrupts the attribute layout and trips
-                    # ntfsfix "Corrupt resident attribute 0xa0" on next mount.
-                    # Byte +8 of any 8-byte-aligned attr never collides with
-                    # USA fixup positions (510-511, 1022-1023), so direct
-                    # patching is safe.
-                    nr_off = rec_abs + ia_off_in_rec + 8
-                    self.image[nr_off:nr_off + 1] = b'\x01'
-                    # Re-patch data_size and init_size
-                    ds_off = rec_abs + ia_off_in_rec + 48
-                    is_off = rec_abs + ia_off_in_rec + 56
-                    packed = struct.pack('<Q', target_ds)
-                    self.image[ds_off:ds_off + 8] = packed
-                    self.image[is_off:is_off + 8] = packed
-                    # Re-patch INDEX_BITMAP (ensures Windows sees all blocks as allocated)
-                    if ib_off_in_rec >= 0 and bitmap:
-                        bm_abs = rec_abs + ib_off_in_rec + ib_val_off
-                        self.image[bm_abs:bm_abs + len(bitmap)] = bitmap
+
+                    # The offsets held in _protected_ia_sizes were captured when
+                    # the record was scanned at startup. Windows rewrites
+                    # records and can change their attribute layout underneath
+                    # us -- most importantly it converts $INDEX_BITMAP from
+                    # resident to non-resident once a directory outgrows the
+                    # record. Patching at the stale resident value offset then
+                    # writes bitmap bytes straight into the non-resident
+                    # header: an all-ones bitmap lands on allocated_size (+40)
+                    # and leaves it 0xFFFFFFFF. That is what ntfs-3g reports as
+                    # "Corrupt non resident attribute 0xb0", and a directory
+                    # whose index is mis-described that way hands Windows the
+                    # wrong file records -- files show up under the wrong
+                    # folder. Re-validate every header against the record as it
+                    # exists right now before touching a single byte.
+                    ia_hdr = self._attr_header_at(rec_abs, ia_off_in_rec)
+                    if ia_hdr is None or ia_hdr[0] != 0xA0:
+                        self._warn_stale_ia_protection(
+                            record_num, 'INDEX_ALLOC', ia_off_in_rec, ia_hdr)
+                    else:
+                        # Re-patch non-resident flag at +8: INDEX_ALLOCATION
+                        # MUST always be non-resident per NTFS spec. Windows
+                        # journal replay or ntfs-3g may write back a
+                        # resident-flagged version, which corrupts the
+                        # attribute layout and trips ntfsfix "Corrupt resident
+                        # attribute 0xa0" on next mount. Byte +8 of any
+                        # 8-byte-aligned attr never collides with USA fixup
+                        # positions (510-511, 1022-1023), so direct patching
+                        # is safe.
+                        nr_off = rec_abs + ia_off_in_rec + 8
+                        self.image[nr_off:nr_off + 1] = b'\x01'
+                        # Re-patch data_size and init_size
+                        ds_off = rec_abs + ia_off_in_rec + 48
+                        is_off = rec_abs + ia_off_in_rec + 56
+                        packed = struct.pack('<Q', target_ds)
+                        self.image[ds_off:ds_off + 8] = packed
+                        self.image[is_off:is_off + 8] = packed
+
+                        # Re-patch INDEX_BITMAP (ensures Windows sees all
+                        # blocks as allocated). Only ever into an attribute
+                        # that is still a RESIDENT 0xB0 whose value slot is
+                        # still where, and as large as, we recorded it.
+                        if ib_off_in_rec >= 0 and bitmap:
+                            ib_hdr = self._attr_header_at(rec_abs, ib_off_in_rec)
+                            if ib_hdr is None or ib_hdr[0] != 0xB0 or ib_hdr[2]:
+                                self._warn_stale_ia_protection(
+                                    record_num, 'INDEX_BITMAP',
+                                    ib_off_in_rec, ib_hdr)
+                            else:
+                                ib_base = rec_abs + ib_off_in_rec
+                                hdr = bytes(self.image[ib_base:ib_base + 24])
+                                cur_val_len = struct.unpack_from('<I', hdr, 16)[0]
+                                cur_val_off = struct.unpack_from('<H', hdr, 20)[0]
+                                end = ib_off_in_rec + cur_val_off + len(bitmap)
+                                if (cur_val_off == ib_val_off
+                                        and cur_val_len >= len(bitmap)
+                                        and end <= MFT_RECORD_SIZE):
+                                    bm_abs = ib_base + ib_val_off
+                                    self.image[bm_abs:bm_abs + len(bitmap)] = bitmap
+                                else:
+                                    self._warn_stale_ia_protection(
+                                        record_num, 'INDEX_BITMAP value',
+                                        ib_off_in_rec, ib_hdr)
 
                 # Keep $MFTMirr in sync: if this record falls within the
                 # mirror's range, copy the full record to the mirror cluster.
@@ -1079,6 +1126,46 @@ class ClusterMapper:
             bitmap: The corrected INDEX_BITMAP value to preserve
         """
         self._protected_ia_sizes[record_num] = (ia_off, data_size, ib_off, ib_val_off, bitmap)
+
+    def _attr_header_at(self, rec_abs: int, attr_off: int):
+        """Return (type, length, non_resident) for the attribute at attr_off.
+
+        Reads the live image. Attribute offsets are 8-byte aligned, so none of
+        these fields (+0..+8) can land on a USA fixup position (bytes 510-511 /
+        1022-1023 of a 1024-byte record): an 8-aligned offset puts +0..+3 at
+        504-507 or 512-515, never 510. So no fixup undo is needed here.
+
+        Returns None when the offset falls outside the record.
+        """
+        if attr_off < 0 or attr_off + 16 > MFT_RECORD_SIZE:
+            return None
+        base = rec_abs + attr_off
+        hdr = bytes(self.image[base:base + 16])
+        if len(hdr) < 16:
+            return None
+        attr_type = struct.unpack_from('<I', hdr, 0)[0]
+        attr_len = struct.unpack_from('<I', hdr, 4)[0]
+        return attr_type, attr_len, hdr[8]
+
+    def _warn_stale_ia_protection(self, record_num: int, what: str,
+                                  attr_off: int, hdr):
+        """Log once per (record, attribute) that a protection offset went stale.
+
+        The record's layout no longer matches what the startup scan recorded,
+        so the re-patch is skipped rather than written into whatever lives at
+        that offset now. The next rescan_mft()/startup re-registers fresh
+        offsets; until then the record simply goes unprotected, which is
+        strictly better than corrupting its attribute header.
+        """
+        key = (record_num, what)
+        if key in self._ia_protect_warned:
+            return
+        self._ia_protect_warned.add(key)
+        seen = ('missing' if hdr is None
+                else 'type=0x%02X non_res=%d' % (hdr[0], hdr[2]))
+        log(f"  Record {record_num}: {what} protection offset 0x{attr_off:x} "
+            f"is stale ({seen}) - skipping re-patch to avoid corrupting the "
+            f"attribute header")
 
     def rescan_mft(self):
         """Rescan the MFT to pick up changes made through ntfs-3g.
