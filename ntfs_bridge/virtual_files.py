@@ -85,6 +85,10 @@ class VirtualFileManager:
     # Start virtual clusters at a high number
     VIRTUAL_CLUSTER_START = 500000
 
+    # Cap on how many free MFT records to collect up front, so scanning a large
+    # volume's MFT does not build a list of hundreds of thousands of integers.
+    MAX_FREE_SLOTS = 4096
+
     def __init__(self, source_dir: str, cluster_size: int = CLUSTER_SIZE):
         self.source_dir = os.path.abspath(source_dir)
         self.cluster_size = cluster_size
@@ -139,19 +143,37 @@ class VirtualFileManager:
         # System records 0-23 are always reserved
         used_records.update(range(24))
 
-        # Find first available slot starting from record 24
-        # MFT typically has ~100-120 records allocated for small volumes
+        # Collect free records from the whole MFT, not a fixed guess.
+        #
+        # The scan used to stop at record 120, which is smaller than the MFT of
+        # any real volume. Once records 24-119 were all in use the free list
+        # came back empty and virtual mode silently added nothing at all - one
+        # "No available MFT slots" line per file and no virtual entries.
+        #
+        # Stop collecting once there are plenty: the MFT of a large volume runs
+        # to hundreds of thousands of records and the whole free list is never
+        # needed at once.
+        total_records = getattr(mapper, '_mft_total_records', 0) or 0
         self._available_mft_slots = []
-        for i in range(24, 120):  # Check reasonable range
+        for i in range(24, total_records):
             if i not in used_records:
                 self._available_mft_slots.append(i)
+                if len(self._available_mft_slots) >= self.MAX_FREE_SLOTS:
+                    break
 
         if self._available_mft_slots:
             self._next_mft_record = self._available_mft_slots[0]
-            log(f"Virtual MFT: {len(self._available_mft_slots)} slots available, starting at {self._next_mft_record}")
+            log(f"Virtual MFT: {len(self._available_mft_slots)} slots available "
+                f"in {total_records} records, starting at {self._next_mft_record}")
         else:
-            self._next_mft_record = 36  # Fallback
-            log(f"Virtual MFT: no slots found, starting at {self._next_mft_record}")
+            # No fallback record number. The old code set _next_mft_record = 36
+            # here, which nothing reads - allocation comes from
+            # _available_mft_slots alone - so it only looked like a usable
+            # default. _allocate_mft_record returns None and the callers skip
+            # the file, which is the safe outcome; say so plainly instead.
+            self._next_mft_record = None
+            log(f"Virtual MFT: WARNING no free records in an MFT of "
+                f"{total_records}; virtual files cannot be added")
 
     def add_file(self, rel_path: str) -> Optional[VirtualFile]:
         """Add a virtual file for an ext4 file.
