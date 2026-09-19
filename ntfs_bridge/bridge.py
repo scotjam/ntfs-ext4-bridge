@@ -52,6 +52,90 @@ PRUNE_MAX_FRACTION = 0.25
 PRUNE_REFUSE_FLOOR = 20
 
 
+# Root entries the volume owns rather than the bridge: Windows' own
+# bookkeeping. Never candidates for pruning, whatever the source looks like.
+WINDOWS_ROOT_NAMES = {
+    'system volume information', '$recycle.bin', '$deleted', '$rmmetadata',
+    '$extend', 'found.000', 'desktop.ini', 'boottel.dat', '.bzvol',
+    'recycler', 'msdos.sys', 'io.sys', 'pagefile.sys', 'hiberfil.sys',
+    'swapfile.sys',
+}
+
+
+def prune_unexposed_roots(ntfs_mount: str, source_dir: str, overflow_dir,
+                          configured_roots, log) -> int:
+    """Remove top-level NTFS directories the bridge no longer exposes.
+
+    prune_stale_entries() walks INSIDE each exposed root, so it can never
+    remove a root itself. When a whole share is renamed or dropped, its old
+    name therefore stays in the volume forever as a ghost: present in the
+    NTFS view, backed by nothing in ext4.
+
+    The distinction that makes this safe is between absent and unconfigured:
+
+      configured but source missing  the disk may simply not be mounted yet.
+                                     Left alone - removing it is how a late
+                                     LUKS mount turns into a volume that
+                                     looks wiped.
+      not configured at all          the operator is not exposing this name.
+                                     Anything under it can only be left over
+                                     from an earlier layout.
+
+    Windows' own root bookkeeping and everything the overflow dir puts at the
+    root are excluded outright: that is real data the bridge does not own.
+    """
+    try:
+        overflow_names = {n.lower() for n in os.listdir(overflow_dir)} \
+            if overflow_dir and os.path.isdir(overflow_dir) else set()
+    except OSError:
+        overflow_names = set()
+    if not os.path.isdir(source_dir):
+        log("  Prune roots: source_dir unreadable - skipping")
+        return 0
+
+    configured = {n.lower() for n in (configured_roots or [])}
+    candidates = []
+    try:
+        entries = sorted(os.listdir(ntfs_mount))
+    except OSError as e:
+        log(f"  Prune roots: cannot list {ntfs_mount}: {e}")
+        return 0
+    for name in entries:
+        low = name.lower()
+        if low in WINDOWS_ROOT_NAMES or low in configured or low in overflow_names:
+            continue
+        if os.path.lexists(os.path.join(source_dir, name)):
+            # Present in ext4, just not shared. Not a ghost, and not ours to
+            # remove - the operator decides what is exposed, and an unexposed
+            # root that still exists may be exposed again tomorrow.
+            continue
+        path = os.path.join(ntfs_mount, name)
+        if not os.path.isdir(path):
+            continue          # root-level files belong to overflow/Windows
+        candidates.append(name)
+
+    if not candidates:
+        return 0
+    exposed_now = [n for n in configured
+                   if os.path.lexists(os.path.join(source_dir, n))]
+    if not exposed_now:
+        log(f"  Prune roots: REFUSING - no configured root resolves under "
+            f"{source_dir}, so the source looks unavailable, not reorganised")
+        return 0
+
+    removed = 0
+    for name in candidates:
+        path = os.path.join(ntfs_mount, name)
+        try:
+            shutil.rmtree(path)
+            removed += 1
+            log(f"  Prune roots: removed {name} (not an exposed share; "
+                f"ext4 has no such root)")
+        except OSError as e:
+            log(f"  Prune roots: could not remove {name}: {e}")
+    return removed
+
+
 def prune_stale_entries(ntfs_mount: str, source_dir: str, roots, log) -> int:
     """Remove files/dirs under `roots` in the NTFS mount that no longer exist
     under the same root in `source_dir`. Returns how many entries were removed.
@@ -1512,6 +1596,11 @@ class NTFSBridge:
         """
         exposed = [name for name in (self.protected_roots or [])
                    if os.path.lexists(os.path.join(self.source_dir, name))]
+        # Roots the bridge no longer exposes go first: a share renamed at the
+        # source otherwise keeps its old name in the volume forever, backed by
+        # nothing, and every read under it can only fail.
+        prune_unexposed_roots(ntfs_mount, self.source_dir, self.overflow_dir,
+                              self.protected_roots, log)
         prune_stale_entries(ntfs_mount, self.source_dir, exposed, log)
 
     def _post_startup_populate(self):

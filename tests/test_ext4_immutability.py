@@ -55,10 +55,20 @@ class Bridge:
         self.protected_roots = protected_roots
         self.overflow = guard(overflow) if overflow else None
         self.proc = None
+        self.root_entries = []
         self.log_path = os.path.join(SANDBOX, "bridge.log")
 
     def start(self, timeout=600):
         os.makedirs(self.mount, exist_ok=True)
+        if self.protected_roots == "auto":
+            # What an operator would configure right now: every top-level
+            # directory the source actually has. A share renamed since the
+            # last run is named by its new name, and its old name is simply
+            # no longer configured - which is what lets the ghost be pruned.
+            self.protected_roots = ",".join(sorted(
+                d for d in os.listdir(self.source)
+                if os.path.isdir(os.path.join(self.source, d))))
+            log("  roots: %s" % self.protected_roots)
         cmd = [sys.executable, "-m", "ntfs_bridge.bridge",
                "--source", self.source, "--image", self.image,
                "--mount", self.mount, "--port", str(PORT),
@@ -83,8 +93,9 @@ class Bridge:
                         entries = os.listdir(self.mount)
                     except OSError as e:
                         entries = ["<listdir failed: %s>" % e]
+                    self.root_entries = sorted(entries)
                     log("  mounted; %d top-level entries: %s"
-                        % (len(entries), sorted(entries)[:8]))
+                        % (len(entries), self.root_entries[:10]))
                     return True
             except OSError:
                 pass
@@ -141,7 +152,7 @@ def scenario_readonly(args):
 
     b = Bridge(src, os.path.join(SANDBOX, "image.raw"),
                os.path.join(SANDBOX, "mnt"),
-               protected_roots=args.protected_roots)
+               protected_roots=(args.protected_roots or "auto"))
     try:
         b.start()
         log("  reading every file through the NTFS mount...")
@@ -165,7 +176,7 @@ def scenario_stale_restart(args):
     mount = os.path.join(SANDBOX, "mnt")
 
     log("\n-- pass 1: build the image from the tree --")
-    b = Bridge(src, image, mount, protected_roots=args.protected_roots)
+    b = Bridge(src, image, mount, protected_roots=(args.protected_roots or "auto"))
     try:
         b.start()
         read_everything(b.mount)
@@ -196,7 +207,7 @@ def scenario_stale_restart(args):
     before = fs_testkit.manifest(src)
 
     log("\n-- pass 2: restart against the REUSED image --")
-    b = Bridge(src, image, mount, protected_roots=args.protected_roots)
+    b = Bridge(src, image, mount, protected_roots=(args.protected_roots or "auto"))
     try:
         b.start()
         log("  reading every file through the NTFS mount...")
@@ -212,7 +223,27 @@ def scenario_stale_restart(args):
     after = fs_testkit.manifest(src)
     probs = fs_testkit.compare(before, after)
     report("stale-restart", probs, before)
-    return 0 if not probs else 1
+
+    # ext4 being untouched is necessary but not sufficient: the served view
+    # must also stop advertising a share that ext4 no longer has, or every
+    # read under it can only fail.
+    ext4_roots = sorted(d for d in os.listdir(src)
+                        if os.path.isdir(os.path.join(src, d)))
+    served = [e for e in b.root_entries
+              if e.lower() not in ("system volume information", "$recycle.bin",
+                                   ".bzvol", "desktop.ini")]
+    ghosts = [e for e in served if e not in ext4_roots]
+    missing = [e for e in ext4_roots if e not in served]
+    log("")
+    log("  ext4 roots  : %s" % ext4_roots)
+    log("  served roots: %s" % served)
+    if ghosts:
+        log("  GHOST ROOTS still served but absent from ext4: %s" % ghosts)
+    if missing:
+        log("  ext4 roots NOT served: %s" % missing)
+    if not ghosts and not missing:
+        log("  served view matches ext4")
+    return 0 if (not probs and not ghosts and not missing) else 1
 
 
 def report(name, probs, before):
