@@ -231,6 +231,16 @@ class ClusterMapper:
         self.bytes_per_sector = struct.unpack('<H', boot[0x0B:0x0D])[0]
         self.sectors_per_cluster = boot[0x0D]
         self.cluster_size = self.bytes_per_sector * self.sectors_per_cluster
+        # The VOLUME's cluster count, from the boot sector - not the image's.
+        # The image is rounded up to a whole cluster and can therefore be one
+        # cluster longer than the volume it carries. $Bitmap is rounded up too,
+        # and NTFS deliberately sets the trailing pad bits to "in use" so those
+        # non-existent clusters are never allocated. Treating a pad bit as a
+        # real allocation makes the volume's tail look like data we have lost.
+        _total_sectors = struct.unpack('<Q', boot[0x28:0x30])[0]
+        self.volume_total_clusters = (
+            _total_sectors // self.sectors_per_cluster
+            if self.sectors_per_cluster else 0)
         self.mft_cluster = struct.unpack('<Q', boot[0x30:0x38])[0]
         self.mft_offset = self.mft_cluster * self.cluster_size
         self._mft_runs, self._mft_total_records = self._get_mft_runs()
@@ -1994,6 +2004,13 @@ class ClusterMapper:
         """
         bitmap = self._bitmap_cache
         if not bitmap:
+            return False
+        # Past the end of the volume there is no cluster to allocate. $Bitmap
+        # still has bits there - rounded up to a whole cluster, and set to 1 by
+        # convention - and reading the backup boot sector at the volume tail
+        # lands exactly on one of them.
+        total = getattr(self, 'volume_total_clusters', 0)
+        if total and cluster >= total:
             return False
         byte_i, bit = divmod(cluster, 8)
         if byte_i >= len(bitmap):

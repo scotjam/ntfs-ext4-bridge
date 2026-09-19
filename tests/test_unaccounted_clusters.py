@@ -77,6 +77,9 @@ def make_mapper():
     for c in (ALLOC_EMPTY, ALLOC_STALE, META_STALE, ALLOC_WRITTEN):
         bitmap[c // 8] |= 1 << (c % 8)
     m._bitmap_cache = bitmap
+    # The volume is one cluster shorter than the image, as a real one is.
+    m.volume_total_clusters = NCLUSTERS - 1
+    m.sectors_per_cluster = 8
 
     # Plausible leftover content in the two "stale" clusters.
     for c in (ALLOC_STALE, META_STALE):
@@ -136,7 +139,15 @@ def main():
                 m3._cluster_is_allocated(ALLOC_EMPTY) is False)
     ok &= expect_served(m3, ALLOC_EMPTY, "read still succeeds during startup")
 
-    print("\n[7] reported once per cluster")
+    print("\n[7] the cluster past the end of the volume")
+    m5 = make_mapper()
+    tail = NCLUSTERS - 1          # exists in the image, not in the volume
+    m5._bitmap_cache[tail // 8] |= 1 << (tail % 8)   # $Bitmap pad bit, set by convention
+    ok &= check("pad bit past the volume end is not an allocation",
+                m5._cluster_is_allocated(tail) is False)
+    ok &= expect_served(m5, tail, "volume tail still readable (backup boot sector)")
+
+    print("\n[8] reported once per cluster")
     m4 = make_mapper()
     for _ in range(4):
         try:
