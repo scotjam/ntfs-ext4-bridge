@@ -5214,16 +5214,23 @@ class ClusterMapper:
 
         # --- Phase 2: slow filesystem op outside the lock ---
         if do_move:
-            parent_dir = os.path.dirname(new_path)
-            if parent_dir and not os.path.exists(parent_dir):
-                try:
-                    os.makedirs(parent_dir, exist_ok=True)
-                except OSError:
-                    pass
+            # Decide BEFORE creating anything. Creating the destination's
+            # parent and only then asking whether the move is allowed leaves
+            # the directory behind when the answer is no: a stale image naming
+            # a directory ext4 no longer has gets it recreated, one refused
+            # rename at a time, which is how a renamed tree came back from the
+            # dead as an empty shell.
+            refused = (self._refuse_ext4_mutation(old_source, 'file rename',
+                                                  os.path.basename(old_source))
+                       or self._refuse_ext4_mutation(new_path, 'file rename', filename))
             try:
-                if not (self._refuse_ext4_mutation(old_source, 'file rename',
-                                                   os.path.basename(old_source))
-                        or self._refuse_ext4_mutation(new_path, 'file rename', filename)):
+                if not refused:
+                    parent_dir = os.path.dirname(new_path)
+                    if parent_dir and not os.path.exists(parent_dir):
+                        try:
+                            os.makedirs(parent_dir, exist_ok=True)
+                        except OSError:
+                            pass
                     shutil.move(old_source, new_path)
                     log(f"  FILE RENAMED: {os.path.basename(old_source)} -> {filename}")
             except OSError as e:
