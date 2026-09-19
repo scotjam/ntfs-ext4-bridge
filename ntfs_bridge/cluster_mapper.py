@@ -631,24 +631,41 @@ class ClusterMapper:
                 chunk = self.image[byte_offset:byte_offset + chunk_len]
 
                 # Nothing mapped this cluster, so the bytes here are whatever
-                # the image happens to hold. If $Bitmap says the cluster is IN
-                # USE and the image holds nothing but zeros, we do not know
-                # what belongs here and must not invent it: that is how
-                # ntfs-3g came to read "magic: 0x00000000" for an index block,
-                # declare the directory corrupt, and "repair" it -- with the
-                # repair flowing back through reconciliation into ext4 as
-                # deletions and zero-filled rewrites. An allocated cluster we
-                # cannot account for is an I/O error, not a hole.
-                if (not meta and chunk and not any(chunk)
+                # the image happens to hold. Ownership, not content, decides
+                # whether that is legitimate:
+                #
+                #   metadata          -> the image IS authoritative. NTFS
+                #                        structure lives here, and
+                #                        _collect_metadata_clusters() covers
+                #                        the system files, every directory
+                #                        (so $INDEX_ALLOCATION blocks too),
+                #                        extension records and named streams.
+                #   guest-written     -> a client write to an unmapped cluster
+                #                        lands in the image (see the else branch
+                #                        of _write_inner), so those bytes are
+                #                        the client's own and must be returned.
+                #   free in $Bitmap   -> a hole, and zeros are the truth.
+                #   anything else     -> file data that ext4 owns and we have
+                #                        lost track of. We cannot say what
+                #                        belongs here, so we must not answer.
+                #
+                # Testing the content instead ("is it all zeros?") only caught
+                # the case where the image had never been populated. A cluster
+                # left unmapped mid-rescan or mid-reparse still holds its
+                # previous, plausible-looking bytes, and serving those is the
+                # same silent corruption wearing a better disguise.
+                if (not meta
+                        and not self._is_guest_written(cluster)
                         and self._cluster_is_allocated(cluster)):
                     if cluster not in self._unmapped_reported:
                         self._unmapped_reported.add(cluster)
                         log(f"READ FAILED (EIO to client): cluster {cluster} is "
-                            f"allocated in $Bitmap but unmapped and empty in the "
-                            f"image - refusing to serve fabricated zeros")
+                            f"allocated in $Bitmap but nothing maps it and no "
+                            f"client wrote it - refusing to serve bytes we "
+                            f"cannot account for")
                     raise IOError(
-                        f"allocated cluster {cluster} is unmapped; refusing to "
-                        f"serve zeros as valid data")
+                        f"allocated cluster {cluster} is unmapped and unwritten; "
+                        f"refusing to serve unaccounted bytes as valid data")
 
                 result[pos:pos + chunk_len] = chunk
                 pos += chunk_len
