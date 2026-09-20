@@ -217,6 +217,120 @@ def cmd_verify():
     return 0 if ok else 1
 
 
+def _upper_snapshot():
+    """Everything currently in the upperdir, with whiteouts called out.
+
+    My own mutations land here too, so the bridge's writes can only be seen as
+    a DIFFERENCE against the state right after those mutations.
+    """
+    files, whiteouts = {}, set()
+    for dp, dn, fn in os.walk(UPPER):
+        for name in fn:
+            p = os.path.join(dp, name)
+            rel = os.path.relpath(p, UPPER)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISCHR(st.st_mode) and os.major(st.st_rdev) == 0 \
+                    and os.minor(st.st_rdev) == 0:
+                whiteouts.add(rel)
+            else:
+                files[rel] = st.st_size
+    return files, whiteouts
+
+
+def cmd_stale():
+    """Restart against a reused image after the library changed underneath.
+
+    This is the shape that actually destroyed data: the image describes the
+    tree as it was, reconciliation decides ext4 disagrees, and it "repairs"
+    ext4 to match. Every mutation below lands in the overlay upper layer, so
+    the real library is never altered even while the bridge is told it was.
+    """
+    share = os.path.join(MERGED)
+    if not os.path.exists(IMAGE):
+        raise SystemExit("no image at %s - run 'run' first so there is a "
+                         "reused image to go stale" % IMAGE)
+    before_lower = stat_manifest(LOWER)
+    log("library baseline: %d files" % len(before_lower))
+
+    log("")
+    log("-- changing the served tree underneath the stopped bridge --")
+    changed = []
+    tops = sorted(d for d in os.listdir(share)
+                  if os.path.isdir(os.path.join(share, d)))
+    if len(tops) < 3:
+        raise SystemExit("need at least 3 top-level shows to mutate")
+
+    victim_dir = os.path.join(share, tops[1])
+    shutil.rmtree(victim_dir)
+    changed.append(("deleted dir", tops[1]))
+
+    some_files = []
+    for dp, dn, fn in os.walk(os.path.join(share, tops[0])):
+        for name in sorted(fn):
+            some_files.append(os.path.join(dp, name))
+        if len(some_files) >= 4:
+            break
+    if len(some_files) >= 3:
+        os.remove(some_files[0])
+        changed.append(("deleted file", os.path.relpath(some_files[0], share)))
+        os.rename(some_files[1], some_files[1] + ".renamed")
+        changed.append(("renamed file", os.path.relpath(some_files[1], share)))
+        with open(some_files[2], "r+b") as f:
+            f.truncate(4096)
+        changed.append(("truncated", os.path.relpath(some_files[2], share)))
+
+    added = os.path.join(share, tops[2], "added_while_down.bin")
+    with open(added, "wb") as f:
+        f.write(b"added while the bridge was down" * 1000)
+    changed.append(("added file", os.path.relpath(added, share)))
+
+    for what, rel in changed:
+        log("     %-14s %s" % (what, rel))
+
+    base_files, base_whiteouts = _upper_snapshot()
+    log("")
+    log("upper after my changes: %d files, %d whiteouts" %
+        (len(base_files), len(base_whiteouts)))
+
+    log("")
+    log("-- restarting against the REUSED image --")
+    cmd_run()
+
+    after_lower = stat_manifest(LOWER)
+    probs = diff_manifest(before_lower, after_lower)
+    now_files, now_whiteouts = _upper_snapshot()
+    new_files = {k: v for k, v in now_files.items() if k not in base_files
+                 or base_files[k] != v}
+    new_whiteouts = now_whiteouts - base_whiteouts
+
+    log("")
+    if probs:
+        log("REAL LIBRARY CHANGED - %d problem(s):" % len(probs))
+        for k, rel, d in probs[:40]:
+            log("   %-12s %-58s %s" % (k, rel[:58], d))
+    else:
+        log("REAL LIBRARY UNCHANGED: %d files, every stat field identical"
+            % len(before_lower))
+
+    log("")
+    log("what the BRIDGE wrote, beyond my own changes:")
+    log("   files written or altered : %d" % len(new_files))
+    for rel, sz in sorted(new_files.items())[:30]:
+        log("      %12d  %s" % (sz, rel))
+    log("   deletions attempted      : %d" % len(new_whiteouts))
+    for rel in sorted(new_whiteouts)[:30]:
+        log("      %s" % rel)
+
+    ok = not probs and not new_files and not new_whiteouts
+    log("")
+    log("VERDICT: %s" % ("the stale image drove no write into ext4" if ok
+                         else "see above"))
+    return 0 if ok else 1
+
+
 def cmd_teardown():
     run(["umount", "-l", MERGED])
     log("overlay unmounted (upperdir kept at %s for inspection)" % UPPER)
@@ -227,7 +341,8 @@ def main():
         print(__doc__)
         return 2
     return {"setup": cmd_setup, "run": cmd_run,
-            "verify": cmd_verify, "teardown": cmd_teardown}[sys.argv[1]]() or 0
+            "verify": cmd_verify, "stale": cmd_stale,
+            "teardown": cmd_teardown}[sys.argv[1]]() or 0
 
 
 if __name__ == "__main__":
