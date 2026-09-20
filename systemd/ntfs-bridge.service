@@ -15,7 +15,13 @@
 Description=NTFS-ext4 bridge (NBD server)
 After=local-fs.target network-online.target
 Wants=network-online.target
+# One line per filesystem. A source dir of symlinks usually spans more
+# than one disk, and listing only some of them is the easy mistake.
+# The bridge no longer depends on getting this right: it waits for its
+# own source roots to resolve (--source-wait, default 300s). These
+# lines still help systemd order the start without the bridge spinning.
 RequiresMountsFor=/srv/CHANGE-ME-data-mount
+#RequiresMountsFor=/srv/CHANGE-ME-second-data-mount
 Before=libvirtd.service
 
 [Service]

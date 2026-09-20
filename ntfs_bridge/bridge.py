@@ -214,6 +214,7 @@ class NTFSBridge:
                  image_size_mb: int = 256,
                  lazy_alloc: bool = False,
                  dealloc_timeout: float = 60.0,
+                 source_wait: float = 300.0,
                  partitioned: bool = False,
                  virtual_mode: bool = False,
                  overflow_dir=None,
@@ -227,6 +228,7 @@ class NTFSBridge:
         self.image_size_mb = image_size_mb
         self.lazy_alloc = lazy_alloc
         self.dealloc_timeout = dealloc_timeout
+        self.source_wait = source_wait
         self.partitioned = partitioned
         self.overflow_dir = overflow_dir
         self.virtual_mode = virtual_mode
@@ -243,6 +245,47 @@ class NTFSBridge:
         self._nbd_thread = None
         self._stopping = False
 
+    def _dangling_source_roots(self):
+        """Top-level source entries that are symlinks pointing nowhere."""
+        out = []
+        try:
+            entries = sorted(os.listdir(self.source_dir))
+        except OSError as e:
+            log(f"FATAL: cannot read source directory {self.source_dir}: {e}")
+            sys.exit(1)
+        for entry in entries:
+            full = os.path.join(self.source_dir, entry)
+            if os.path.islink(full) and not os.path.exists(full):
+                out.append(f"{entry} -> {os.readlink(full)}")
+        return out
+
+    def _wait_for_source_roots(self):
+        """Block until every source root resolves, or the wait runs out.
+
+        Generic by construction: it asks the source directory what it points
+        at rather than being told which filesystems to expect, so it behaves
+        the same whether the data is on one disk or five, local or encrypted,
+        and needs no change when a share is added.
+        """
+        if self.source_wait <= 0:
+            return
+        dangling = self._dangling_source_roots()
+        if not dangling:
+            return
+        log(f"Source roots not resolvable yet ({len(dangling)}): waiting up to "
+            f"{self.source_wait}s for the data to appear")
+        for d in dangling:
+            log(f"  waiting on: {d}")
+        deadline = time.time() + self.source_wait
+        while time.time() < deadline:
+            time.sleep(2)
+            dangling = self._dangling_source_roots()
+            if not dangling:
+                log(f"All source roots resolved after "
+                    f"{int(self.source_wait - (deadline - time.time()))}s")
+                return
+        log(f"Source roots still unresolved after {self.source_wait}s")
+
     def setup(self):
         """Set up the bridge: create image, populate it, initialize components."""
         log(f"Source directory: {self.source_dir}")
@@ -254,16 +297,27 @@ class NTFSBridge:
             log(f"ERROR: Source directory does not exist: {self.source_dir}")
             sys.exit(1)
 
+        # Wait for the source roots to resolve before deciding anything.
+        #
+        # RequiresMountsFor= in the unit solves this only for the mounts an
+        # operator remembered to list: a source dir of symlinks usually spans
+        # several disks, and listing one of them is the easy mistake - the
+        # bridge then starts while another is still unmounted and aborts,
+        # instead of simply waiting. Waiting here needs no per-machine
+        # configuration and covers any number of disks, encrypted or not,
+        # however the source is laid out.
+        #
+        # Bounded, because waiting forever for a disk that is never coming
+        # back is its own failure. When the wait runs out the existing guard
+        # below still refuses to serve.
+        self._wait_for_source_roots()
+
         # Refuse to start with dangling source symlinks. If the bridge starts
         # before the data disk is mounted (boot ordering), every top-level
         # symlink is dangling, the MFT scan maps nothing to ext4, and the
         # whole volume silently reads as zeros — which a backup client would
         # upload as valid data. Better to fail hard here.
-        dangling = []
-        for entry in sorted(os.listdir(self.source_dir)):
-            full = os.path.join(self.source_dir, entry)
-            if os.path.islink(full) and not os.path.exists(full):
-                dangling.append(f"{entry} -> {os.readlink(full)}")
+        dangling = self._dangling_source_roots()
         if dangling:
             log("FATAL: source directory has dangling symlinks (data disk "
                 "not mounted yet?). Refusing to serve a volume that would "
@@ -1813,6 +1867,11 @@ def main():
                         help='Enable lazy allocation for large files (saves disk space)')
     parser.add_argument('--dealloc-timeout', type=float, default=60.0,
                         help='Seconds after last read before deallocating (default: 60)')
+    parser.add_argument('--source-wait', type=float, default=300.0,
+                        help='Seconds to wait for source roots to '
+                             'resolve before giving up, for data disks '
+                             'that mount late. 0 disables waiting '
+                             '(default: 300)')
     parser.add_argument('--partitioned', action='store_true',
                         help='Add MBR partition table (required for Windows VM)')
     parser.add_argument('--virtual', action='store_true',
@@ -1849,6 +1908,7 @@ def main():
         image_size_mb=args.size,
         lazy_alloc=args.lazy,
         dealloc_timeout=args.dealloc_timeout,
+        source_wait=args.source_wait,
         partitioned=args.partitioned,
         virtual_mode=args.virtual,
         overflow_dir=args.overflow_dir,
