@@ -23,9 +23,20 @@ def main():
     src = open(BRIDGE, encoding='utf-8').read()
     setup = body_of(src, 'setup')
 
-    # 1. Every ntfsfix that runs after the mapper exists is followed by reload().
+    # The pre-allocation block moved out of setup() into a helper when the
+    # two-way branch landed. The ORDER is what matters and it has to be proven
+    # in two places now, not assumed: the helper must be CALLED after the
+    # mapper exists, and INSIDE the helper ntfsfix must be followed by reload.
+    # Concatenating the bodies would let both pass even if the call were
+    # moved above the mapper, so check the call site explicitly.
     mapper_at = setup.index('self.mapper = ClusterMapper(')
-    after = setup[mapper_at:]
+    helper = '_allocate_new_sparse_files'
+    call_at = setup.find('self.%s()' % helper)
+    assert call_at != -1, "expected setup() to call %s()" % helper
+    assert call_at > mapper_at, (
+        "%s() is called BEFORE the mapper exists; its ntfsfix would then "
+        "run with no hot cache to reload" % helper)
+    after = setup[mapper_at:] + body_of(src, helper)
     fixes = [m.start() for m in re.finditer(r"\['ntfsfix', self\.image_path\]", after)]
     assert fixes, "expected a post-alloc ntfsfix in setup(); did it move?"
     for pos in fixes:
