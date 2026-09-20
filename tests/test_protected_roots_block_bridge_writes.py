@@ -48,6 +48,12 @@ def make_mapper(source_dir, image):
     m.overflow_dir = source_dir
     m._mft_runs = [(0, TOTAL_RECORDS * MFT_RECORD_SIZE)]
     m._protected_top_dirs = {"media"}
+    # safe mode came in with the two-way branch; these harnesses build
+    # mappers via __new__, so the attributes it reads must be set here too.
+    m._safe_mode = False
+    m._windows_created_sources = set()
+    m._file_mft_seq = {}
+    m._dir_mft_seq = {}
     m._protect_refused = set()
     m.ext4_authoritative = False
     m.mft_record_to_source = {}

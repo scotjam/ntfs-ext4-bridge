@@ -41,6 +41,10 @@ def make_mapper(tmp="/tmp"):
     m.cluster_map = {}
     m._direct_run_map = []
     m._protected_top_dirs = set()
+    # safe mode came in with the two-way branch; these harnesses build
+    # mappers via __new__, so the attributes it reads must be set here too.
+    m._safe_mode = False
+    m._windows_created_sources = set()
     m._protect_refused = set()
     m._materialize_refused = set()
     m._guest_written = bytearray()

@@ -30,6 +30,13 @@ EVENT_DELETE = 'delete'
 EVENT_MODIFY = 'modify'
 EVENT_MOVED_FROM = 'moved_from'
 EVENT_MOVED_TO = 'moved_to'
+# Emitted only when the watcher is created with move_events=True. The
+# callback payload is a (old_rel_path, new_rel_path) tuple, not a string.
+EVENT_MOVE = 'move'
+
+# Unmatched IN_MOVED_FROM cookies older than this become plain deletes
+# (the destination was outside the watched tree).
+MOVE_PAIR_TIMEOUT = 2.0
 
 
 class FileWatcher:
@@ -40,16 +47,23 @@ class FileWatcher:
 
     DEBOUNCE_MS = 100  # Debounce window in milliseconds
 
-    def __init__(self, watch_dir: str, callback: Callable[[str, str], None]):
+    def __init__(self, watch_dir: str, callback: Callable[[str, str], None],
+                 move_events: bool = False):
         """
         Initialize the file watcher.
 
         Args:
             watch_dir: Root directory to watch (recursively)
-            callback: Function called with (event_type, rel_path) on changes
+            callback: Function called with (event_type, rel_path) on changes.
+                With move_events=True, EVENT_MOVE is also delivered and its
+                payload is an (old_rel, new_rel) tuple.
+            move_events: Pair IN_MOVED_FROM/TO cookies into true EVENT_MOVE
+                events instead of synthesizing delete+create. Unpaired halves
+                degrade to delete/create after MOVE_PAIR_TIMEOUT.
         """
         self.watch_dir = os.path.abspath(watch_dir)
         self.callback = callback
+        self.move_events = move_events
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -58,8 +72,10 @@ class FileWatcher:
         self._pending_events: Dict[str, tuple] = {}
         self._debounce_thread: Optional[threading.Thread] = None
 
-        # Track move cookies to pair IN_MOVED_FROM/TO events
-        self._move_cookies: Dict[int, str] = {}
+        # Track move cookies to pair IN_MOVED_FROM/TO events.
+        # move_events=False: cookie -> old_rel (informational only)
+        # move_events=True:  cookie -> (old_rel, timestamp) awaiting its TO
+        self._move_cookies: Dict[int, object] = {}
 
         if not INOTIFY_AVAILABLE:
             log("WARNING: inotify not available - file watching disabled")
@@ -153,16 +169,31 @@ class FileWatcher:
             log(f"File created/modified: {rel_path}")
 
         elif 'IN_MOVED_FROM' in type_names:
-            # Start of a move operation
             cookie = raw_event[0].cookie if hasattr(raw_event[0], 'cookie') else 0
+            if self.move_events and cookie:
+                # Hold for pairing with the matching IN_MOVED_TO; the
+                # debounce loop reaps unmatched cookies into deletes.
+                with self._lock:
+                    self._move_cookies[cookie] = (rel_path, time.time())
+                log(f"Move from (pending pair): {rel_path}")
+                return
             self._move_cookies[cookie] = rel_path
             event_type = EVENT_DELETE  # Treat as delete from old location
             log(f"Move from: {rel_path}")
 
         elif 'IN_MOVED_TO' in type_names:
-            # End of a move operation
             cookie = raw_event[0].cookie if hasattr(raw_event[0], 'cookie') else 0
-            old_path = self._move_cookies.pop(cookie, None)
+            with self._lock:
+                old_entry = self._move_cookies.pop(cookie, None)
+            if self.move_events and isinstance(old_entry, tuple):
+                old_path = old_entry[0]
+                log(f"Move: {old_path} -> {rel_path}")
+                try:
+                    self.callback(EVENT_MOVE, (old_path, rel_path))
+                except Exception as e:
+                    log(f"Callback error for move {rel_path}: {e}")
+                return
+            old_path = old_entry
             event_type = EVENT_CREATE  # Treat as create at new location
             log(f"Move to: {rel_path} (from {old_path})")
 
@@ -207,6 +238,16 @@ class FileWatcher:
 
                 for path in paths_to_remove:
                     del self._pending_events[path]
+
+                # Reap unmatched IN_MOVED_FROM cookies (move_events mode):
+                # the destination was outside the tree -> plain delete.
+                if self.move_events:
+                    for cookie in list(self._move_cookies):
+                        entry = self._move_cookies[cookie]
+                        if (isinstance(entry, tuple)
+                                and now - entry[1] > MOVE_PAIR_TIMEOUT):
+                            del self._move_cookies[cookie]
+                            events_to_fire.append((entry[0], EVENT_DELETE))
 
             # Fire events outside the lock
             for path, event_type in events_to_fire:
@@ -330,12 +371,16 @@ class PollingFileWatcher:
                         log(f"Callback error for delete {path}: {e}")
 
 
-def create_watcher(watch_dir: str, callback: Callable[[str, str], None]) -> 'FileWatcher | PollingFileWatcher':
+def create_watcher(watch_dir: str, callback: Callable[[str, str], None],
+                   move_events: bool = False) -> 'FileWatcher | PollingFileWatcher':
     """Create the best available file watcher for the platform.
 
     Returns an inotify-based watcher on Linux, or a polling watcher elsewhere.
     For WSL /mnt paths (Windows filesystem), always use polling since inotify
     doesn't work across the 9p/drvfs mount boundary.
+
+    move_events=True enables true EVENT_MOVE events (inotify watcher only;
+    the polling watcher can't detect renames and keeps delete+create).
     """
     # Use polling for WSL /mnt paths (Windows filesystem doesn't trigger inotify)
     if watch_dir.startswith('/mnt/'):
@@ -343,7 +388,7 @@ def create_watcher(watch_dir: str, callback: Callable[[str, str], None]) -> 'Fil
         return PollingFileWatcher(watch_dir, callback)
 
     if INOTIFY_AVAILABLE:
-        return FileWatcher(watch_dir, callback)
+        return FileWatcher(watch_dir, callback, move_events=move_events)
     else:
         log("Using polling watcher (inotify not available)")
         return PollingFileWatcher(watch_dir, callback)

@@ -56,6 +56,10 @@ def make_mapper(image):
     m.dir_indx_clusters = set()
     m._direct_allocated_records = set()
     m._protected_top_dirs = set()
+    # safe mode came in with the two-way branch; these harnesses build
+    # mappers via __new__, so the attributes it reads must be set here too.
+    m._safe_mode = False
+    m._windows_created_sources = set()
     m._protected_ia_sizes = {}
     m._ia_protect_warned = set()
     m._mft_mirror_offset = -1
@@ -120,6 +124,9 @@ def main():
     m = make_mapper(image)
     m.protect_ia_size(REC_NUM, IA_OFF, TARGET_DS, IB_OFF, IB_VAL_OFF, BITMAP)
     rec = add_nonresident_bitmap(base_record())
+    # Windows shrank data_size: the corruption case, and the only path on
+    # which the protected bitmap is written back at all.
+    struct.pack_into("<Q", rec, IA_OFF + 48, 512)
     off = run_write(m, rec)
 
     alloc = struct.unpack_from("<Q", image, off + IB_OFF + 40)[0]

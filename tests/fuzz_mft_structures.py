@@ -48,6 +48,10 @@ def make_mapper():
     m.dir_indx_clusters = set()
     m._direct_allocated_records = set()
     m._protected_top_dirs = set()
+    # safe mode came in with the two-way branch; these harnesses build
+    # mappers via __new__, so the attributes it reads must be set here too.
+    m._safe_mode = False
+    m._windows_created_sources = set()
     m._protect_refused = set()
     m._protected_ia_sizes = {}
     m._ia_protect_warned = set()

@@ -18,6 +18,6 @@ scp -r "$LOCAL_DIR/tests" $SERVER:$REMOTE_DIR/
 scp -r "$LOCAL_DIR/scripts" $SERVER:$REMOTE_DIR/
 
 echo "Running tests on server..."
-ssh $SERVER "cd $REMOTE_DIR && python3 tests/test_synthesizer.py"
+ssh $SERVER "cd $REMOTE_DIR && python3 -m pytest tests/ -q"
 
 echo "Done!"

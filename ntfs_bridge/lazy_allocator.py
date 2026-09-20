@@ -309,7 +309,7 @@ class LazyAllocator:
                 self.deallocate_file(rel_path)
 
     def create_sparse_file(self, rel_path: str, source_path: str) -> bool:
-        """DISABLED — see SyncDaemon._sync_create_file for context.
+        """DISABLED — writing file content through the local ntfs-3g mount corrupted source files (the SyncDaemon that motivated this is now removed).
 
         The previous implementation opened `ntfs_path` (the FUSE mount
         path) in 'wb' mode and then sparse-extended it. The bridge's

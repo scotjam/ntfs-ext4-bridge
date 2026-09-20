@@ -11,6 +11,7 @@ Supports lazy allocation: large files can start as sparse (no clusters),
 get allocated on first read, and deallocated after a timeout.
 """
 import bisect
+import errno
 import mmap
 import os
 import queue
@@ -20,6 +21,8 @@ import threading
 import time
 import traceback
 from typing import Dict, Iterable, List, Tuple, Optional, Set, TYPE_CHECKING
+
+from . import mft_op_journal
 
 if TYPE_CHECKING:
     from .lazy_allocator import LazyAllocator
@@ -55,12 +58,30 @@ class _HotImageCache:
     flush() writes the hot bytearray back to the mmap and syncs to disk.
     """
 
+    # Track beyond-hot writes in coarse aligned chunks so a durability
+    # barrier (NBD FLUSH) can msync exactly what changed, instead of either
+    # only the 64MB hot region (loses metadata on a multi-TB volume) or the
+    # whole multi-TB mapping (too slow, trips the WNBD 30s timeout).
+    _DIRTY_CHUNK = 1 << 20  # 1 MiB, page-aligned
+
     def __init__(self, mm: mmap.mmap, hot_size: int):
         self._mm = mm
         self._hot_size = min(hot_size, len(mm))
         log(f"Loading {self._hot_size // (1024 * 1024)}MB image metadata into RAM...")
         self._hot = bytearray(mm[:self._hot_size])
+        self._dirty_chunks = set()   # chunk indices written beyond hot_size
+        self._hot_dirty = False      # hot region has unflushed changes
         log("Image metadata cached (reads/writes are now RAM-speed)")
+
+    def _mark_dirty(self, start, stop):
+        if start < self._hot_size:
+            self._hot_dirty = True
+        beyond_start = max(start, self._hot_size)
+        if beyond_start < stop:
+            c0 = beyond_start // self._DIRTY_CHUNK
+            c1 = (stop - 1) // self._DIRTY_CHUNK
+            for c in range(c0, c1 + 1):
+                self._dirty_chunks.add(c)
 
     def __len__(self) -> int:
         return len(self._mm)
@@ -78,6 +99,7 @@ class _HotImageCache:
     def __setitem__(self, s: slice, value: bytes):
         start = s.start if s.start is not None else 0
         stop = s.stop if s.stop is not None else start + len(value)
+        self._mark_dirty(start, stop)
         if stop <= self._hot_size:
             self._hot[start:stop] = value
         elif start >= self._hot_size:
@@ -93,9 +115,37 @@ class _HotImageCache:
         self._hot = bytearray(self._mm[:self._hot_size])
 
     def flush(self):
-        """Flush hot cache to mmap and sync to disk."""
+        """Durability barrier: msync the hot region AND every beyond-hot
+        chunk written since the last flush.
+
+        The hot 64MB alone is not enough on a multi-TB volume — MFT records,
+        $Bitmap, and directory INDX blocks live beyond it. Syncing only the
+        dirty chunks keeps this fast enough for the WNBD 30s I/O timeout
+        while still making all acknowledged metadata durable.
+        """
         self._mm[:self._hot_size] = bytes(self._hot)
         self._mm.flush(0, self._hot_size)
+        self._hot_dirty = False
+        if self._dirty_chunks:
+            total = len(self._mm)
+            for c in sorted(self._dirty_chunks):
+                off = c * self._DIRTY_CHUNK
+                size = min(self._DIRTY_CHUNK, total - off)
+                if size > 0:
+                    self._mm.flush(off, size)
+            self._dirty_chunks.clear()
+
+    def flush_all(self):
+        """Flush hot cache to mmap and msync the ENTIRE image to disk.
+
+        Used before an offline ntfs-3g mount (the consistency gate), where
+        the whole image must be on disk and the guest is offline so the
+        cost of a full msync is acceptable.
+        """
+        self._mm[:self._hot_size] = bytes(self._hot)
+        self._mm.flush()
+        self._hot_dirty = False
+        self._dirty_chunks.clear()
 
     def close(self):
         self._mm.close()
@@ -165,9 +215,29 @@ class ClusterMapper:
 
     def __init__(self, image_path: str, source_dir: str,
                  overflow_dir: Optional[str] = None,
-                 protected_roots: Optional[Iterable[str]] = None):
+                 protected_roots: Optional[Iterable[str]] = None,
+                 roots: Optional[Iterable[str]] = None,
+                 safe_mode: bool = False):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
+
+        # Safe mode (--safe-mode). One-way read of the whole ext4 tree, plus
+        # write access ONLY to objects Windows creates itself this session.
+        # Every file and directory that already existed in ext4 is strictly
+        # read-only at the bridge: writes to their MFT records and data
+        # clusters are dropped. Because every pre-existing directory is
+        # read-only, Windows can only insert new entries into the volume root
+        # (the one writable existing directory) or into its own freshly
+        # created subdirectories — so new content can only attach at the root.
+        # Guarantee: existing ext4 data can never be corrupted; the only files
+        # at risk are the ones Windows created in the root. No guest agent or
+        # consistency gate is involved. See _is_source_protected /
+        # _is_record_protected for the enforcement, keyed on the set below.
+        self._safe_mode = bool(safe_mode)
+        # Absolute source paths the bridge itself created for Windows this
+        # session (via _check_new_file / _check_new_directory). In safe mode
+        # these are the ONLY writable source objects.
+        self._windows_created_sources: Set[str] = set()
 
         # Top-level subdirectories of source_dir whose contents are presented
         # read-only at the bridge level. Writes that target an MFT record
@@ -200,22 +270,37 @@ class ClusterMapper:
         self._real_roots = frozenset()
 
         # Known top-level entries in the source directory (for root path
-        # resolution). protected_roots is the authoritative allowlist: only
-        # source_dir top-level entries named there are recognised. Anything
-        # else at source_dir root is ignored, and _resolve_source_path
-        # consequently routes its rel_paths to overflow_dir. When
-        # protected_roots is empty, source_dir contributes nothing -- a
-        # misconfigured bridge can't accidentally expose shares.
+        # resolution). `roots` is the exposure allowlist: only source_dir
+        # top-level entries named there are recognised. Anything else at
+        # source_dir root is ignored, and _resolve_source_path consequently
+        # routes its rel_paths to overflow_dir. Exposure (roots) is
+        # independent of write-protection (protected_roots); when `roots`
+        # is not given, it falls back to protected_roots for backwards
+        # compatibility. When both are empty, source_dir contributes
+        # nothing -- a misconfigured bridge can't accidentally expose shares.
+        self._exposed_top_dirs: Set[str] = set()
+        if roots:
+            self._exposed_top_dirs = {r.lower() for r in roots if r}
+        else:
+            self._exposed_top_dirs = set(self._protected_top_dirs)
         self.known_root_entries: Set[str] = set()
-        if self._protected_top_dirs:
+        if self._exposed_top_dirs:
             try:
                 entries = set(os.listdir(self.source_dir))
             except OSError:
                 entries = set()
             self.known_root_entries = {
                 name for name in entries
-                if name.lower() in self._protected_top_dirs
+                if name.lower() in self._exposed_top_dirs
             }
+
+        # Realpath whitelist for _validate_path. Top-level share entries are
+        # commonly symlinks to other filesystems; realpath() resolves through
+        # them, so containment must be checked against the resolved TARGETS,
+        # not just source_dir itself (otherwise every path under a symlinked
+        # share is rejected as traversal).
+        self._allowed_realpath_roots: Set[str] = set()
+        self._recompute_allowed_roots()
 
         # Memory-map the image file, then wrap with a hot RAM cache.
         # The hot cache keeps the first 64MB in a bytearray so NTFS metadata
@@ -258,6 +343,10 @@ class ClusterMapper:
         # entity.  If it changes, _check_directory_rename is looking at a
         # recycled record – not a rename – and must not move anything.
         self._dir_mft_seq: Dict[int, int] = {}
+        # MFT sequence numbers of tracked FILE records; mirrors
+        # _dir_mft_seq and guards against record-slot recycling being
+        # misread as a rename (which would shutil.move the wrong file).
+        self._file_mft_seq: Dict[int, int] = {}
         self.dir_children: Dict[int, Set[int]] = {}
         self.removed_mft_records: Set[int] = set()
 
@@ -271,14 +360,41 @@ class ClusterMapper:
         # Thread safety
         self.lock = threading.RLock()
 
-        # Background MFT sync queue: write() puts (offset, data) here so that
-        # the NBD reply goes out immediately; ext4 operations run asynchronously.
+        # ext4 source files written since the last durability barrier. On an
+        # NBD FLUSH these get fsync'd so acknowledged file data is actually on
+        # disk (a plain write() leaves it in ext4 page cache). Add is
+        # GIL-atomic; the barrier snapshots+clears under self.lock.
+        self._dirty_sources: Set[str] = set()
+
+        # Consistency-gate quiescence. While set, the image is being modified
+        # offline (ntfs-3g apply with the guest disk offline): writes are
+        # refused with EROFS and all reads serialize behind self.lock so
+        # nothing races _scan_mft's map rebuild. There should be no I/O at
+        # all during a gate (the guest disk is offline); this is a hard guard.
+        self.gate_active = threading.Event()
+
+        # Set while _scan_mft clears+rebuilds the cluster maps (rescan_mft).
+        # Reads serialize behind self.lock while set so a lockless data read
+        # can't observe the maps mid-rebuild (and serve zeros for a mapped
+        # cluster). Unlike gate_active it does NOT block writes.
+        self._map_rebuild = threading.Event()
+
+        # Persistent MFT->ext4 op journal. Capture any un-materialized ops
+        # left by a previous (crashed) run BEFORE opening it fresh, so a
+        # crash between ack and materialization is recovered by replay (see
+        # _replay_op_journal at the end of __init__).
+        self._op_journal_path = self.image_path + '.mftops'
+        self._op_journal_recovery = mft_op_journal.recover(self._op_journal_path)
+        self._op_journal = mft_op_journal.MftOpJournal(self._op_journal_path)
+
+        # Background MFT sync queue: write() puts (seq, offset, data) here so
+        # the NBD reply goes out immediately; ext4 operations run async.
         self._mft_queue: queue.Queue = queue.Queue()
         _t = threading.Thread(target=self._mft_worker, daemon=True,
                               name="MFTSyncWorker")
         _t.start()
 
-        # Loop prevention sets (shared with SyncDaemon)
+        # Loop prevention sets (shared with the two-way sync components)
         # Individual set operations (add, discard, `in`) are thread-safe under
         # CPython's GIL.  A lock is provided for any compound operations or
         # future iteration that may need atomicity.
@@ -286,10 +402,17 @@ class ClusterMapper:
         self.ext4_sync_in_progress: Set[str] = set()
         self.ntfs_sync_in_progress: Set[str] = set()
 
+        # Optional callback (set by the two-way SyncCoordinator) invoked with
+        # rel_path whenever the MFT worker observes the echo of a guest op —
+        # i.e. it skips ext4 materialization because the path is in
+        # ext4_sync_in_progress. Lets the coordinator clear suppression as
+        # soon as the echo lands instead of waiting for a timeout.
+        self.echo_observed_callback = None
+
         # Time-based loop prevention: records when NTFS→ext4 sync last wrote
         # each file.  The instant set (ntfs_sync_in_progress) is cleared as
         # soon as the write finishes, but the FileWatcher fires asynchronously
-        # later.  SyncDaemon checks these timestamps to suppress cascade events
+        # later.  OpJournal checks these timestamps to suppress cascade events
         # for a grace period after the sync.
         self.ntfs_sync_timestamps: Dict[str, float] = {}
 
@@ -460,8 +583,32 @@ class ClusterMapper:
             log(f"Protected (read-only at bridge): {sorted(self._protected_top_dirs)} "
                 f"-> {protected_files} files, {protected_dirs} dirs")
 
+        # Replay any MFT ops a previous crashed run acknowledged but never
+        # materialized to ext4 (ack-before-durable recovery). Runs
+        # synchronously here, before the bridge starts serving.
+        self._replay_op_journal()
+
+    def _replay_op_journal(self):
+        """Materialize un-done ops recovered from a crashed run's journal."""
+        pending = getattr(self, '_op_journal_recovery', None)
+        if not pending:
+            return
+        log(f"Replaying {len(pending)} un-materialized MFT op(s) from "
+            f"a previous run...")
+        replayed = 0
+        for seq, offset, data in pending:
+            try:
+                self._mft_sync_ext4_passes(offset, data)
+                replayed += 1
+            except Exception as e:
+                log(f"  replay op seq={seq} error: {e}")
+        log(f"Op-journal replay complete: {replayed}/{len(pending)} applied")
+        self._op_journal_recovery = []
+
     def close(self):
         """Close the memory-mapped image file."""
+        if hasattr(self, '_op_journal') and self._op_journal:
+            self._op_journal.close()
         if hasattr(self, 'image') and self.image:
             self.image.flush()
             self.image.close()
@@ -474,27 +621,51 @@ class ClusterMapper:
         """Cleanup on deletion."""
         self.close()
 
+    def _run_map_insert(self, entries):
+        """Insert run entries into _direct_run_map by REBINDING, not mutating.
+
+        Lock-free data reads snapshot the _direct_run_map reference (see
+        _run_map_lookup); an in-place bisect.insort would shift elements
+        under a concurrent searcher and let it return a wrong run. Building a
+        new sorted list and rebinding makes the update atomic for readers.
+        Callers hold self.lock, so concurrent writers don't lose entries.
+        """
+        if not entries:
+            return
+        new_list = list(self._direct_run_map)
+        for entry in entries:
+            bisect.insort(new_list, entry)
+        self._direct_run_map = new_list
+
     def _run_map_lookup(self, cluster: int) -> Optional[Tuple[str, int]]:
         """Binary search in _direct_run_map for a cluster.
 
         Returns (source_path, file_offset) or None.
         O(log n) in number of runs, not clusters.
+
+        Data reads run without self.lock, so this snapshots the list
+        reference once and searches that snapshot — writers replace the list
+        by rebinding (never in-place mutation, see _run_map_replace), so the
+        snapshot is a consistent immutable view. The final `start <= cluster
+        < end` check is explicit (both bounds) so a stale-but-consistent
+        snapshot can only return None, never a wrong run.
         """
-        if not self._direct_run_map:
+        runs = self._direct_run_map  # atomic reference grab (GIL)
+        if not runs:
             return None
         # Find rightmost entry with start <= cluster
-        lo, hi = 0, len(self._direct_run_map)
+        lo, hi = 0, len(runs)
         while lo < hi:
             mid = (lo + hi) // 2
-            if self._direct_run_map[mid][0] <= cluster:
+            if runs[mid][0] <= cluster:
                 lo = mid + 1
             else:
                 hi = mid
         idx = lo - 1
         if idx < 0:
             return None
-        start, end, path, base_offset = self._direct_run_map[idx]
-        if cluster < end:
+        start, end, path, base_offset = runs[idx]
+        if start <= cluster < end:
             return (path, base_offset + (cluster - start) * self.cluster_size)
         return None
 
@@ -511,8 +682,12 @@ class ClusterMapper:
         For sparse files, triggers lazy allocation on first access.
         For virtual files (ext4 only), synthesizes MFT records and data on-the-fly.
         """
-        # Lock MFT-region reads to prevent torn reads during concurrent writes
-        if self.is_mft_region(offset, length):
+        # Lock MFT-region reads to prevent torn reads during concurrent writes.
+        # While a consistency gate is active OR the cluster maps are being
+        # rebuilt (rescan_mft), serialize ALL reads behind the lock so a
+        # lockless data read can't observe half-cleared maps.
+        if (self.gate_active.is_set() or self._map_rebuild.is_set()
+                or self.is_mft_region(offset, length)):
             with self.lock:
                 return self._read_inner(offset, length)
         return self._read_inner(offset, length)
@@ -821,12 +996,21 @@ class ClusterMapper:
         Data cluster writes go to ext4 source files synchronously.
         Other metadata writes go to the image.
         """
+        if self.gate_active.is_set():
+            # Consistency gate in progress: the image is being modified
+            # offline. The guest disk should be offline too, so no writes
+            # are expected; refuse any stragglers rather than corrupt.
+            raise OSError(errno.EROFS, "consistency gate active")
         if self.is_mft_region(offset, len(data)):
+            data = bytes(data)
+            # Journal the op durably-recoverable BEFORE acking, so a crash
+            # between ack and materialization is replayed on restart.
+            seq = self._op_journal.append_op(offset, data)
             with self.lock:
                 # Phase 1 (fast): write MFT data to image so NTFS sees it
                 self._mft_write_to_image(offset, data)
             # Phase 2 (slow): sync changes to ext4 in background thread
-            self._mft_queue.put((offset, bytes(data)))
+            self._mft_queue.put((seq, offset, data))
         else:
             self._write_inner(offset, data)
 
@@ -837,7 +1021,28 @@ class ClusterMapper:
         its relative path, then checks the top-level component against
         self._protected_top_dirs. Resident files have their data inside the MFT
         record, so blocking the record write also protects the file content.
+
+        In safe mode every pre-existing record is protected (see __init__);
+        only the root directory and objects Windows created this session stay
+        writable.
         """
+        if self._safe_mode:
+            # Root directory (record 5) must accept new entries so Windows can
+            # create files/dirs at the volume root; never protect it.
+            if record_num == 5:
+                return False
+            src = self.mft_record_to_source.get(record_num)
+            if src is not None:
+                # Pre-existing ext4 file -> protected; Windows-created -> writable.
+                return src not in self._windows_created_sources
+            rel = self.mft_record_to_dir.get(record_num)
+            if rel is not None:
+                dpath = self._resolve_source_path(rel)
+                return dpath not in self._windows_created_sources
+            # Untracked / free record: Windows is writing a brand-new file's
+            # MFT record. Allow it (it becomes a Windows-created object once
+            # _check_new_file materializes it).
+            return False
         if not self._protected_top_dirs:
             return False
         rel_path = None
@@ -854,7 +1059,13 @@ class ClusterMapper:
         """Return True if source_path lies under a protected top-level dir of source_dir.
 
         Case-insensitive comparison; see _protected_top_dirs note.
+
+        In safe mode this returns True for every source object except the ones
+        Windows created this session, making all pre-existing ext4 file data
+        strictly read-only at the bridge.
         """
+        if self._safe_mode:
+            return source_path not in self._windows_created_sources
         if not self._protected_top_dirs:
             return False
         prefix = self.source_dir + os.sep
@@ -980,7 +1191,6 @@ class ClusterMapper:
                 if record_num in self._protected_ia_sizes:
                     ia_off_in_rec, target_ds, ib_off_in_rec, ib_val_off, bitmap = \
                         self._protected_ia_sizes[record_num]
-
                     # The offsets held in _protected_ia_sizes were captured when
                     # the record was scanned at startup. Windows rewrites
                     # records and can change their attribute layout underneath
@@ -992,57 +1202,54 @@ class ClusterMapper:
                     # and leaves it 0xFFFFFFFF. That is what ntfs-3g reports as
                     # "Corrupt non resident attribute 0xb0", and a directory
                     # whose index is mis-described that way hands Windows the
-                    # wrong file records -- files show up under the wrong
-                    # folder. Re-validate every header against the record as it
-                    # exists right now before touching a single byte.
+                    # wrong file records. Re-validate every header against the
+                    # record as it exists right now before touching a byte.
                     ia_hdr = self._attr_header_at(rec_abs, ia_off_in_rec)
                     if ia_hdr is None or ia_hdr[0] != 0xA0:
                         self._warn_stale_ia_protection(
                             record_num, 'INDEX_ALLOC', ia_off_in_rec, ia_hdr)
                     else:
-                        # Re-patch non-resident flag at +8: INDEX_ALLOCATION
-                        # MUST always be non-resident per NTFS spec. Windows
-                        # journal replay or ntfs-3g may write back a
-                        # resident-flagged version, which corrupts the
-                        # attribute layout and trips ntfsfix "Corrupt resident
-                        # attribute 0xa0" on next mount. Byte +8 of any
-                        # 8-byte-aligned attr never collides with USA fixup
-                        # positions (510-511, 1022-1023), so direct patching
-                        # is safe.
-                        nr_off = rec_abs + ia_off_in_rec + 8
-                        self.image[nr_off:nr_off + 1] = b'\x01'
-                        # Re-patch data_size and init_size
-                        ds_off = rec_abs + ia_off_in_rec + 48
-                        is_off = rec_abs + ia_off_in_rec + 56
-                        packed = struct.pack('<Q', target_ds)
-                        self.image[ds_off:ds_off + 8] = packed
-                        self.image[is_off:is_off + 8] = packed
+                        ia_abs = rec_abs + ia_off_in_rec
+                        # Re-patch non-resident flag at +8: 0xA0 MUST be
+                        # non-resident; a resident-flagged write trips ntfsfix
+                        # "Corrupt resident attribute 0xa0" on next mount.
+                        self.image[ia_abs + 8:ia_abs + 9] = b'\x01'
+                        # Only RESTORE data_size when Windows shrank it below
+                        # the protected value - that is the corruption case,
+                        # where INDX blocks get hidden. Forcing target_ds
+                        # unconditionally also undid legitimate growth and hid
+                        # new files added to the directory.
+                        cur_ds = struct.unpack(
+                            '<Q', self.image[ia_abs + 48:ia_abs + 56])[0]
+                        if cur_ds < target_ds:
+                            packed = struct.pack('<Q', target_ds)
+                            self.image[ia_abs + 48:ia_abs + 56] = packed
+                            self.image[ia_abs + 56:ia_abs + 64] = packed
 
-                        # Re-patch INDEX_BITMAP (ensures Windows sees all
-                        # blocks as allocated). Only ever into an attribute
-                        # that is still a RESIDENT 0xB0 whose value slot is
-                        # still where, and as large as, we recorded it.
-                        if ib_off_in_rec >= 0 and bitmap:
-                            ib_hdr = self._attr_header_at(rec_abs, ib_off_in_rec)
-                            if ib_hdr is None or ib_hdr[0] != 0xB0 or ib_hdr[2]:
-                                self._warn_stale_ia_protection(
-                                    record_num, 'INDEX_BITMAP',
-                                    ib_off_in_rec, ib_hdr)
-                            else:
-                                ib_base = rec_abs + ib_off_in_rec
-                                hdr = bytes(self.image[ib_base:ib_base + 24])
-                                cur_val_len = struct.unpack_from('<I', hdr, 16)[0]
-                                cur_val_off = struct.unpack_from('<H', hdr, 20)[0]
-                                end = ib_off_in_rec + cur_val_off + len(bitmap)
-                                if (cur_val_off == ib_val_off
-                                        and cur_val_len >= len(bitmap)
-                                        and end <= MFT_RECORD_SIZE):
-                                    bm_abs = ib_base + ib_val_off
-                                    self.image[bm_abs:bm_abs + len(bitmap)] = bitmap
-                                else:
+                            # The bitmap goes back only into an attribute that
+                            # is still a RESIDENT 0xB0 whose value slot is
+                            # where, and as large as, we recorded it.
+                            if ib_off_in_rec >= 0 and bitmap:
+                                ib_hdr = self._attr_header_at(rec_abs, ib_off_in_rec)
+                                if ib_hdr is None or ib_hdr[0] != 0xB0 or ib_hdr[2]:
                                     self._warn_stale_ia_protection(
-                                        record_num, 'INDEX_BITMAP value',
+                                        record_num, 'INDEX_BITMAP',
                                         ib_off_in_rec, ib_hdr)
+                                else:
+                                    ib_base = rec_abs + ib_off_in_rec
+                                    hdr = bytes(self.image[ib_base:ib_base + 24])
+                                    cur_val_len = struct.unpack_from('<I', hdr, 16)[0]
+                                    cur_val_off = struct.unpack_from('<H', hdr, 20)[0]
+                                    end = ib_off_in_rec + cur_val_off + len(bitmap)
+                                    if (cur_val_off == ib_val_off
+                                            and cur_val_len >= len(bitmap)
+                                            and end <= MFT_RECORD_SIZE):
+                                        bm_abs = ib_base + ib_val_off
+                                        self.image[bm_abs:bm_abs + len(bitmap)] = bitmap
+                                    else:
+                                        self._warn_stale_ia_protection(
+                                            record_num, 'INDEX_BITMAP value',
+                                            ib_off_in_rec, ib_hdr)
 
                 # Keep $MFTMirr in sync: if this record falls within the
                 # mirror's range, copy the full record to the mirror cluster.
@@ -1065,13 +1272,18 @@ class ClusterMapper:
         it before slow filesystem operations so concurrent reads are not blocked.
         """
         while True:
-            offset, data = self._mft_queue.get()
+            seq, offset, data = self._mft_queue.get()
             try:
                 self._mft_sync_ext4_passes(offset, data)
             except Exception as e:
                 log(f"MFT sync worker error: {e}")
                 traceback.print_exc()
             finally:
+                # Mark the op materialized even on error: retrying it on the
+                # next restart cannot help (the failure is deterministic given
+                # the same image state) and the consistency gate reconciles
+                # any residual drift. Leaving it pending would replay forever.
+                self._op_journal.append_done(seq)
                 self._mft_queue.task_done()
 
     def _mft_sync_ext4_passes(self, offset: int, data: bytes):
@@ -1168,6 +1380,7 @@ class ClusterMapper:
                         with open(source_path, 'r+b') as f:
                             f.seek(write_offset)
                             f.write(chunk_data)
+                        self._dirty_sources.add(source_path)
                         if not hasattr(self, '_write_logged'):
                             self._write_logged = set()
                         if source_path not in self._write_logged:
@@ -1188,6 +1401,7 @@ class ClusterMapper:
                     with open(source_path, 'r+b') as f:
                         f.seek(write_offset)
                         f.write(chunk_data)
+                    self._dirty_sources.add(source_path)
                     if not hasattr(self, '_write_logged'):
                         self._write_logged = set()
                     if source_path not in self._write_logged:
@@ -1209,9 +1423,143 @@ class ClusterMapper:
         return len(self.image)
 
     def flush(self):
-        """Flush image changes to disk."""
+        """Flush image changes to disk (hot region + dirty beyond-hot chunks)."""
         if self.image:
             self.image.flush()
+
+    def flush_all(self):
+        """Flush the entire image to disk (before an offline external mount)."""
+        if self.image:
+            self.image.flush_all()
+
+    def clear_dirty_bit(self):
+        """Clear the NTFS volume dirty bit ($Volume / $VOLUME_INFORMATION).
+
+        ntfsfix deliberately sets the dirty bit so Windows runs chkdsk on
+        first mount. The bridge's image is internally consistent (its own
+        fixups), and letting Windows auto-chkdsk the bridge volume is a
+        safety hazard — chkdsk would rewrite metadata underneath the bridge.
+        Clear it after each ntfsfix so Windows mounts clean.
+
+        The flags field sits early in record 3 (well before the USA fixup
+        positions at 510/1022), so it can be patched directly in the image
+        without re-doing fixups.
+        """
+        try:
+            rec_abs = self._rec_offset(3)
+            if rec_abs is None or rec_abs + MFT_RECORD_SIZE > len(self.image):
+                return
+            raw = self._undo_fixups(bytearray(
+                self.image[rec_abs:rec_abs + MFT_RECORD_SIZE]))
+            if raw[:4] != b'FILE':
+                return
+            off = struct.unpack('<H', raw[20:22])[0]
+            while off < MFT_RECORD_SIZE - 8:
+                atype = struct.unpack('<I', raw[off:off + 4])[0]
+                if atype == 0xFFFFFFFF:
+                    break
+                alen = struct.unpack('<I', raw[off + 4:off + 8])[0]
+                if alen == 0 or alen > MFT_RECORD_SIZE:
+                    break
+                if atype == 0x70 and raw[off + 8] == 0:  # $VOLUME_INFORMATION
+                    val_off = struct.unpack('<H', raw[off + 20:off + 22])[0]
+                    flags_abs = rec_abs + off + val_off + 0x0A
+                    if flags_abs + 2 > len(self.image):
+                        return
+                    cur = struct.unpack('<H', self.image[flags_abs:flags_abs + 2])[0]
+                    if cur & 0x0001:
+                        self.image[flags_abs:flags_abs + 2] = \
+                            struct.pack('<H', cur & ~0x0001)
+                        log("Cleared NTFS volume dirty bit")
+                    return
+                off += alen
+        except Exception as e:
+            log(f"clear_dirty_bit error: {e}")
+
+    def durability_barrier(self):
+        """Make all acknowledged writes durable — the NBD FLUSH contract.
+
+        Windows sends NBD_CMD_FLUSH expecting everything acknowledged so far
+        to survive a power loss. That requires three things, none of which a
+        bare image.flush() of the hot region did:
+          1. drain the async MFT->ext4 worker queue, so acknowledged
+             create/rename/delete metadata ops have actually reached ext4;
+          2. fsync every ext4 source file written since the last barrier
+             (a plain write() only dirties the ext4 page cache);
+          3. msync the image (hot region + every dirty beyond-hot chunk —
+             MFT/$Bitmap/INDX on a multi-TB volume live beyond 64MB).
+        """
+        # 1. drain queued metadata ops (materializes them to ext4 and marks
+        #    them done in the op journal)
+        try:
+            self._mft_queue.join()
+        except Exception as e:
+            log(f"durability_barrier: queue drain error: {e}")
+
+        # 1b. fsync the op journal so its now-empty/all-done state is durable
+        #     before the image is made durable — nothing to replay after a
+        #     post-FLUSH crash.
+        self._op_journal.sync()
+
+        # 2. fsync dirty ext4 sources
+        with self.lock:
+            dirty = list(self._dirty_sources)
+            self._dirty_sources.clear()
+        for path in dirty:
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass  # file may have been renamed/deleted since the write
+
+        # 3. msync the image (dirty regions)
+        if self.image:
+            self.image.flush()
+
+    def reload_from_image(self):
+        """Fully re-derive bridge state from the on-disk image.
+
+        Used after an offline ntfs-3g modification (the consistency gate),
+        where the $MFT may have grown or relocated, the $Bitmap changed, and
+        $MFTMirr moved. A shallow rescan_mft() is NOT enough: it reuses the
+        MFT geometry captured in __init__, so a grown/rewritten MFT is read
+        at stale record offsets and most records are missed (the "10->3
+        files" gate bug). This re-reads everything the way __init__ does.
+
+        Caller must ensure no NBD I/O is in flight (gate_active set, guest
+        disk offline).
+        """
+        with self.lock:
+            # Pull the externally-modified image back into the hot cache.
+            self.image.reload()
+
+            # Re-parse the boot sector and MFT geometry — both may differ
+            # after ntfs-3g rewrote the volume.
+            boot = self.image[0:512]
+            self.bytes_per_sector = struct.unpack('<H', boot[0x0B:0x0D])[0]
+            self.sectors_per_cluster = boot[0x0D]
+            self.cluster_size = self.bytes_per_sector * self.sectors_per_cluster
+            self.mft_cluster = struct.unpack('<Q', boot[0x30:0x38])[0]
+            self.mft_offset = self.mft_cluster * self.cluster_size
+            self._mft_runs, self._mft_total_records = self._get_mft_runs()
+            self._alloc_watermark = max(16, self.mft_cluster + 100)
+            self._recompute_allowed_roots()
+
+            # Re-run the same derivation __init__ does after the image is set.
+            self._scan_mft()
+            self._find_bitmap_location()
+            self._load_bitmap_cache()
+            self._build_free_run_index()
+            self._reserve_system_file_clusters()
+            self._load_mft_mirror_info()
+            self._build_path_mappings()
+
+            log(f"Reloaded from image: {self._mft_total_records} MFT records, "
+                f"{len(self.mft_record_to_source)} files tracked, "
+                f"{len(self.sparse_files)} sparse")
 
     def protect_ia_size(self, record_num: int, ia_off: int, data_size: int,
                         ib_off: int = -1, ib_val_off: int = 0, bitmap: bytes = b''):
@@ -1276,25 +1624,33 @@ class ClusterMapper:
 
         Called after ext4->NTFS sync operations complete.
         """
-        with self.lock:
-            old_cluster_count = len(self.cluster_map)
-            old_file_count = len(self.mft_record_to_source)
-            old_files = set(self.mft_record_to_source.values())
-            self._scan_mft()
-            self._build_path_mappings()
-            new_cluster_count = len(self.cluster_map)
-            new_file_count = len(self.mft_record_to_source)
-            new_files = set(self.mft_record_to_source.values())
-            added_files = new_files - old_files
-            removed_files = old_files - new_files
-            log(f"Rescan: {old_cluster_count}->{new_cluster_count} clusters, "
-                f"{old_file_count}->{new_file_count} files")
-            if added_files:
-                for f in added_files:
-                    log(f"  + {os.path.basename(f)}")
-            if removed_files:
-                for f in removed_files:
-                    log(f"  - {os.path.basename(f)}")
+        # Serialize reads for the duration so a lockless data read can't
+        # observe the maps mid clear-and-rebuild (would serve zeros for a
+        # mapped cluster). read() checks _map_rebuild and takes self.lock.
+        self._map_rebuild.set()
+        try:
+            with self.lock:
+                old_cluster_count = len(self.cluster_map)
+                old_file_count = len(self.mft_record_to_source)
+                old_files = set(self.mft_record_to_source.values())
+                self._recompute_allowed_roots()
+                self._scan_mft()
+                self._build_path_mappings()
+                new_cluster_count = len(self.cluster_map)
+                new_file_count = len(self.mft_record_to_source)
+                new_files = set(self.mft_record_to_source.values())
+                added_files = new_files - old_files
+                removed_files = old_files - new_files
+                log(f"Rescan: {old_cluster_count}->{new_cluster_count} clusters, "
+                    f"{old_file_count}->{new_file_count} files")
+                if added_files:
+                    for f in added_files:
+                        log(f"  + {os.path.basename(f)}")
+                if removed_files:
+                    for f in removed_files:
+                        log(f"  - {os.path.basename(f)}")
+        finally:
+            self._map_rebuild.clear()
 
     # =========================================================================
     # Direct allocation (no ntfs-3g, no data copy)
@@ -1450,6 +1806,16 @@ class ClusterMapper:
                         pass
 
                 off += attr_len
+
+        # Reserve the virtual-INDX region at the top of the volume so
+        # allocate_file_direct never hands those clusters to a user file
+        # (which would cross-link with a directory's synthesized INDX block).
+        # Only matters in --virtual mode, but reserving is harmless otherwise.
+        total_clusters = len(self.image) // self.cluster_size
+        vstart = getattr(self, 'next_virtual_indx_cluster', total_clusters)
+        if 0 < vstart < total_clusters:
+            self._free_index_remove(vstart, total_clusters - vstart)
+            total_reserved += total_clusters - vstart
 
         log(f"  System file reservation: removed {total_reserved:,} clusters from free-run index")
 
@@ -2596,18 +2962,19 @@ class ClusterMapper:
         return False
 
     def allocate_file_direct(self, rel_path: str) -> bool:
-        """Allocate clusters for a sparse file directly (no ntfs-3g).
+        """Allocate clusters for a sparse file (locked wrapper).
 
-        This updates:
-        1. Cluster bitmap (marks clusters as used)
-        2. MFT data runs (points to allocated clusters)
-        3. cluster_map (routes reads to ext4 file)
-
-        No data is copied - reads will return ext4 content.
-        Uses run-based allocation for efficiency with large files (40GB+).
-
-        Returns True if successful.
+        Takes self.lock so the bitmap / free-run index / _direct_run_map /
+        cluster_map / MFT mutations are atomic against concurrent reads and
+        the MFT worker. Reachable from the lockless data-read path (via
+        _check_sparse_file_read → _trigger_sparse_allocation), so the lock
+        here is what prevents two readers double-allocating the same free
+        clusters (cross-linked files).
         """
+        with self.lock:
+            return self._allocate_file_direct_impl(rel_path)
+
+    def _allocate_file_direct_impl(self, rel_path: str) -> bool:
         if rel_path not in self.sparse_files:
             return False
 
@@ -2670,10 +3037,12 @@ class ClusterMapper:
         last_cluster = runs[-1][0] + runs[-1][1] - 1
         log(f"  Mapping clusters {first_cluster}-{last_cluster} to {os.path.basename(source_path)}")
         file_offset = 0
+        _run_entries = []
         for start, count in runs:
-            bisect.insort(self._direct_run_map, (start, start + count, source_path, file_offset))
+            _run_entries.append((start, start + count, source_path, file_offset))
             file_offset += count * self.cluster_size
             self._alloc_watermark = max(self._alloc_watermark, start + count)
+        self._run_map_insert(_run_entries)
 
         # Ensure source_to_clusters has an entry (empty set; runs are in _direct_run_map)
         if source_path not in self.source_to_clusters:
@@ -2743,6 +3112,11 @@ class ClusterMapper:
             off += attr_len
 
     def deallocate_file_direct(self, rel_path: str) -> bool:
+        """Deallocate clusters for a file (locked wrapper)."""
+        with self.lock:
+            return self._deallocate_file_direct_impl(rel_path)
+
+    def _deallocate_file_direct_impl(self, rel_path: str) -> bool:
         """Deallocate clusters for a file (reverse of allocate_file_direct).
 
         Restores the file to sparse state.
@@ -2811,6 +3185,7 @@ class ClusterMapper:
         self.mft_record_to_dir.clear()
         self.resident_file_data.clear()
         self._direct_run_map.clear()
+        self._file_mft_seq.clear()
         # In-use user file records seen by this scan; the bridge compares this
         # against len(mft_record_to_source) to refuse serving a volume whose
         # source data is missing (e.g. bridge started before the data disk
@@ -2966,9 +3341,11 @@ class ClusterMapper:
 
         source_path = self._resolve_source_path(rel_path)
 
-        # Find source file
+        # Find source file. The fallback walk requires a size match (or a
+        # unique basename) so an ambiguous name can't map to the wrong file.
         if not os.path.isfile(source_path):
-            found = self._find_source_file(filename)
+            expected_size = self._extract_file_size(record)
+            found = self._find_source_file(filename, expected_size)
             if not found:
                 return
             source_path = found
@@ -2993,6 +3370,7 @@ class ClusterMapper:
                 # This is a sparse file - track it but don't map the minimal clusters
                 self.sparse_files[rel_path] = (source_path, file_size, record_num)
                 self.mft_record_to_source[record_num] = source_path
+                self._note_file_seq(record_num, record)
                 # Record the allocated clusters so we can detect reads to them
                 for start_cluster, count in data_runs:
                     if start_cluster > 0:  # Skip sparse runs
@@ -3005,6 +3383,7 @@ class ClusterMapper:
                     log(f"  Mapping new file: {rel_path} (record {record_num}, {real_cluster_count} clusters)")
                 self._map_clusters(data_runs, source_path)
                 self.mft_record_to_source[record_num] = source_path
+                self._note_file_seq(record_num, record)
                 # Remove from sparse tracking if it was there
                 self.sparse_files.pop(rel_path, None)
         else:
@@ -3023,6 +3402,7 @@ class ClusterMapper:
                 if source_size > resident_loc[2]:  # too large to be truly resident
                     self.sparse_files[rel_path] = (source_path, source_size, record_num)
                     self.mft_record_to_source[record_num] = source_path
+                    self._note_file_seq(record_num, record)
                 else:
                     self.resident_file_data[record_num] = {
                         'source_path': source_path,
@@ -3031,6 +3411,7 @@ class ClusterMapper:
                         'available': resident_loc[2],      # max bytes available for data
                     }
                     self.mft_record_to_source[record_num] = source_path
+                    self._note_file_seq(record_num, record)
             else:
                 # No data runs and no resident data - check if it's a large sparse file
                 try:
@@ -3038,6 +3419,7 @@ class ClusterMapper:
                     if file_size > 700:  # Large file with no allocation = sparse
                         self.sparse_files[rel_path] = (source_path, file_size, record_num)
                         self.mft_record_to_source[record_num] = source_path
+                        self._note_file_seq(record_num, record)
                 except OSError:
                     pass
 
@@ -3087,7 +3469,26 @@ class ClusterMapper:
         return filename, parent_ref
 
     def _extract_data_runs(self, record: bytearray) -> Optional[List[Tuple[int, int]]]:
-        """Extract data runs from MFT record's $DATA attribute."""
+        """Extract $DATA runs, following $ATTRIBUTE_LIST for fragmented files.
+
+        A file fragmented enough that ntfs-3g spills its $DATA runs into
+        extension MFT records has an $ATTRIBUTE_LIST (0x20) in the base
+        record; the base $DATA then covers only the first extent. Reading
+        only the base record would map just that extent and serve zeros for
+        the tail. When an $ATTRIBUTE_LIST is present we gather every unnamed
+        $DATA extent (base + extension records), ordered by VCN. On any
+        parsing anomaly we fall back to the base record's runs — that only
+        loses the tail, never returns wrong clusters.
+        """
+        attrlist = self._find_attribute_list(record)
+        if attrlist is not None:
+            combined = self._extract_data_runs_via_attrlist(attrlist)
+            if combined is not None:
+                return combined
+        return self._extract_data_runs_base(record)
+
+    def _extract_data_runs_base(self, record: bytearray) -> Optional[List[Tuple[int, int]]]:
+        """Extract data runs from a single MFT record's unnamed $DATA."""
         first_attr = struct.unpack('<H', record[20:22])[0]
         off = first_attr
 
@@ -3119,6 +3520,104 @@ class ClusterMapper:
             off += attr_len
 
         return None
+
+    def _find_attribute_list(self, record: bytearray) -> Optional[bytes]:
+        """Return the raw $ATTRIBUTE_LIST (0x20) value, or None if absent.
+
+        Handles resident and non-resident $ATTRIBUTE_LIST (the latter by
+        reading its data-run clusters from the image). Returns None on any
+        anomaly so the caller falls back to the base record.
+        """
+        off = struct.unpack('<H', record[20:22])[0]
+        while off < MFT_RECORD_SIZE - 8:
+            attr_type = struct.unpack('<I', record[off:off + 4])[0]
+            if attr_type == 0xFFFFFFFF:
+                return None
+            attr_len = struct.unpack('<I', record[off + 4:off + 8])[0]
+            if attr_len == 0 or attr_len > MFT_RECORD_SIZE:
+                return None
+            if attr_type == 0x20:
+                non_res = record[off + 8]
+                if not non_res:
+                    val_len = struct.unpack('<I', record[off + 16:off + 20])[0]
+                    val_off = struct.unpack('<H', record[off + 20:off + 22])[0]
+                    if off + val_off + val_len > MFT_RECORD_SIZE:
+                        return None
+                    return bytes(record[off + val_off:off + val_off + val_len])
+                # Non-resident: read its clusters from the image.
+                try:
+                    runs_off = struct.unpack('<H', record[off + 32:off + 34])[0]
+                    real_size = struct.unpack('<Q', record[off + 48:off + 56])[0]
+                    runs = self._parse_data_runs(
+                        record[off + runs_off:off + attr_len], real_size)
+                    if not runs:
+                        return None
+                    buf = bytearray()
+                    for lcn, count in runs:
+                        if lcn is None or lcn < 0:
+                            return None  # sparse attr list — bail
+                        start = lcn * self.cluster_size
+                        buf += self.image[start:start + count * self.cluster_size]
+                    return bytes(buf[:real_size])
+                except Exception:
+                    return None
+            off += attr_len
+        return None
+
+    def _extract_data_runs_via_attrlist(
+            self, attrlist: bytes) -> Optional[List[Tuple[int, int]]]:
+        """Gather all unnamed $DATA extents referenced by an $ATTRIBUTE_LIST.
+
+        Returns the concatenated (lcn, count) run list ordered by VCN, or
+        None on any anomaly (caller falls back to the base record).
+        """
+        # Collect (start_vcn, mft_ref) for unnamed $DATA (0x80) entries.
+        entries = []
+        pos = 0
+        n = len(attrlist)
+        guard = 0
+        while pos + 26 <= n:
+            guard += 1
+            if guard > 4096:
+                return None
+            atype = struct.unpack_from('<I', attrlist, pos)[0]
+            rec_len = struct.unpack_from('<H', attrlist, pos + 4)[0]
+            if rec_len < 26 or pos + rec_len > n:
+                break
+            name_len = attrlist[pos + 6]
+            if atype == 0x80 and name_len == 0:  # unnamed $DATA
+                start_vcn = struct.unpack_from('<Q', attrlist, pos + 8)[0]
+                mft_ref = struct.unpack_from('<Q', attrlist, pos + 16)[0] & 0xFFFFFFFFFFFF
+                entries.append((start_vcn, mft_ref))
+            pos += rec_len
+
+        if not entries:
+            return None
+        if len(entries) > 4096:
+            return None
+
+        # Read each referenced record once and extract its unnamed $DATA runs.
+        rec_cache = {}
+        fragments = []  # (start_vcn, runs)
+        for start_vcn, mft_ref in entries:
+            if mft_ref not in rec_cache:
+                ext_off = self._rec_offset(mft_ref)
+                if ext_off is None or ext_off + MFT_RECORD_SIZE > len(self.image):
+                    return None
+                raw = bytes(self.image[ext_off:ext_off + MFT_RECORD_SIZE])
+                if raw[:4] != b'FILE':
+                    return None
+                rec_cache[mft_ref] = self._undo_fixups(bytearray(raw))
+            runs = self._extract_data_runs_base(rec_cache[mft_ref])
+            if runs is None:
+                return None
+            fragments.append((start_vcn, runs))
+
+        fragments.sort(key=lambda f: f[0])
+        combined = []
+        for _vcn, runs in fragments:
+            combined.extend(runs)
+        return combined if combined else None
 
     def _extract_file_size(self, record: bytearray) -> Optional[int]:
         """Extract file size from $DATA attribute (resident or non-resident)."""
@@ -3354,6 +3853,141 @@ class ClusterMapper:
             self._real_roots_key = entries
         return self._real_roots
 
+    def remap_source_path(self, old_rel: str, new_rel: str):
+        """Rename a tracked ext4 source across every mapping structure.
+
+        Called when an ext4-side rename is detected (the bridge emits the
+        guest 'mv' op, so it knows the path moved before the guest echo
+        arrives). Without this, cluster mappings keep pointing at the old
+        ext4 path, which no longer exists, and every read of the file's
+        data fails with EIO until a consistency gate reconciles it.
+
+        Handles BOTH file and directory renames. For a directory rename the
+        move is a single ext4/inotify event covering the whole subtree, so
+        every child mapping (whose source is under old_source) must be
+        rewritten too — otherwise the children read as EIO after a dir move.
+
+        rel paths are share-relative with the OS separator (as stored in
+        path_to_mft_record / sparse_files / mft_record_to_dir).
+        """
+        old_source = self._resolve_source_path(old_rel)
+        new_source = self._resolve_source_path(new_rel)
+        if old_source == new_source:
+            return
+        old_src_pre = old_source + os.sep
+        old_rel_pre = old_rel + os.sep
+
+        def remap_source(sp):
+            if sp == old_source:
+                return new_source
+            if sp.startswith(old_src_pre):
+                return new_source + os.sep + sp[len(old_src_pre):]
+            return sp
+
+        def remap_rel(rp):
+            if rp == old_rel:
+                return new_rel
+            if rp.startswith(old_rel_pre):
+                return new_rel + os.sep + rp[len(old_rel_pre):]
+            return rp
+
+        def affects_source(sp):
+            return sp == old_source or sp.startswith(old_src_pre)
+
+        with self.lock:
+            # Overwrite-rename cleanup: if new_source was already tracked by a
+            # DIFFERENT record (ext4 `mv -f A B` over an existing B), Windows
+            # frees B's old MFT record. Drop that stale tracking now so a late
+            # "record freed" echo can't fire _check_file_deleted and os.remove
+            # the just-renamed-in B source (wrong-file delete). The record
+            # being remapped keeps its mapping.
+            keep_recs = {rn for rn, sp in self.mft_record_to_source.items()
+                         if affects_source(sp)}
+            for rn, sp in list(self.mft_record_to_source.items()):
+                if rn not in keep_recs and (sp == new_source
+                                            or sp.startswith(new_source + os.sep)):
+                    log(f"  Dropping overwritten target tracking: record {rn} "
+                        f"({os.path.basename(sp)})")
+                    self.mft_record_to_source.pop(rn, None)
+                    self._file_mft_seq.pop(rn, None)
+                    self.resident_file_data.pop(rn, None)
+
+            # source_to_clusters (keyed by source path)
+            for sp in [s for s in self.source_to_clusters if affects_source(s)]:
+                self.source_to_clusters[remap_source(sp)] = \
+                    self.source_to_clusters.pop(sp)
+
+            # Per-cluster map (small files)
+            for c, m in list(self.cluster_map.items()):
+                if isinstance(m, tuple) and len(m) == 2 \
+                        and affects_source(m[0]):
+                    self.cluster_map[c] = (remap_source(m[0]), m[1])
+
+            # Run-based map (large files, the RUN_MAP_THRESHOLD=0 default)
+            self._direct_run_map = [
+                (s, e, remap_source(sp), o)
+                for s, e, sp, o in self._direct_run_map
+            ]
+
+            # Record -> source path
+            for rn, sp in list(self.mft_record_to_source.items()):
+                if affects_source(sp):
+                    self.mft_record_to_source[rn] = remap_source(sp)
+
+            # Record -> directory rel path (for directories and their subdirs)
+            for rn, rp in list(self.mft_record_to_dir.items()):
+                if rp == old_rel or rp.startswith(old_rel_pre):
+                    self.mft_record_to_dir[rn] = remap_rel(rp)
+
+            # path_to_mft_record (keyed by rel path)
+            for rp in [r for r in self.path_to_mft_record
+                       if r == old_rel or r.startswith(old_rel_pre)]:
+                self.path_to_mft_record[remap_rel(rp)] = \
+                    self.path_to_mft_record.pop(rp)
+
+            # Sparse-file tracking (rel-keyed; value carries source path)
+            for rp in [r for r in self.sparse_files
+                       if r == old_rel or r.startswith(old_rel_pre)]:
+                _src, sz, rn = self.sparse_files.pop(rp)
+                self.sparse_files[remap_rel(rp)] = (
+                    remap_source(_src), sz, rn)
+            for c, rp in list(self.sparse_file_clusters.items()):
+                if rp == old_rel or rp.startswith(old_rel_pre):
+                    self.sparse_file_clusters[c] = remap_rel(rp)
+
+            # Resident-file tracking
+            for info in self.resident_file_data.values():
+                sp = info.get('source_path')
+                if sp and affects_source(sp):
+                    info['source_path'] = remap_source(sp)
+
+            log(f"  Remapped source: {old_rel} -> {new_rel}")
+
+    def _notify_echo_observed(self, rel_path: str):
+        """Tell the SyncCoordinator (if any) that a guest-op echo landed."""
+        cb = self.echo_observed_callback
+        if cb is not None:
+            try:
+                cb(rel_path)
+            except Exception as e:
+                log(f"  echo_observed_callback error: {e}")
+
+
+    def _recompute_allowed_roots(self):
+        """Rebuild the realpath whitelist used by _validate_path.
+
+        Includes source_dir, overflow_dir, and the resolved target of every
+        exposed top-level entry (shares are commonly symlinks into other
+        filesystems). Called at init and again after rescans/gates because
+        symlink targets can change between sessions.
+        """
+        roots = {os.path.realpath(self.source_dir),
+                 os.path.realpath(self.overflow_dir)}
+        for entry in self.known_root_entries:
+            target = os.path.realpath(os.path.join(self.source_dir, entry))
+            roots.add(target)
+        self._allowed_realpath_roots = roots
+
     def _validate_path(self, source_path: str, context: str = '') -> bool:
         """Validate that a resolved path stays within allowed directories.
 
@@ -3403,16 +4037,55 @@ class ClusterMapper:
             return os.path.relpath(source_path, self.overflow_dir)
         return os.path.relpath(source_path, self.source_dir)
 
-    def _find_source_file(self, filename: str) -> Optional[str]:
-        """Find matching file in source directory."""
+    def _find_source_file(self, filename: str,
+                          expected_size: Optional[int] = None
+                          ) -> Optional[str]:
+        """Find a matching file in the source directory.
+
+        The tree-walk fallback is deliberately strict: a bare basename can
+        match many files (e.g. episode files with identical names in
+        different season folders), and mapping the wrong one silently serves
+        another file's content. It only returns a match when the basename is
+        unique in the tree, or when exactly one candidate matches
+        expected_size (the NTFS record's data_size).
+        """
         path = os.path.join(self.source_dir, filename)
         if os.path.isfile(path):
             return path
 
+        matches = []
         for root, dirs, files in os.walk(self.source_dir, followlinks=True):
             if filename in files:
-                return os.path.join(root, filename)
+                matches.append(os.path.join(root, filename))
+                if len(matches) > 8:
+                    break  # ambiguity already certain
 
+        if not matches:
+            return None
+        if len(matches) == 1:
+            if expected_size is not None:
+                try:
+                    if os.path.getsize(matches[0]) != expected_size:
+                        log(f"  _find_source_file({filename}): single match "
+                            f"has wrong size; refusing")
+                        return None
+                except OSError:
+                    return None
+            return matches[0]
+
+        if expected_size is not None:
+            sized = []
+            for m in matches:
+                try:
+                    if os.path.getsize(m) == expected_size:
+                        sized.append(m)
+                except OSError:
+                    pass
+            if len(sized) == 1:
+                return sized[0]
+
+        log(f"  _find_source_file({filename}): {len(matches)} ambiguous "
+            f"matches; refusing to guess")
         return None
 
     def _map_clusters(self, data_runs: List[Tuple[int, int]], source_path: str):
@@ -3440,9 +4113,8 @@ class ClusterMapper:
                 new_entries.append((lcn, lcn + count, source_path, file_offset))
                 file_offset += count * self.cluster_size
                 self._alloc_watermark = max(self._alloc_watermark, lcn + count)
-            # Insert maintaining sort order
-            for entry in new_entries:
-                bisect.insort(self._direct_run_map, entry)
+            # Insert maintaining sort order (rebind, not in-place)
+            self._run_map_insert(new_entries)
             return
 
         file_offset = 0
@@ -4544,8 +5216,14 @@ class ClusterMapper:
             else:
                 offset_bytes = ((-offset).bit_length() + 8) // 8
 
-            count_bytes = max(1, min(count_bytes, 4))
-            offset_bytes = max(1, min(offset_bytes, 4))
+            # Cap at 8 (the data-run header nibble allows 0-15 bytes). The
+            # previous cap of 4 silently truncated the LCN delta for volumes
+            # with >2^31 clusters (>~8.8TB @ 4KB) — and virtual INDX clusters
+            # live at the TOP of the volume, so their delta IS the absolute
+            # top LCN — making the run point at a mid-volume cluster
+            # (cross-link / unreadable directory).
+            count_bytes = max(1, min(count_bytes, 8))
+            offset_bytes = max(1, min(offset_bytes, 8))
 
             header = (offset_bytes << 4) | count_bytes
             runs.append(header)
@@ -4669,7 +5347,20 @@ class ClusterMapper:
                 return False
 
             flags = struct.unpack('<H', record[22:24])[0]
-            if flags & 0x01:  # Still in use - not deleted
+            if flags & 0x01:  # Still in use
+                # Recycled slot? The tracked file was deleted and the record
+                # reused for a new file before this worker pass observed the
+                # freed state. Drop the stale tracking (never touch ext4 on
+                # inference alone; the gate reconciles the leftover file).
+                seq = struct.unpack('<H', bytes(record[16:18]))[0]
+                expected_seq = self._file_mft_seq.get(record_num)
+                source_path = self.mft_record_to_source.get(record_num)
+                if (source_path and expected_seq is not None
+                        and seq != expected_seq):
+                    log(f"  _check_file_deleted({record_num}): seq changed "
+                        f"{expected_seq}->{seq}, record recycled; dropping "
+                        f"stale tracking for {self._get_rel_path(source_path)}")
+                    self._drop_file_tracking(record_num, source_path)
                 return False
 
             source_path = self.mft_record_to_source.get(record_num)
@@ -4687,13 +5378,16 @@ class ClusterMapper:
 
             if rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping delete (ext4 sync in progress): {rel_path}")
+                self._notify_echo_observed(rel_path)
                 del self.mft_record_to_source[record_num]
+                self._file_mft_seq.pop(record_num, None)
                 self.resident_file_data.pop(record_num, None)
                 self.path_to_mft_record.pop(rel_path, None)
                 return True
 
             # Remove tracking before releasing lock
             del self.mft_record_to_source[record_num]
+            self._file_mft_seq.pop(record_num, None)
             self.resident_file_data.pop(record_num, None)
             self.path_to_mft_record.pop(rel_path, None)
             if source_path in self.source_to_clusters:
@@ -4787,6 +5481,7 @@ class ClusterMapper:
 
             if new_rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping dir rename (ext4 sync in progress): {new_rel_path}")
+                self._notify_echo_observed(new_rel_path)
                 self.mft_record_to_dir[record_num] = new_rel_path
                 self.path_to_mft_record.pop(old_rel_path, None)
                 self.path_to_mft_record[new_rel_path] = record_num
@@ -4948,6 +5643,7 @@ class ClusterMapper:
 
             if rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping new dir (ext4 sync in progress): {rel_path}")
+                self._notify_echo_observed(rel_path)
                 self.mft_record_to_dir[record_num] = rel_path
                 self._dir_mft_seq[record_num] = seq
                 self.path_to_mft_record[rel_path] = record_num
@@ -4974,6 +5670,11 @@ class ClusterMapper:
             with self.lock:
                 if do_create:
                     self.ntfs_sync_in_progress.discard(rel_path)
+                    # Safe mode: a directory Windows created this session is
+                    # writable (Windows may nest its own new files under it);
+                    # everything that pre-existed in ext4 stays read-only.
+                    if self._safe_mode:
+                        self._windows_created_sources.add(source_path)
                 self.mft_record_to_dir[record_num] = rel_path
                 self._dir_mft_seq[record_num] = seq
                 self.path_to_mft_record[rel_path] = record_num
@@ -5028,12 +5729,17 @@ class ClusterMapper:
 
             if rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping new file (ext4 sync in progress): {rel_path}")
+                self._notify_echo_observed(rel_path)
                 self.mft_record_to_source[record_num] = source_path
+                self._note_file_seq(record_num, record)
+                self.path_to_mft_record[rel_path] = record_num
                 self._track_file_data(record, record_num, source_path)
                 return None
 
             if os.path.exists(source_path):
                 self.mft_record_to_source[record_num] = source_path
+                self._note_file_seq(record_num, record)
+                self.path_to_mft_record[rel_path] = record_num
                 self._track_file_data(record, record_num, source_path)
                 return None
 
@@ -5103,14 +5809,49 @@ class ClusterMapper:
             with self.lock:
                 self.ntfs_sync_in_progress.discard(rel_path)
                 self.mft_record_to_source[record_num] = source_path
+                self._note_file_seq(record_num, record)
                 self.path_to_mft_record[rel_path] = record_num
                 self._track_file_data(record, record_num, source_path)
+                # Safe mode: this file was just created by Windows, so its
+                # data clusters and MFT record remain writable (everything
+                # pre-existing is read-only).
+                if self._safe_mode:
+                    self._windows_created_sources.add(source_path)
             return source_path
         except OSError as e:
             log(f"  Failed to create file {rel_path}: {e}")
             with self.lock:
                 self.ntfs_sync_in_progress.discard(rel_path)
             return None
+
+    def _note_file_seq(self, record_num: int, record) -> None:
+        """Remember a tracked FILE record's MFT sequence number."""
+        try:
+            self._file_mft_seq[record_num] = struct.unpack(
+                '<H', record[16:18])[0]
+        except (struct.error, TypeError):
+            pass
+
+    def _drop_file_tracking(self, record_num: int, source_path: str):
+        """Remove every mapping for a stale/recycled tracked file record.
+
+        Leaves the ext4 source untouched — when tracking is stale the only
+        safe action is to forget it; _check_new_file will pick up the
+        record's new occupant on its next MFT update, and the consistency
+        gate reconciles any leftover drift. Caller holds self.lock.
+        """
+        rel_path = self._get_rel_path(source_path)
+        self.mft_record_to_source.pop(record_num, None)
+        self._file_mft_seq.pop(record_num, None)
+        self.resident_file_data.pop(record_num, None)
+        if self.path_to_mft_record.get(rel_path) == record_num:
+            self.path_to_mft_record.pop(rel_path, None)
+        if source_path in self.source_to_clusters:
+            for cluster in self.source_to_clusters[source_path]:
+                self.cluster_map.pop(cluster, None)
+            del self.source_to_clusters[source_path]
+        self._direct_run_map = [r for r in self._direct_run_map
+                                if r[2] != source_path]
 
     def _track_file_data(self, record: bytearray, record_num: int, source_path: str):
         """Track file data - either cluster mapping or resident tracking."""
@@ -5151,6 +5892,24 @@ class ClusterMapper:
             record = self._undo_fixups(bytearray(
                 self.image[record_offset:record_offset + MFT_RECORD_SIZE]))
             if record[0:4] != b'FILE':
+                return
+
+            # Guard: record recycled for a different file entity. Windows can
+            # free a record (delete) and reuse it (new file) between MFT
+            # worker passes; without this check the reuse is misread as a
+            # rename and shutil.move relocates the OLD file's ext4 source
+            # onto the NEW file's path. Mirrors the directory guard in
+            # _check_directory_rename.
+            cur_flags = struct.unpack('<H', record[22:24])[0]
+            cur_seq = struct.unpack('<H', record[16:18])[0]
+            expected_seq = self._file_mft_seq.get(record_num)
+            if (cur_flags & 0x01) and expected_seq is not None \
+                    and cur_seq != expected_seq:
+                stale_rel = self._get_rel_path(source_path)
+                log(f"  _reparse({record_num}): seq changed "
+                    f"{expected_seq}->{cur_seq}, record recycled "
+                    f"(was {stale_rel}); dropping stale tracking")
+                self._drop_file_tracking(record_num, source_path)
                 return
 
             # Determine rename
@@ -5197,13 +5956,21 @@ class ClusterMapper:
                                 self.path_to_mft_record[new_rel_path] = record_num
                                 source_path = new_path
                                 self.mft_record_to_source[record_num] = new_path
+                                self._note_file_seq(record_num, record)
                         else:
-                            # Sync in progress - just update tracking
+                            # Echo of a guest-executed rename (ext4 already
+                            # moved). Release the suppression window early so
+                            # the coordinator doesn't rely on the wall-clock
+                            # timeout (which Windows' lazy MFT flush can
+                            # outlast). Just update tracking, don't re-move.
+                            self._notify_echo_observed(new_rel_path)
+                            self._notify_echo_observed(old_rel)
                             if old_rel in self.path_to_mft_record:
                                 del self.path_to_mft_record[old_rel]
                             self.path_to_mft_record[new_rel_path] = record_num
                             source_path = new_path
                             self.mft_record_to_source[record_num] = new_path
+                            self._note_file_seq(record_num, record)
                     else:
                         # File doesn't exist at old path - just update tracking
                         if old_rel in self.path_to_mft_record:
@@ -5211,6 +5978,7 @@ class ClusterMapper:
                         self.path_to_mft_record[new_rel_path] = record_num
                         source_path = new_path
                         self.mft_record_to_source[record_num] = new_path
+                        self._note_file_seq(record_num, record)
 
         # --- Phase 2: slow filesystem op outside the lock ---
         if do_move:
@@ -5245,6 +6013,7 @@ class ClusterMapper:
                 self.path_to_mft_record[new_rel_path] = record_num
                 source_path = new_path
                 self.mft_record_to_source[record_num] = new_path
+                self._note_file_seq(record_num, record)
                 if old_source in self.source_to_clusters:
                     clusters = self.source_to_clusters.pop(old_source)
                     self.source_to_clusters[new_path] = clusters

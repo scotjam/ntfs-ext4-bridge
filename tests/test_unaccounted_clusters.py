@@ -69,6 +69,10 @@ def make_mapper():
     m._mft_mirror_offset = -1
     m._mft_mirror_record_count = 0
     m._protected_top_dirs = set()
+    # safe mode came in with the two-way branch; these harnesses build
+    # mappers via __new__, so the attributes it reads must be set here too.
+    m._safe_mode = False
+    m._windows_created_sources = set()
     m._protect_refused = set()
     m.ext4_authoritative = False
     m._check_sparse_file_read = lambda *a, **k: None

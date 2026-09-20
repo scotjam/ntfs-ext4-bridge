@@ -294,9 +294,15 @@ class PartitionWrapper:
                     pos += remaining
 
             else:
-                # Reading from partition - offset and pass to mapper
+                # Reading from partition - offset and pass to mapper.
+                # Clamp so a read that starts in the partition body doesn't
+                # run past it into the backup-GPT trailer (which would then
+                # be served as zeros from the mapper instead of trailer_area).
                 partition_offset = current_offset - PARTITION_OFFSET_BYTES
-                data = self.mapper.read(partition_offset, remaining)
+                part_read = remaining
+                if self.trailer_area and current_offset < self.trailer_offset:
+                    part_read = min(remaining, self.trailer_offset - current_offset)
+                data = self.mapper.read(partition_offset, part_read)
                 if not data or len(data) == 0:
                     break  # Prevent infinite loop
                 result[pos:pos + len(data)] = data
@@ -340,6 +346,18 @@ class PartitionWrapper:
     def flush(self):
         """Flush any pending writes to the underlying mapper."""
         self.mapper.flush()
+
+    def flush_all(self):
+        """Pass through full-image flush to the underlying mapper."""
+        self.mapper.flush_all()
+
+    def durability_barrier(self):
+        """Pass through the NBD FLUSH durability barrier to the mapper."""
+        self.mapper.durability_barrier()
+
+    def clear_dirty_bit(self):
+        """Pass through the volume dirty-bit clear to the mapper."""
+        self.mapper.clear_dirty_bit()
 
     def rescan_mft(self):
         """Pass through MFT rescan to underlying mapper."""

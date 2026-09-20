@@ -28,7 +28,6 @@ import time
 
 from .cluster_mapper import ClusterMapper
 from .nbd_server import NBDServer
-from .sync_daemon import SyncDaemon
 from .lazy_allocator import LazyAllocator
 from .partition_wrapper import PartitionWrapper
 from .virtual_files import VirtualFileManager
@@ -206,7 +205,7 @@ def prune_stale_entries(ntfs_mount: str, source_dir: str, roots, log) -> int:
 
 
 class NTFSBridge:
-    """Main bridge tying together ClusterMapper, NBD server, and SyncDaemon."""
+    """Main bridge tying together ClusterMapper, NBD server, and two-way sync."""
 
     def __init__(self, image_path: str, source_dir: str,
                  ntfs_mount: str, port: int = 10809,
@@ -219,7 +218,16 @@ class NTFSBridge:
                  virtual_mode: bool = False,
                  overflow_dir=None,
                  exclude_patterns=None,
-                 protected_roots=None):
+                 protected_roots=None,
+                 roots=None,
+                 two_way=False,
+                 safe_mode=False,
+                 control_host='192.168.122.1',
+                 control_port=10810,
+                 agent_token_file=None,
+                 gate_threshold_ops=500,
+                 gate_threshold_age=600.0,
+                 winrm_url=None, winrm_user=None, winrm_password=None):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
         self.ntfs_mount = os.path.abspath(ntfs_mount)
@@ -234,16 +242,43 @@ class NTFSBridge:
         self.virtual_mode = virtual_mode
         self.exclude_patterns = list(exclude_patterns) if exclude_patterns else []
         self.protected_roots = list(protected_roots) if protected_roots else []
+        # Exposure list (which source_dir top-level entries appear on the
+        # volume). Falls back to protected_roots when unset, preserving the
+        # old behavior where --protected-roots doubled as the exposure switch.
+        self.roots = list(roots) if roots else list(self.protected_roots)
+
+        # Two-way live sync (guest-agent architecture)
+        self.two_way = two_way
+
+        # Safe mode: one-way read of all ext4 + write only to Windows-created
+        # objects (which can only attach at the volume root, since every
+        # pre-existing ext4 file/dir is read-only at the bridge). Mutually
+        # exclusive with two-way; needs no guest agent or consistency gate.
+        self.safe_mode = safe_mode
+        if self.safe_mode and self.two_way:
+            raise ValueError("--safe-mode and --two-way are mutually exclusive")
+
+        self.control_host = control_host
+        self.control_port = control_port
+        self.agent_token_file = agent_token_file
+        self.gate_threshold_ops = gate_threshold_ops
+        self.gate_threshold_age = gate_threshold_age
+        self.winrm_url = winrm_url
+        self.winrm_user = winrm_user
+        self.winrm_password = winrm_password
 
         self.mapper = None
         self.partition_wrapper = None
         self.nbd_server = None
-        self.sync_daemon = None
         self.lazy_allocator = None
         self.virtual_file_manager = None
         self._file_watcher = None
         self._nbd_thread = None
         self._stopping = False
+        self.control_server = None
+        self.op_journal = None
+        self.sync_coordinator = None
+        self.consistency_gate = None
 
     def _dangling_source_roots(self):
         """Top-level source entries that are symlinks pointing nowhere."""
@@ -440,7 +475,9 @@ class NTFSBridge:
         log("Initializing ClusterMapper...")
         self.mapper = ClusterMapper(self.image_path, self.source_dir,
                                      overflow_dir=self.overflow_dir,
-                                     protected_roots=self.protected_roots)
+                                     protected_roots=self.protected_roots,
+                                     roots=self.roots,
+                                     safe_mode=self.safe_mode)
 
         # A reused image describes the tree as it was when we last shut down.
         # ext4 can have moved on since - files added, moved or deleted while the
@@ -475,55 +512,7 @@ class NTFSBridge:
             self.mapper.lazy_allocator = self.lazy_allocator
 
             # Pre-allocate all sparse files during setup
-            # This is fast (no data copy) and ensures ntfs-3g sees allocated files
-            # Sort largest files first: they need large contiguous free regions that
-            # will be consumed by smaller files if those are allocated first.
-            sparse_files = sorted(
-                (p for p in self.mapper.sparse_files.keys()
-                 if not self._should_exclude(p)),
-                key=lambda p: self.mapper.sparse_files[p][1],  # file_size
-                reverse=True
-            )
-            if sparse_files:
-                log(f"Pre-allocating {len(sparse_files)} sparse files (largest first)...")
-                for rel_path in sparse_files:
-                    success = self.mapper.allocate_file_direct(rel_path)
-                    if success:
-                        self.lazy_allocator.register_file(
-                            rel_path,
-                            os.path.join(self.source_dir, rel_path),
-                            is_allocated=True
-                        )
-                    else:
-                        log(f"  Warning: Failed to pre-allocate {rel_path}")
-
-                # Flush the mmap to disk and re-run ntfsfix to clear the journal
-                # that ntfs-3g wrote during _populate_image().  Without this,
-                # Windows replays ntfs-3g's journal on first mount and reverts all
-                # the non-resident DATA attributes we just installed back to the
-                # empty-resident state, making the files appear empty/corrupted.
-                log("Flushing image and re-running ntfsfix to clear post-populate journal...")
-                self.mapper.image.flush()
-                fix_result = subprocess.run(
-                    ['ntfsfix', self.image_path],
-                    capture_output=True, text=True
-                )
-                log(f"ntfsfix (post-alloc): {fix_result.stdout.strip()}")
-                if fix_result.returncode != 0:
-                    log(f"ntfsfix warning: {fix_result.stderr.strip()}")
-                # ntfsfix just rewrote the image behind the hot cache. It
-                # syncs $MFTMirr, empties $LogFile and toggles the $Volume
-                # dirty flag - all inside the first 64MB the cache snapshotted
-                # at ClusterMapper init. Left stale, the NBD server served the
-                # pre-ntfsfix $MFT record 3 while $MFTMirr (over 1TB into the
-                # image, well past the cache) came fresh from the mmap, so
-                # ntfs-3g refused the mount with "$MFTMirr does not match $MFT
-                # (record 3)" and live sync stayed off. Worse, stop() flushed
-                # the stale cache back over the repair, leaving the image
-                # corrupt on disk for the next start to fix and re-break.
-                # Everything written through the cache was flushed above, so
-                # reloading loses nothing.
-                self.mapper.image.reload()
+            self._allocate_new_sparse_files()
 
             # Register existing allocated files
             for record_num, source_path in self.mapper.mft_record_to_source.items():
@@ -546,6 +535,10 @@ class NTFSBridge:
         # overwrite the fix via its MFT writes.  Writes via hot_cache so the NBD
         # server (which starts next) immediately serves the corrected data.
         self._fix_index_alloc_data_sizes()
+
+        # Clear the dirty bit ntfsfix set, so Windows mounts the bridge
+        # volume clean and never auto-runs chkdsk against it.
+        self.mapper.clear_dirty_bit()
 
         # Step 6: Create NBD server
         # Use PartitionWrapper for Windows VM mode (adds MBR partition table)
@@ -575,6 +568,116 @@ class NTFSBridge:
 
         log("Setup complete")
 
+    def _allocate_new_sparse_files(self):
+        """Pre-allocate every currently-sparse file, then flush + ntfsfix.
+
+        Fast (no data copy). Sorts largest first: big files need large
+        contiguous free regions that smaller files would otherwise fragment.
+        Called at setup and again by the consistency gate after an offline
+        populate creates new sparse entries.
+        """
+        sparse_files = sorted(
+            (p for p in self.mapper.sparse_files.keys()
+             if not self._should_exclude(p)),
+            key=lambda p: self.mapper.sparse_files[p][1],  # file_size
+            reverse=True
+        )
+        if not sparse_files:
+            return
+        log(f"Pre-allocating {len(sparse_files)} sparse files (largest first)...")
+        for rel_path in sparse_files:
+            success = self.mapper.allocate_file_direct(rel_path)
+            if success:
+                if self.lazy_allocator:
+                    self.lazy_allocator.register_file(
+                        rel_path,
+                        os.path.join(self.source_dir, rel_path),
+                        is_allocated=True
+                    )
+            else:
+                log(f"  Warning: Failed to pre-allocate {rel_path}")
+
+        # Flush the mmap to disk and re-run ntfsfix to clear the journal
+        # that ntfs-3g wrote during the populate.  Without this, Windows
+        # replays ntfs-3g's journal on first mount and reverts all the
+        # non-resident DATA attributes we just installed back to the
+        # empty-resident state, making the files appear empty/corrupted.
+        log("Flushing image and re-running ntfsfix to clear post-populate journal...")
+        self.mapper.image.flush()
+        fix_result = subprocess.run(
+            ['ntfsfix', self.image_path],
+            capture_output=True, text=True
+        )
+        log(f"ntfsfix (post-alloc): {fix_result.stdout.strip()}")
+        if fix_result.returncode != 0:
+            log(f"ntfsfix warning: {fix_result.stderr.strip()}")
+        # ntfsfix wrote to the image file behind the hot cache; reload so
+        # the in-RAM metadata matches what's on disk.
+        self.mapper.image.reload()
+
+    def _start_two_way(self):
+        """Start the two-way live sync stack (guest-agent architecture).
+
+        Components: OpJournal (watches share roots, coalesces ext4 events
+        into guest ops), SyncCoordinator (echo suppression), ControlServer
+        (agent HTTP endpoint), ConsistencyGate (offline reconciliation).
+        """
+        from .op_journal import OpJournal
+        from .sync_coordinator import SyncCoordinator
+        from .control_server import ControlServer
+        from .consistency_gate import ConsistencyGate
+
+        token = self._load_or_create_token()
+
+        journal_path = self.image_path + '.op-journal.jsonl'
+        self.op_journal = OpJournal(
+            journal_path, self.source_dir, self.mapper,
+            exclude_cb=self._should_exclude,
+            gate_threshold_ops=self.gate_threshold_ops,
+            gate_threshold_age=self.gate_threshold_age,
+        )
+        self.sync_coordinator = SyncCoordinator(self.mapper, self.op_journal)
+        self.control_server = ControlServer(
+            self.control_host, self.control_port, token,
+            self.op_journal, self.sync_coordinator, self.mapper,
+        )
+        self.consistency_gate = ConsistencyGate(self)
+        self.control_server.gate = self.consistency_gate
+
+        self.control_server.start()
+        self.op_journal.start()
+        self.consistency_gate.start()
+
+        # Manual gate trigger: SIGUSR1
+        try:
+            import signal
+            signal.signal(
+                signal.SIGUSR1,
+                lambda *_: self.consistency_gate.request("SIGUSR1"))
+        except (ImportError, ValueError, AttributeError):
+            pass
+
+        log(f"Two-way sync started (agent endpoint "
+            f"{self.control_host}:{self.control_port})")
+
+    def _load_or_create_token(self) -> str:
+        """Read the shared agent token, generating one on first use."""
+        import secrets
+        path = self.agent_token_file or (self.image_path + '.agent-token')
+        try:
+            with open(path, encoding='utf-8') as f:
+                token = f.read().strip()
+            if token:
+                return token
+        except OSError:
+            pass
+        token = secrets.token_hex(32)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(token + '\n')
+        os.chmod(path, 0o600)
+        log(f"Generated new agent token at {path}")
+        return token
+
     def run(self):
         """Run the bridge (blocking)."""
         # Start NBD server in background thread
@@ -599,10 +702,23 @@ class NTFSBridge:
             self._start_virtual_file_watcher()
             log("Virtual file watcher started (live ext4→NTFS sync)")
 
+        # Start two-way sync components (guest-agent architecture). The local
+        # ntfs-3g mount and SyncDaemon are never used in this mode: a second
+        # NTFS driver on a volume the VM has mounted is unsafe by design.
+        if self.two_way:
+            self._start_two_way()
+
         # Connect nbd-client and mount
         # Skip in partitioned+virtual mode (VM connects directly to NBD)
+        # and in two-way mode (guest agent handles ext4->NTFS sync)
         mount_success = False
-        if self.partitioned and self.virtual_mode:
+        if self.two_way:
+            log("Two-way mode: skipping local nbd-client/mount and SyncDaemon")
+        elif self.safe_mode:
+            log("Safe mode: skipping local nbd-client/mount (VM connects "
+                "directly; existing ext4 is read-only, new root files sync "
+                "via the MFT worker)")
+        elif self.partitioned and self.virtual_mode:
             log("VM mode: skipping local nbd-client/mount (VM connects directly)")
         else:
             mount_success = self._connect_and_mount()
@@ -618,19 +734,16 @@ class NTFSBridge:
 
                 # The volume mounted and its INDX bitmap has been reconciled, so
                 # the image is now a fair description of ext4. Reconciliation may
-                # write back from here on.
+                # write back from here on. This survives the SyncDaemon removal
+                # below: the flag gates reconciliation, not the daemon.
                 if self.mapper.ext4_authoritative:
                     self.mapper.ext4_authoritative = False
                     log("Volume mounted cleanly: reconciliation to ext4 re-enabled")
 
-                # Start sync daemon for ntfs-3g based sync
-                if not self.virtual_mode:
-                    self.sync_daemon = SyncDaemon(
-                        self.source_dir, self.ntfs_mount, self.mapper,
-                        lazy_allocator=self.lazy_allocator
-                    )
-                    self.sync_daemon.start()
-                    log("Sync daemon started")
+                # NOTE: the old SyncDaemon (live ext4->NTFS via this local
+                # ntfs-3g mount) was removed: writing NTFS metadata through a
+                # second driver while a VM has the volume mounted corrupts
+                # Windows' cached state. Use --two-way instead.
 
                 # Run catch-up populate in background via production mount.
                 # The temp-mount populate may have failed for files in large
@@ -657,7 +770,14 @@ class NTFSBridge:
             log(f"  Lazy allocation: ENABLED (timeout: {self.dealloc_timeout}s)")
         if self.virtual_mode:
             log(f"  Virtual mode: ENABLED (no ntfs-3g mount required)")
-        if not mount_success and not self.virtual_mode:
+        if self.two_way:
+            log(f"  Two-way sync: ENABLED (control endpoint "
+                f"{self.control_host}:{self.control_port})")
+        if self.safe_mode:
+            log("  Safe mode: ENABLED (read-all; writes only to files "
+                "Windows creates at the volume root; existing ext4 read-only)")
+        if (not mount_success and not self.virtual_mode and not self.two_way
+                and not self.safe_mode):
             log("  WARNING: ntfs-3g mount failed, ext4→NTFS sync disabled")
             log(f"  Connect manually: sudo nbd-client -N '' 127.0.0.1 {self.port} /dev/nbdX")
         log("  Press Ctrl+C to stop")
@@ -720,11 +840,20 @@ class NTFSBridge:
 
         log("Stopping bridge...")
 
+        if self.consistency_gate:
+            self.consistency_gate.stop()
+
+        if self.op_journal:
+            self.op_journal.stop()
+
+        if self.sync_coordinator:
+            self.sync_coordinator.stop()
+
+        if self.control_server:
+            self.control_server.stop()
+
         if self._file_watcher:
             self._file_watcher.stop()
-
-        if self.sync_daemon:
-            self.sync_daemon.stop()
 
         if self.lazy_allocator:
             self.lazy_allocator.stop()
@@ -734,10 +863,17 @@ class NTFSBridge:
         if self.nbd_server:
             self.nbd_server.stop()
 
-        # Save image changes
+        # Save image changes. Drain any queued MFT->ext4 ops FIRST (the
+        # worker is a daemon thread and dies at process exit, so unqueued
+        # ops would be lost), then fully msync the image and close.
         if self.mapper:
-            log("Saving image...")
-            self.mapper.flush()
+            log("Draining MFT sync queue and saving image...")
+            try:
+                self.mapper.durability_barrier()
+                self.mapper.flush_all()
+                self.mapper.close()
+            except Exception as e:
+                log(f"Error during final flush: {e}")
 
         log("Bridge stopped")
 
@@ -1821,17 +1957,18 @@ class NTFSBridge:
     def _should_expose_source_root(self, name: str) -> bool:
         """Return True if a top-level source_dir entry should be exposed.
 
-        --protected-roots is the authoritative list of source_dir shares
-        the bridge exposes at the NTFS root. Anything not on it is skipped
-        at populate time and never appears in the NTFS view.
+        --roots is the authoritative exposure list of source_dir shares the
+        bridge presents at the NTFS root; it defaults to --protected-roots
+        for backwards compatibility (exposure used to be coupled to write
+        protection). Anything not on it is skipped at populate time and
+        never appears in the NTFS view.
 
-        If --protected-roots is empty (or unset), no source_dir entries
-        are exposed at all — only overflow_dir contents reach F:\\. This
-        is the safe default: source_dir must be opted into explicitly,
-        so a misconfigured bridge cannot accidentally expose shares
-        read-write.
+        If neither list names any entries, no source_dir entries are
+        exposed at all — only overflow_dir contents reach the volume. This
+        is the safe default: source_dir must be opted into explicitly, so
+        a misconfigured bridge cannot accidentally expose shares.
         """
-        wanted = {p.lower() for p in (self.protected_roots or [])}
+        wanted = {p.lower() for p in (self.roots or [])}
         return name.lower() in wanted
 
     @staticmethod
@@ -1895,9 +2032,45 @@ def main():
                              'or any working dir a backup/indexing tool installs at '
                              'the volume root). Example: '
                              '--protected-roots share-a,share-b,share-c')
+    parser.add_argument('--roots', default='',
+                        help='Comma-separated exposure list: which top-level '
+                             'subdirectories of --source appear on the volume. '
+                             'Independent of write protection. Default: the '
+                             '--protected-roots list (backwards compatible).')
+    parser.add_argument('--two-way', action='store_true',
+                        help='Enable full two-way live sync via the guest '
+                             'agent (see guest_agent/). Replaces the local '
+                             'ntfs-3g mount + SyncDaemon.')
+    parser.add_argument('--safe-mode', action='store_true',
+                        help='Read-only for all existing ext4 content; Windows '
+                             'may only create/write/delete its OWN new files at '
+                             'the volume root. Existing ext4 files and '
+                             'directories can never be modified or corrupted. '
+                             'No guest agent or consistency gate. Mutually '
+                             'exclusive with --two-way.')
+    parser.add_argument('--control-host', default='192.168.122.1',
+                        help='Bind address for the agent control endpoint '
+                             '(default: 192.168.122.1, the libvirt NAT gateway)')
+    parser.add_argument('--control-port', type=int, default=10810,
+                        help='Agent control endpoint port (default: 10810)')
+    parser.add_argument('--agent-token-file',
+                        help='Path to the shared agent token (generated on '
+                             'first use; default: <image>.agent-token)')
+    parser.add_argument('--gate-threshold-ops', type=int, default=500,
+                        help='Pending-op count that escalates to a '
+                             'consistency gate (default: 500)')
+    parser.add_argument('--gate-threshold-age', type=float, default=600.0,
+                        help='Seconds an op may sit unacked before escalating '
+                             'to a consistency gate (default: 600)')
+    parser.add_argument('--winrm-url',
+                        help='Windows VM address for the WinRM gate fallback '
+                             '(optional; used when the agent is unreachable)')
+    parser.add_argument('--winrm-user', help='WinRM username')
+    parser.add_argument('--winrm-password', help='WinRM password')
 
     args = parser.parse_args()
     protected_roots = [r.strip() for r in args.protected_roots.split(',') if r.strip()]
+    roots = [r.strip() for r in args.roots.split(',') if r.strip()]
 
     bridge = NTFSBridge(
         image_path=args.image,
@@ -1914,6 +2087,17 @@ def main():
         overflow_dir=args.overflow_dir,
         exclude_patterns=args.exclude,
         protected_roots=protected_roots,
+        roots=roots,
+        two_way=args.two_way,
+        safe_mode=args.safe_mode,
+        control_host=args.control_host,
+        control_port=args.control_port,
+        agent_token_file=args.agent_token_file,
+        gate_threshold_ops=args.gate_threshold_ops,
+        gate_threshold_age=args.gate_threshold_age,
+        winrm_url=args.winrm_url,
+        winrm_user=args.winrm_user,
+        winrm_password=args.winrm_password,
     )
 
     # Handle signals
