@@ -33,7 +33,7 @@ sys.path.insert(0, HERE)
 import fs_testkit  # noqa: E402
 
 SANDBOX = "/root/bridge-test"
-PORT = 10810
+PORT = 10811   # distinct from the overlay harness so the two never share an NBD socket
 
 
 def log(msg):
@@ -48,7 +48,9 @@ def guard(path):
 
 
 class Bridge:
-    def __init__(self, source, image, mount, protected_roots="", overflow=None):
+    def __init__(self, source, image, mount, protected_roots="", overflow=None,
+                 extra_args=()):
+        self.extra_args = list(extra_args)
         self.source = guard(source)
         self.image = guard(image)
         self.mount = guard(mount)
@@ -77,6 +79,7 @@ class Bridge:
             cmd += ["--protected-roots", self.protected_roots]
         if self.overflow:
             cmd += ["--overflow-dir", self.overflow]
+        cmd += self.extra_args
         log("  starting bridge: %s" % " ".join(cmd[2:]))
         self.fh = open(self.log_path, "ab")
         self.fh.write(b"\n==== start %s ====\n" % time.ctime().encode())
@@ -246,6 +249,93 @@ def scenario_stale_restart(args):
     return 0 if (not probs and not ghosts and not missing) else 1
 
 
+def scenario_record_only(args):
+    """Write THROUGH the volume and prove nothing reaches ext4 - but that every
+    attempt is catalogued in enough detail to judge it."""
+    import json
+    src = os.path.join(SANDBOX, "source")
+    image = os.path.join(SANDBOX, "image.raw")
+    catalogue = image + ".ext4-attempts.jsonl"
+    if os.path.exists(catalogue):
+        os.remove(catalogue)
+    before = fs_testkit.manifest(src)
+
+    b = Bridge(src, image, os.path.join(SANDBOX, "mnt"),
+               protected_roots=(args.protected_roots or "auto"),
+               extra_args=["--record-only"])
+    attempted = []
+    try:
+        b.start()
+        m = b.mount
+
+        def attempt(label, fn):
+            try:
+                fn()
+                attempted.append((label, "accepted by ntfs-3g"))
+            except OSError as e:
+                attempted.append((label, "refused: %s" % e))
+
+        # What a guest might do to a library, through the volume.
+        attempt("overwrite sizes/size_4096.bin",
+                lambda: open(os.path.join(m, "sizes", "size_4096.bin"), "r+b").write(b"\xab" * 4096))
+        attempt("zero-fill sizes/size_65537.bin",
+                lambda: open(os.path.join(m, "sizes", "size_65537.bin"), "r+b").write(bytes(65537)))
+        attempt("truncate sizes/size_131072.bin",
+                lambda: open(os.path.join(m, "sizes", "size_131072.bin"), "r+b").truncate(100))
+        attempt("delete names/with spaces.txt",
+                lambda: os.remove(os.path.join(m, "names", "with spaces.txt")))
+        attempt("create sizes/new_from_guest.bin",
+                lambda: open(os.path.join(m, "sizes", "new_from_guest.bin"), "wb").write(b"guest" * 1000))
+        attempt("rename names/UPPER.TXT -> names/renamed.txt",
+                lambda: os.rename(os.path.join(m, "names", "UPPER.TXT"),
+                                  os.path.join(m, "names", "renamed.txt")))
+        for label, outcome in attempted:
+            log("     %-44s %s" % (label, outcome))
+        time.sleep(15)      # let the MFT worker reconcile (and refuse)
+    finally:
+        b.stop()
+
+    after = fs_testkit.manifest(src)
+    probs = fs_testkit.compare(before, after)
+    report("record-only", probs, before)
+
+    log("")
+    log("  catalogue: %s" % catalogue)
+    recs = []
+    if os.path.exists(catalogue):
+        for line in open(catalogue, encoding="utf-8"):
+            line = line.strip()
+            if line:
+                r = json.loads(line)
+                if not r.get("header"):
+                    recs.append(r)
+    ops = {}
+    for r in recs:
+        ops[r["op"]] = ops.get(r["op"], 0) + 1
+    log("  attempts catalogued: %d  by op: %s" % (len(recs), ops))
+    for r in recs[:25]:
+        extra = ""
+        if r["op"] == "data_write":
+            extra = " bytes=%s zero=%s spans=%s" % (r.get("bytes"), r.get("all_zero"),
+                                                   r.get("spans", [])[:2])
+        log("     %-14s %-40s%s" % (r["op"], r.get("path", "")[:40], extra))
+
+    # The test: ext4 untouched, and the writes we made show up as attempts.
+    ok = not probs
+    want = {"data_write", "delete"}
+    have = set(ops)
+    if not want <= have:
+        log("  MISSING expected attempt kinds: %s" % sorted(want - have))
+        ok = False
+    zero = [r for r in recs if r["op"] == "data_write" and r.get("all_zero")]
+    if not zero:
+        log("  the zero-fill write was not flagged all_zero")
+        ok = False
+    log("")
+    log("RECORD-ONLY VERDICT: %s" % ("ext4 untouched, attempts catalogued" if ok else "see above"))
+    return 0 if ok else 1
+
+
 def report(name, probs, before):
     log("")
     if not probs:
@@ -267,7 +357,7 @@ def report(name, probs, before):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", choices=["readonly", "stale-restart"])
+    ap.add_argument("scenario", choices=["readonly", "stale-restart", "record-only"])
     ap.add_argument("--protected-roots", default="")
     args = ap.parse_args()
 
@@ -278,6 +368,8 @@ def main():
         % (args.scenario, args.protected_roots))
     if args.scenario == "readonly":
         return scenario_readonly(args)
+    if args.scenario == "record-only":
+        return scenario_record_only(args)
     return scenario_stale_restart(args)
 
 

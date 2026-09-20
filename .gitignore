@@ -55,3 +55,8 @@ venv/
 *.bak
 *.bak-*
 *.orig
+
+# Bridge sidecar files (live next to the image, may hold library paths)
+*.ext4-attempts.jsonl
+*.op-journal.jsonl
+*.mftops

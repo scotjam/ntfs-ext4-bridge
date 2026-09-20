@@ -53,6 +53,8 @@ def mapper():
     m._safe_mode = False
     m._windows_created_sources = set()
     m._protect_refused = set()
+    m._attempt_log = None
+    m.record_only = False
     m._protected_ia_sizes = {}
     m._ia_protect_warned = set()
     m._mft_mirror_offset = -1

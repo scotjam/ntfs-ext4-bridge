@@ -375,10 +375,15 @@ class OpJournal:
             processed = {r['seq'] for r in results if 'seq' in r}
             dirty_changed = False
             for r in results:
+                op = next((o for o in self._ops
+                           if o['seq'] == r.get('seq')), None)
+                rel = op.get('_rel') if op else None
+                self._journal_write({
+                    'ack': True, 'ts': now, 'seq': r.get('seq'),
+                    'status': r.get('status'), 'code': r.get('code'),
+                    'message': r.get('message'), 'rel': rel,
+                    'op': (op or {}).get('op')})
                 if r.get('status') != 'ok':
-                    op = next((o for o in self._ops
-                               if o['seq'] == r.get('seq')), None)
-                    rel = op.get('_rel') if op else None
                     log(f"guest op {r.get('seq')} failed: "
                         f"{r.get('code')} {r.get('message')} ({rel})")
                     if rel:

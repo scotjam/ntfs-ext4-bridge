@@ -11,6 +11,8 @@ Supports lazy allocation: large files can start as sparse (no clusters),
 get allocated on first read, and deallocated after a timeout.
 """
 import bisect
+import hashlib
+import json
 import errno
 import mmap
 import os
@@ -202,6 +204,78 @@ def _set_bitmap_bits(bitmap: bytearray, start: int, count: int, value: bool):
         bitmap[last_byte] &= (~mask) & 0xFF
 
 
+class Ext4AttemptLog:
+    """Append-only JSONL of every ext4 mutation the bridge would have made.
+
+    Record-only mode refuses every guest-originated write to pre-existing ext4
+    and writes it here instead, one line per attempt, no de-duplication. The
+    point is review: what does Windows try to do to the library, and would
+    letting it through have been valid or corruption? Only once that question
+    has an evidence-based answer is the direction worth linking in.
+
+    Data writes are coalesced per NBD request and per file, with a hash and a
+    short preview of the bytes, so a zero-filled rewrite or a truncation is
+    visible in the log without opening anything.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._fh = open(path, "a", encoding="utf-8")
+        self._write({"header": True, "mode": "record-only",
+                     "ts": time.time(), "pid": os.getpid()})
+
+    def _write(self, rec: dict):
+        try:
+            self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self._fh.flush()
+        except (OSError, ValueError):
+            pass
+
+    def record(self, op: str, source_path: str, rel_path: str = "", **detail):
+        rec = {"ts": time.time(), "op": op, "path": rel_path or source_path,
+               "source": source_path}
+        try:
+            rec["size_on_ext4"] = os.path.getsize(source_path)
+        except OSError:
+            rec["size_on_ext4"] = None
+        rec.update(detail)
+        self._write(rec)
+
+    def record_data(self, source_path: str, rel_path: str, ranges):
+        """ranges: list of (offset, bytes). Coalesced by the caller per file."""
+        h = hashlib.sha256()
+        total = 0
+        spans = []
+        cur = None
+        all_zero = True
+        preview = b""
+        for off, b in sorted(ranges, key=lambda r: r[0]):
+            h.update(b)
+            total += len(b)
+            if any(b):
+                all_zero = False
+            if not preview:
+                preview = b[:64]
+            if cur and off == cur[1]:
+                cur[1] = off + len(b)
+            else:
+                if cur:
+                    spans.append(tuple(cur))
+                cur = [off, off + len(b)]
+        if cur:
+            spans.append(tuple(cur))
+        self.record("data_write", source_path, rel_path,
+                    bytes=total, spans=spans[:32], span_count=len(spans),
+                    sha256=h.hexdigest(), all_zero=all_zero,
+                    preview_hex=preview.hex())
+
+    def close(self):
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+
+
 class ClusterMapper:
     """Maps NTFS clusters to ext4 source files via MFT scanning.
 
@@ -217,7 +291,9 @@ class ClusterMapper:
                  overflow_dir: Optional[str] = None,
                  protected_roots: Optional[Iterable[str]] = None,
                  roots: Optional[Iterable[str]] = None,
-                 safe_mode: bool = False):
+                 safe_mode: bool = False,
+                 record_only: bool = False,
+                 attempt_log_path: str = None):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
 
@@ -233,7 +309,13 @@ class ClusterMapper:
         # at risk are the ones Windows created in the root. No guest agent or
         # consistency gate is involved. See _is_source_protected /
         # _is_record_protected for the enforcement, keyed on the set below.
-        self._safe_mode = bool(safe_mode)
+        # Record-only borrows safe mode's refusal rule - everything that
+        # pre-existed in ext4 is read-only at the bridge, only objects Windows
+        # created this session are writable - and adds the catalogue.
+        self.record_only = bool(record_only)
+        self._safe_mode = bool(safe_mode) or self.record_only
+        self._attempt_log = (Ext4AttemptLog(attempt_log_path)
+                             if self.record_only and attempt_log_path else None)
         # Absolute source paths the bridge itself created for Windows this
         # session (via _check_new_file / _check_new_directory). In safe mode
         # these are the ONLY writable source objects.
@@ -1101,6 +1183,9 @@ class ClusterMapper:
                 log("  STALE IMAGE: refusing %s on %s (image reused from a "
                     "previous run, not yet re-derived from ext4)"
                     % (what, rel_path or source_path))
+            if self._attempt_log:
+                self._attempt_log.record(what, source_path, rel_path,
+                                         reason="stale image")
             return True
         if not self._is_source_protected(source_path):
             return False
@@ -1109,7 +1194,119 @@ class ClusterMapper:
             self._protect_refused.add(key)
             log("  PROTECTED: refusing %s on %s (ext4 is authoritative here)"
                 % (what, rel_path or source_path))
+        if self._attempt_log:
+            self._attempt_log.record(what, source_path, rel_path,
+                                     reason="record-only" if self.record_only
+                                     else "protected root")
         return True
+
+    @staticmethod
+    def _record_diff(cur: bytes, want: bytes, limit: int = 16):
+        """Runs of differing bytes as [offset, from_hex, to_hex], for review."""
+        out = []
+        i = 0
+        n = min(len(cur), len(want))
+        while i < n and len(out) < limit:
+            if cur[i] == want[i]:
+                i += 1
+                continue
+            j = i
+            while j < n and cur[j] != want[j] and j - i < 64:
+                j += 1
+            out.append([i, cur[i:j].hex(), want[i:j].hex()])
+            i = j
+        return out
+
+    def _catalogue_refused_record_write(self, record_num: int,
+                                        offset: int, data: bytes) -> None:
+        """Record-only: say what a dropped MFT record write was trying to do.
+
+        A guest delete, rename or truncate of a pre-existing file never
+        reaches ext4 in record-only mode because the record write itself is
+        refused above; without this the catalogue would show data writes and
+        nothing else, and the whole point of the mode is to see every change
+        Windows attempts. Rebuild the record as the guest wanted it (current
+        bytes with the incoming chunk laid over) and diff it against what the
+        image holds. Caller holds self.lock.
+        """
+        try:
+            rec_abs = self._rec_offset(record_num)
+            if rec_abs is None:
+                return
+            cur = bytes(self.image[rec_abs:rec_abs + MFT_RECORD_SIZE])
+            if len(cur) != MFT_RECORD_SIZE or cur[0:4] != b'FILE':
+                return
+            want = bytearray(cur)
+            a = max(offset, rec_abs)
+            b = min(offset + len(data), rec_abs + MFT_RECORD_SIZE)
+            if a >= b:
+                return
+            want[a - rec_abs:b - rec_abs] = data[a - offset:b - offset]
+            want = bytes(want)
+
+            source_path = self.mft_record_to_source.get(record_num)
+            if source_path is not None:
+                rel_path = self._get_rel_path(source_path)
+                kind = 'file'
+            else:
+                rel_path = self.mft_record_to_dir.get(record_num, '')
+                source_path = self._resolve_source_path(rel_path) if rel_path else ''
+                kind = 'dir'
+
+            cur_flags = struct.unpack('<H', cur[22:24])[0]
+            new_flags = struct.unpack('<H', want[22:24])[0]
+            cur_seq = struct.unpack('<H', cur[16:18])[0]
+            new_seq = struct.unpack('<H', want[16:18])[0]
+            detail = {'record': record_num, 'kind': kind,
+                      'flags_from': cur_flags, 'flags_to': new_flags,
+                      'seq_from': struct.unpack('<H', cur[16:18])[0],
+                      'seq_to': struct.unpack('<H', want[16:18])[0],
+                      'changed_bytes': sum(1 for x, y in zip(cur, want) if x != y),
+                      'diff': self._record_diff(cur, want)}
+            if (cur_flags & 0x01) and not (new_flags & 0x01):
+                op = 'delete'
+            elif new_seq != cur_seq:
+                # NTFS bumps the sequence number when a record is freed. The
+                # kernel page cache hands us only the state at flush time, so
+                # a delete followed by a create that reused the slot arrives
+                # as one write that looks like a rename. It is not: the old
+                # inode was destroyed.
+                op = 'delete'
+                if new_flags & 0x01:
+                    new_name, new_parent = self._extract_filename_and_parent(want)
+                    detail['reused_for'] = new_name
+                    detail['reused_parent'] = new_parent & 0xFFFFFFFFFFFF
+            else:
+                cur_name, cur_parent = self._extract_filename_and_parent(cur)
+                new_name, new_parent = self._extract_filename_and_parent(want)
+                if (new_name, new_parent) != (cur_name, cur_parent):
+                    op = 'rename'
+                    detail['from'] = cur_name
+                    detail['to'] = new_name
+                    detail['parent_from'] = cur_parent & 0xFFFFFFFFFFFF
+                    detail['parent_to'] = new_parent & 0xFFFFFFFFFFFF
+                elif kind == 'file':
+                    cur_size = self._extract_file_size(cur)
+                    new_size = self._extract_file_size(want)
+                    if cur_size is not None and new_size is not None                             and cur_size != new_size:
+                        op = 'truncate' if new_size < cur_size else 'extend'
+                        detail['size_from'] = cur_size
+                        detail['size_to'] = new_size
+                    else:
+                        op = 'record_update'
+                else:
+                    op = 'record_update'
+            if op == 'record_update':
+                # Timestamps / attribute churn: worth counting, not worth a
+                # line each. One per record per session.
+                key = (record_num, 'record_update')
+                if key in self._protect_refused:
+                    return
+                self._protect_refused.add(key)
+            self._attempt_log.record(op, source_path, rel_path,
+                                     reason="record-only", **detail)
+        except Exception as e:
+            log(f"  catalogue of refused record write failed: {e}")
 
     def _mft_write_to_image(self, offset: int, data: bytes):
         """Write MFT record data to the image (fast path, called under self.lock).
@@ -1149,12 +1346,20 @@ class ClusterMapper:
                     # Protect directly-allocated file records from external overwrites.
                     # ntfs-3g or Windows journal replay may write stale sparse data
                     # runs for these records, which would silently undo allocate_file_direct().
+                    # Still a guest change we want to see in record-only mode:
+                    # a truncate of a lazily allocated file lands here.
+                    if self._attempt_log:
+                        self._catalogue_refused_record_write(
+                            record_num, offset, data)
                     continue
                 if self._is_record_protected(record_num):
                     # User-configured read-only top-level dir: drop the write.
                     # The image keeps its current (good) record bytes; ext4 source
                     # never sees the write either, since _mft_sync_ext4_passes
                     # re-reads the (unchanged) record from the image.
+                    if self._attempt_log:
+                        self._catalogue_refused_record_write(
+                            record_num, offset, data)
                     continue
                 rec_abs = self._rec_offset(record_num)
                 if rec_abs is None:
@@ -1251,18 +1456,8 @@ class ClusterMapper:
                                             record_num, 'INDEX_BITMAP value',
                                             ib_off_in_rec, ib_hdr)
 
-                # Keep $MFTMirr in sync: if this record falls within the
-                # mirror's range, copy the full record to the mirror cluster.
-                # This prevents ntfs-3g from crashing with "$MFTMirr does not
-                # match $MFT" after any write to the mirrored records.
-                if (self._mft_mirror_offset >= 0
-                        and record_num < self._mft_mirror_record_count):
-                    # Re-read the full (now-updated) record from the primary MFT
-                    primary_off = rec_abs
-                    mirror_off = self._mft_mirror_offset + record_num * MFT_RECORD_SIZE
-                    full_record = self.image[primary_off:primary_off + MFT_RECORD_SIZE]
-                    if len(full_record) == MFT_RECORD_SIZE:
-                        self.image[mirror_off:mirror_off + MFT_RECORD_SIZE] = full_record
+                # Keep $MFTMirr in sync with whatever this record now holds.
+                self._sync_mirror_record(record_num)
 
     def _mft_worker(self):
         """Background thread: drain the MFT write queue and sync changes to ext4.
@@ -1340,6 +1535,9 @@ class ClusterMapper:
     def _write_inner(self, offset: int, data: bytes):
         """Inner write implementation for non-MFT writes."""
         cluster_size = self.cluster_size
+        # Record-only: refused data writes are gathered here per file and
+        # written to the catalogue once at the end of this request.
+        attempts = {}
 
         # MFT region is handled by write() via _mft_write_to_image + queue
         if self.is_mft_region(offset, len(data)):
@@ -1373,6 +1571,9 @@ class ClusterMapper:
                     # Write to ext4 source file (per-cluster mapping)
                     source_path, file_offset = mapping
                     if self._is_source_protected(source_path):
+                        if self._attempt_log:
+                            attempts.setdefault(source_path, []).append(
+                                (file_offset + cluster_offset, bytes(chunk_data)))
                         pos += chunk_len
                         continue
                     write_offset = file_offset + cluster_offset
@@ -1394,6 +1595,9 @@ class ClusterMapper:
                 # RUN_MAP_THRESHOLD=0 end up here, ensuring writes reach ext4)
                 source_path, file_offset = run_mapping
                 if self._is_source_protected(source_path):
+                    if self._attempt_log:
+                        attempts.setdefault(source_path, []).append(
+                            (file_offset + cluster_offset, bytes(chunk_data)))
                     pos += chunk_len
                     continue
                 write_offset = file_offset + cluster_offset
@@ -1418,6 +1622,10 @@ class ClusterMapper:
 
             pos += chunk_len
 
+        if attempts and self._attempt_log:
+            for sp, ranges in attempts.items():
+                self._attempt_log.record_data(sp, self._get_rel_path(sp), ranges)
+
     def get_size(self) -> int:
         """Get total volume size."""
         return len(self.image)
@@ -1438,41 +1646,20 @@ class ClusterMapper:
         ntfsfix deliberately sets the dirty bit so Windows runs chkdsk on
         first mount. The bridge's image is internally consistent (its own
         fixups), and letting Windows auto-chkdsk the bridge volume is a
-        safety hazard — chkdsk would rewrite metadata underneath the bridge.
+        safety hazard - chkdsk would rewrite metadata underneath the bridge.
         Clear it after each ntfsfix so Windows mounts clean.
 
-        The flags field sits early in record 3 (well before the USA fixup
-        positions at 510/1022), so it can be patched directly in the image
-        without re-doing fixups.
+        This used to patch the flags word in $MFT directly and stop there.
+        $MFTMirr then still said dirty, and ntfs-3g refused the local mount
+        with "$MFTMirr does not match $MFT (record 3)" - unnoticed under
+        --two-way, which never mounts locally, and fatal everywhere else.
+        There is one clearing routine and one mirror routine; use both.
         """
         try:
-            rec_abs = self._rec_offset(3)
-            if rec_abs is None or rec_abs + MFT_RECORD_SIZE > len(self.image):
-                return
-            raw = self._undo_fixups(bytearray(
-                self.image[rec_abs:rec_abs + MFT_RECORD_SIZE]))
-            if raw[:4] != b'FILE':
-                return
-            off = struct.unpack('<H', raw[20:22])[0]
-            while off < MFT_RECORD_SIZE - 8:
-                atype = struct.unpack('<I', raw[off:off + 4])[0]
-                if atype == 0xFFFFFFFF:
-                    break
-                alen = struct.unpack('<I', raw[off + 4:off + 8])[0]
-                if alen == 0 or alen > MFT_RECORD_SIZE:
-                    break
-                if atype == 0x70 and raw[off + 8] == 0:  # $VOLUME_INFORMATION
-                    val_off = struct.unpack('<H', raw[off + 20:off + 22])[0]
-                    flags_abs = rec_abs + off + val_off + 0x0A
-                    if flags_abs + 2 > len(self.image):
-                        return
-                    cur = struct.unpack('<H', self.image[flags_abs:flags_abs + 2])[0]
-                    if cur & 0x0001:
-                        self.image[flags_abs:flags_abs + 2] = \
-                            struct.pack('<H', cur & ~0x0001)
-                        log("Cleared NTFS volume dirty bit")
-                    return
-                off += alen
+            with self.lock:
+                if self._clear_volume_dirty_flag():
+                    self._sync_mirror_record(MFT_RECORD_VOLUME)
+                    log("Cleared NTFS volume dirty bit (and mirrored it)")
         except Exception as e:
             log(f"clear_dirty_bit error: {e}")
 
@@ -5244,6 +5431,32 @@ class ClusterMapper:
         runs.append(0)  # End marker
         return bytes(runs)
 
+    def _sync_mirror_record(self, record_num: int) -> bool:
+        """Copy record_num from $MFT to $MFTMirr, if the mirror covers it.
+
+        The only correct way to change a mirrored record is to change it in
+        $MFT and then copy the whole record across: ntfs-3g refuses to mount a
+        volume whose mirror disagrees with $MFT ("$MFTMirr does not match
+        $MFT (record N)"), and Windows chkdsk flags it. Every writer of the
+        first few records must end here - _mft_write_to_image does, and so
+        must anything that patches $Volume, $MFT or $MFTMirr out of band.
+
+        Caller holds self.lock. Returns True if a copy was made.
+        """
+        if (self._mft_mirror_offset < 0
+                or record_num >= self._mft_mirror_record_count):
+            return False
+        primary_off = self._rec_offset(record_num)
+        if primary_off is None:
+            return False
+        mirror_off = self._mft_mirror_offset + record_num * MFT_RECORD_SIZE
+        full_record = self.image[primary_off:primary_off + MFT_RECORD_SIZE]
+        if len(full_record) != MFT_RECORD_SIZE \
+                or mirror_off + MFT_RECORD_SIZE > len(self.image):
+            return False
+        self.image[mirror_off:mirror_off + MFT_RECORD_SIZE] = full_record
+        return True
+
     def _clear_volume_dirty_flag(self) -> bool:
         """Clear VOLUME_IS_DIRTY in the $Volume record, in place in the image.
 
@@ -5724,19 +5937,26 @@ class ClusterMapper:
             if not self._validate_path(source_path, '_check_new_file'):
                 return None
 
-            if self._refuse_ext4_mutation(source_path, 'materialize', rel_path):
-                return None
-
-            if rel_path in self.ext4_sync_in_progress:
-                log(f"  Skipping new file (ext4 sync in progress): {rel_path}")
-                self._notify_echo_observed(rel_path)
+            if os.path.exists(source_path):
+                # ext4 already has this path: just link the record to it.
+                # That is a read-side mapping, not a mutation, so it must
+                # happen before the protection check - the post-startup
+                # populate re-creates through the mount whatever the guest
+                # deleted or renamed, and under record-only / protected roots
+                # that record would otherwise stay unmapped and every read of
+                # it would EIO.
                 self.mft_record_to_source[record_num] = source_path
                 self._note_file_seq(record_num, record)
                 self.path_to_mft_record[rel_path] = record_num
                 self._track_file_data(record, record_num, source_path)
                 return None
 
-            if os.path.exists(source_path):
+            if self._refuse_ext4_mutation(source_path, 'materialize', rel_path):
+                return None
+
+            if rel_path in self.ext4_sync_in_progress:
+                log(f"  Skipping new file (ext4 sync in progress): {rel_path}")
+                self._notify_echo_observed(rel_path)
                 self.mft_record_to_source[record_num] = source_path
                 self._note_file_seq(record_num, record)
                 self.path_to_mft_record[rel_path] = record_num

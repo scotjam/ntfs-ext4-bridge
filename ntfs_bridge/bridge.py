@@ -222,6 +222,7 @@ class NTFSBridge:
                  roots=None,
                  two_way=False,
                  safe_mode=False,
+                 record_only=False,
                  control_host='192.168.122.1',
                  control_port=10810,
                  agent_token_file=None,
@@ -257,6 +258,13 @@ class NTFSBridge:
         self.safe_mode = safe_mode
         if self.safe_mode and self.two_way:
             raise ValueError("--safe-mode and --two-way are mutually exclusive")
+        # Record-only: the NTFS->ext4 direction is catalogued and refused for
+        # everything that pre-existed in ext4 (Windows' own new root objects
+        # still land in the overflow dir), while ext4->NTFS may run live. It
+        # composes with --two-way, which is what supplies the live half; on
+        # its own it serves the volume and just keeps the catalogue.
+        self.record_only = record_only
+        self.attempt_log_path = image_path + '.ext4-attempts.jsonl'
 
         self.control_host = control_host
         self.control_port = control_port
@@ -477,7 +485,9 @@ class NTFSBridge:
                                      overflow_dir=self.overflow_dir,
                                      protected_roots=self.protected_roots,
                                      roots=self.roots,
-                                     safe_mode=self.safe_mode)
+                                     safe_mode=self.safe_mode,
+                                     record_only=self.record_only,
+                                     attempt_log_path=self.attempt_log_path)
 
         # A reused image describes the tree as it was when we last shut down.
         # ext4 can have moved on since - files added, moved or deleted while the
@@ -776,6 +786,9 @@ class NTFSBridge:
         if self.safe_mode:
             log("  Safe mode: ENABLED (read-all; writes only to files "
                 "Windows creates at the volume root; existing ext4 read-only)")
+        if self.record_only:
+            log("  Record-only: ENABLED (guest writes to pre-existing ext4 are "
+                "catalogued and refused; see " + self.attempt_log_path + ")")
         if (not mount_success and not self.virtual_mode and not self.two_way
                 and not self.safe_mode):
             log("  WARNING: ntfs-3g mount failed, ext4→NTFS sync disabled")
@@ -2041,6 +2054,12 @@ def main():
                         help='Enable full two-way live sync via the guest '
                              'agent (see guest_agent/). Replaces the local '
                              'ntfs-3g mount + SyncDaemon.')
+    parser.add_argument('--record-only', action='store_true',
+                        help='Catalogue every guest write that would reach '
+                             'pre-existing ext4 to <image>.ext4-attempts.jsonl '
+                             'and refuse it. Composes with --two-way for live '
+                             'ext4->NTFS. New objects Windows creates at the '
+                             'volume root still sync via the overflow dir.')
     parser.add_argument('--safe-mode', action='store_true',
                         help='Read-only for all existing ext4 content; Windows '
                              'may only create/write/delete its OWN new files at '
@@ -2090,6 +2109,7 @@ def main():
         roots=roots,
         two_way=args.two_way,
         safe_mode=args.safe_mode,
+        record_only=args.record_only,
         control_host=args.control_host,
         control_port=args.control_port,
         agent_token_file=args.agent_token_file,

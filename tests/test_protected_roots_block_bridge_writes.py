@@ -55,6 +55,8 @@ def make_mapper(source_dir, image):
     m._file_mft_seq = {}
     m._dir_mft_seq = {}
     m._protect_refused = set()
+    m._attempt_log = None
+    m.record_only = False
     m.ext4_authoritative = False
     m.mft_record_to_source = {}
     m.mft_record_to_dir = {}

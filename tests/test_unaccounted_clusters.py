@@ -74,6 +74,8 @@ def make_mapper():
     m._safe_mode = False
     m._windows_created_sources = set()
     m._protect_refused = set()
+    m._attempt_log = None
+    m.record_only = False
     m.ext4_authoritative = False
     m._check_sparse_file_read = lambda *a, **k: None
 
