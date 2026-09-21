@@ -173,6 +173,7 @@ function Execute-Op($op, $driveLetter) {
 Log "bridge-agent $AgentVersion starting"
 $epoch = $null
 $driveLetter = $null
+$lostVolume = $false
 
 while ($true) {
     try {
@@ -209,8 +210,25 @@ while ($true) {
 
         if ($resp.epoch -ne $epoch) {
             # Bridge restarted or a gate completed: our cached NTFS state may
-            # be stale. Cycle the disk to drop caches, reset the cursor.
-            Log "epoch change $epoch -> $($resp.epoch): cycling disk to drop caches"
+            # be stale, and so may the drive letter - after a bridge restart
+            # the volume can come back as a different disk/letter. Re-resolve
+            # the volume by serial (hello) before anything else; a cycle with
+            # the old letter failed here and every op after it failed with
+            # "No MSFT_Volume ... DriveLetter".
+            Log "epoch change $epoch -> $($resp.epoch): re-resolving the volume, cycling disk to drop caches"
+            $epoch = $null
+            Set-Cursor 0
+            $hello = Invoke-Bridge '/v1/hello' @{
+                agent_version = $AgentVersion
+                hostname = $env:COMPUTERNAME
+            }
+            $newLetter = Find-BridgeVolume $hello.volume_serial
+            if (-not $newLetter) {
+                Log "bridge volume (serial $($hello.volume_serial)) not found after epoch change; retrying in 15s"
+                Start-Sleep -Seconds 15
+                continue
+            }
+            $driveLetter = $newLetter
             try {
                 $diskNum = Get-BridgeDiskNumber $driveLetter
                 Set-Disk -Number $diskNum -IsOffline $true
@@ -219,8 +237,8 @@ while ($true) {
             } catch {
                 Log "disk cycle failed: $_"
             }
-            $epoch = $resp.epoch
-            Set-Cursor 0
+            $epoch = $hello.epoch
+            Log "re-hello ok: epoch=$epoch volume=${driveLetter}:"
             continue
         }
 
@@ -236,12 +254,21 @@ while ($true) {
                 Log "op $($op.seq) ($($op.op) $($op.path)) failed: $_"
                 $results += @{ seq = $op.seq; status = 'error'
                                code = 'EFAIL'; message = "$_" }
+                if ("$_" -match 'DriveLetter' -or -not (Test-Path -LiteralPath "${driveLetter}:\")) {
+                    # the volume moved from under us: re-resolve on the next loop
+                    $lostVolume = $true
+                }
             }
             $maxSeq = $op.seq
         }
 
         Invoke-Bridge '/v1/ack' @{ epoch = $epoch; results = $results } | Out-Null
         Set-Cursor $maxSeq
+        if ($lostVolume) {
+            Log "volume ${driveLetter}: is gone; re-resolving via hello"
+            $lostVolume = $false
+            $epoch = $null
+        }
     }
     catch {
         Log "loop error: $_"
