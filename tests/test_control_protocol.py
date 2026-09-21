@@ -102,6 +102,10 @@ def test_hello_returns_epoch_and_serial(server):
 
 def test_poll_ack_roundtrip_with_suppression(server):
     _, journal, coordinator, mapper, _, port = server
+    # dispatch drops ops whose ext4 subject no longer exists; give this
+    # synthetic mkdir a real directory to describe
+    os.makedirs(os.path.join(journal.source_dir, 'Share', 'newdir'),
+                exist_ok=True)
     journal.inject_op({'op': 'mkdir', 'path': 'Share\\newdir',
                        '_rel': 'Share/newdir'})
 
@@ -120,6 +124,11 @@ def test_poll_ack_roundtrip_with_suppression(server):
 
     # Echo observation releases suppression immediately
     mapper.echo_observed_callback('Share/newdir')
+    # the echo starts a short grace (trailing driver writes for the same
+    # op must still be dropped); release follows within a sweep or two
+    deadline = time.time() + 5.0
+    while 'Share/newdir' in mapper.ext4_sync_in_progress and time.time() < deadline:
+        time.sleep(0.2)
     assert 'Share/newdir' not in mapper.ext4_sync_in_progress
 
 

@@ -494,10 +494,19 @@ class NTFSBridge:
         # bridge was down - and _populate_image() skips entries already present,
         # so stale paths survive. Until the volume has mounted cleanly, ext4 is
         # the authority and reconciliation may not write back to it.
-        self.mapper.ext4_authoritative = not image_is_fresh
+        # ... unless _populate_image() just mounted the reused image, pruned
+        # what ext4 no longer has and added what it gained: that IS the
+        # re-derivation, in every mode. The flag stayed set for good in
+        # --two-way (which never mounts locally), refusing every guest
+        # change to ext4 after a restart.
+        rederived = getattr(self, '_image_rederived', False)
+        self.mapper.ext4_authoritative = not image_is_fresh and not rederived
         if self.mapper.ext4_authoritative:
             log("Image reused: ext4 is authoritative until the volume mounts "
                 "cleanly (reconciliation will not write back to ext4 yet)")
+        elif not image_is_fresh:
+            log("Image reused and re-derived from ext4 at startup "
+                "(pruned + populated): reconciliation enabled")
 
         # Sanity check: if the MFT holds many user file records but almost
         # none could be mapped to an ext4 source, the source data is missing
@@ -1634,6 +1643,7 @@ class NTFSBridge:
             # a folder renamed at the source does not keep its old name in
             # the volume as a stale twin.
             self._prune_stale_entries(tmp_mount)
+            self._image_rederived = True
 
             log("Populating NTFS image from ext4 source...")
             files_created = 0
@@ -1797,7 +1807,10 @@ class NTFSBridge:
         step in populate that deletes, and it must not mistake an absent
         disk for an empty one.
         """
-        exposed = [name for name in (self.protected_roots or [])
+        # The exposure list (--roots), not the protection list: a bridge
+        # run with --roots alone pruned nothing, so a file deleted on ext4
+        # while it was down stayed on the volume after restart.
+        exposed = [name for name in (self.roots or self.protected_roots or [])
                    if os.path.lexists(os.path.join(self.source_dir, name))]
         # Roots the bridge no longer exposes go first: a share renamed at the
         # source otherwise keeps its old name in the volume forever, backed by

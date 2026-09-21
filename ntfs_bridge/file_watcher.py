@@ -120,6 +120,7 @@ class FileWatcher:
                 inotify.constants.IN_CREATE |
                 inotify.constants.IN_DELETE |
                 inotify.constants.IN_CLOSE_WRITE |
+                inotify.constants.IN_MODIFY |
                 inotify.constants.IN_MOVED_FROM |
                 inotify.constants.IN_MOVED_TO |
                 inotify.constants.IN_ISDIR
@@ -167,6 +168,12 @@ class FileWatcher:
             # File write completed
             event_type = EVENT_CREATE  # Treat as create/modify
             log(f"File created/modified: {rel_path}")
+
+        elif 'IN_MODIFY' in type_names and 'IN_ISDIR' not in type_names:
+            # truncate()/pwrite() on an already-open or never-opened path
+            # produce no IN_CLOSE_WRITE. The debounce below folds a write
+            # storm into one event per quiet period.
+            event_type = EVENT_CREATE
 
         elif 'IN_MOVED_FROM' in type_names:
             cookie = raw_event[0].cookie if hasattr(raw_event[0], 'cookie') else 0

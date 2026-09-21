@@ -582,6 +582,9 @@ class ClusterMapper:
         # re-derived from ext4. ext4 is authoritative in that window and
         # reconciliation must not push image state onto it.
         self.ext4_authoritative = False
+        # rel -> set of agent op kinds currently in flight for that path
+        # (maintained by SyncCoordinator; empty when no two-way stack)
+        self.ext4_sync_kinds: Dict[str, Set[str]] = {}
 
         # $MFTMirr sync: byte offset of the mirror cluster in the image, and
         # how many MFT records it stores. Populated by _load_mft_mirror_info().
@@ -714,7 +717,40 @@ class ClusterMapper:
         """
         if not entries:
             return
-        new_list = list(self._direct_run_map)
+        # A cluster belongs to exactly one file. Any existing entry that
+        # overlaps a new one is stale (a freed run the driver reused) and
+        # would win the rightmost-start lookup for the old, possibly gone,
+        # path. Evict it.
+        # Sorted by start, so the candidates for an overlap with [st, en)
+        # sit just before the insertion point of `en`; walk back while an
+        # entry can still reach `st`. O(spans * log n), not O(n * spans):
+        # this runs under self.lock on every reparse, and with thousands of
+        # runs the linear form stalled every read on the volume.
+        cur = self._direct_run_map
+        evict = set()
+        for st, en, _sp, _o in entries:
+            i = bisect.bisect_left(cur, (en,)) - 1
+            while i >= 0:
+                e = cur[i]
+                if e[1] > st:
+                    evict.add(i)
+                    i -= 1
+                    continue
+                # entries are disjoint runs sorted by start; once one ends
+                # at or before `st`, earlier ones cannot overlap either
+                # unless they are stale overlaps themselves - look a few
+                # further back, then stop
+                j = i - 1
+                while j >= 0 and j >= i - 4:
+                    if cur[j][1] > st:
+                        evict.add(j)
+                    j -= 1
+                break
+        if evict:
+            new_list = [e for k, e in enumerate(cur) if k not in evict]
+            log(f"  run map: evicted {len(evict)} stale overlapping run(s)")
+        else:
+            new_list = list(cur)
         for entry in entries:
             bisect.insort(new_list, entry)
         self._direct_run_map = new_list
@@ -922,6 +958,15 @@ class ClusterMapper:
                 # previous, plausible-looking bytes, and serving those is the
                 # same silent corruption wearing a better disguise.
                 if (not meta
+                        and not self._is_guest_written(cluster)
+                        and self._cluster_is_allocated(cluster)
+                        and not self._allocated_at_load(cluster)):
+                    # Allocated by the guest during this session and never
+                    # written: a fresh allocation. Zeros are the truth (the
+                    # driver reads such clusters back before its first
+                    # partial write), and the image bytes are not.
+                    chunk = bytes(chunk_len)
+                elif (not meta
                         and not self._is_guest_written(cluster)
                         and self._cluster_is_allocated(cluster)):
                     if cluster not in self._unmapped_reported:
@@ -1217,6 +1262,100 @@ class ClusterMapper:
             i = j
         return out
 
+    def _is_stale_direct_replay(self, record_num: int, offset: int,
+                                data: bytes) -> bool:
+        """True if this write would re-sparsify a directly allocated file.
+
+        allocate_file_direct() replaces the sparse placeholder runs of a
+        lazily populated file with real clusters mapped to ext4. A driver
+        that still holds the old record (journal replay, a cached inode)
+        can write the sparse runs straight back, which would silently undo
+        the allocation. That, and only that, is refused: the record must be
+        in use, must still describe a file at least as large as we
+        allocated, and must carry a sparse extent where we put clusters.
+        Caller holds self.lock.
+        """
+        try:
+            rec_abs = self._rec_offset(record_num)
+            if rec_abs is None:
+                return False
+            a = max(offset, rec_abs)
+            b = min(offset + len(data), rec_abs + MFT_RECORD_SIZE)
+            if a >= b:
+                return False
+            want = bytearray(self.image[rec_abs:rec_abs + MFT_RECORD_SIZE])
+            want[a - rec_abs:b - rec_abs] = data[a - offset:b - offset]
+            if want[0:4] != b'FILE':
+                return False
+            want = self._undo_fixups(want)
+            flags = struct.unpack('<H', want[22:24])[0]
+            if not (flags & 0x01):
+                return False
+            source_path = self.mft_record_to_source.get(record_num)
+            if not source_path:
+                return False
+            ours = getattr(self, '_direct_allocated', {}).get(
+                self._get_rel_path(source_path))
+            if not ours:
+                return False
+            our_size = ours[1]
+            runs = self._extract_data_runs(want) or []
+            sparse = any(lcn in (-1, None) for lcn, _c in runs)
+            if not sparse:
+                return False
+            size = self._extract_file_size(want)
+            if size is not None and size < our_size:
+                return False
+            key = (record_num, 'stale sparse replay')
+            if key not in self._protect_refused:
+                self._protect_refused.add(key)
+                log(f"  Ignoring stale sparse data runs written back for "
+                    f"record {record_num} ({os.path.basename(source_path)}); "
+                    f"keeping the direct allocation")
+            return True
+        except Exception as e:
+            log(f"  _is_stale_direct_replay({record_num}) error: {e}")
+            return False
+
+    @staticmethod
+    def _uncovered(start: int, end: int, intervals):
+        """Parts of [start, end) not covered by any (s, e) in intervals."""
+        out = []
+        pos = start
+        for s_, e_ in sorted(intervals):
+            if e_ <= pos:
+                continue
+            if s_ >= end:
+                break
+            if s_ > pos:
+                out.append((pos, s_))
+            pos = max(pos, e_)
+            if pos >= end:
+                break
+        if pos < end:
+            out.append((pos, end))
+        return out
+
+    def _stamp_echo(self, *rels) -> None:
+        """Mark rel paths as just-written-by-the-bridge for the op journal's
+        echo filter. Called AFTER an ext4 mutation completes as well as
+        before it: a slow move (an overlay copy-up, a loaded disk) fires its
+        inotify event long after the pre-move stamp, and an unfiltered echo
+        becomes a guest op that undoes what the guest just did."""
+        now = time.time()
+        for rel in rels:
+            if rel:
+                self.ntfs_sync_timestamps[rel] = now
+
+    def _forget_direct_alloc(self, record_num: int, source_path: str) -> None:
+        """The guest now owns this record's allocation: stop treating the
+        runs we allocated as ours (the dealloc thread must never free
+        clusters the guest re-allocated). Caller holds self.lock."""
+        self._direct_allocated_records.discard(record_num)
+        da = getattr(self, '_direct_allocated', None)
+        if da:
+            da.pop(self._get_rel_path(source_path), None)
+
     def _catalogue_refused_record_write(self, record_num: int,
                                         offset: int, data: bytes) -> None:
         """Record-only: say what a dropped MFT record write was trying to do.
@@ -1342,15 +1481,13 @@ class ClusterMapper:
             for record_num in touched_records:
                 if record_num in self.dir_indx_clusters:
                     continue
-                if record_num in self._direct_allocated_records:
-                    # Protect directly-allocated file records from external overwrites.
-                    # ntfs-3g or Windows journal replay may write stale sparse data
-                    # runs for these records, which would silently undo allocate_file_direct().
-                    # Still a guest change we want to see in record-only mode:
-                    # a truncate of a lazily allocated file lands here.
-                    if self._attempt_log:
-                        self._catalogue_refused_record_write(
-                            record_num, offset, data)
+                if (record_num in self._direct_allocated_records
+                        and self._is_stale_direct_replay(record_num, offset, data)):
+                    # ntfs-3g or Windows journal replay writing back the
+                    # sparse runs this record had before allocate_file_direct()
+                    # replaced them. Keep ours. Every other guest change to a
+                    # lazily allocated file (resize, rename, delete) goes
+                    # through like any other record.
                     continue
                 if self._is_record_protected(record_num):
                     # User-configured read-only top-level dir: drop the write.
@@ -1459,6 +1596,75 @@ class ClusterMapper:
                 # Keep $MFTMirr in sync with whatever this record now holds.
                 self._sync_mirror_record(record_num)
 
+        # A write can straddle the end of the last known $MFT run - the
+        # driver extends $MFT by a cluster and writes the boundary page in
+        # one request. The part outside the runs used to be discarded, which
+        # lost the first records of every new $MFT extent. Put it in the
+        # image like any other guest write.
+        if write_end <= len(self.image):
+            pos = offset
+            covered = sorted(self._mft_runs)
+            for disk_off, run_bytes in covered:
+                run_end = disk_off + run_bytes
+                if pos < disk_off and min(write_end, disk_off) > pos:
+                    self._image_write_raw(pos, data[pos - offset:min(write_end, disk_off) - offset])
+                pos = max(pos, min(run_end, write_end))
+                if pos >= write_end:
+                    break
+            if pos < write_end:
+                self._image_write_raw(pos, data[pos - offset:write_end - offset])
+
+        if 0 in touched_records:
+            self._refresh_mft_runs()
+
+    def _image_write_raw(self, off: int, chunk: bytes) -> None:
+        """Plain image write with provenance. Caller holds self.lock."""
+        if not chunk:
+            return
+        self.image[off:off + len(chunk)] = chunk
+        for c in range(off // self.cluster_size,
+                       (off + len(chunk) - 1) // self.cluster_size + 1):
+            self._mark_guest_written(c)
+
+    def _refresh_mft_runs(self) -> None:
+        """Re-read $MFT's own data runs after the guest rewrote record 0.
+
+        The driver grows $MFT when it runs out of records. Until now the
+        bridge kept the runs it parsed at startup, so every record in a new
+        extent was invisible to the ext4 sync passes: files the guest (or
+        the agent, for the host) created there never reached ext4, and a
+        boundary write lost its tail. Caller holds self.lock.
+        """
+        try:
+            runs, total = self._get_mft_runs()
+        except Exception as e:
+            log(f"  _refresh_mft_runs: cannot parse record 0: {e}")
+            return
+        if not runs or (runs == self._mft_runs and total == self._mft_total_records):
+            return
+        old_runs = list(self._mft_runs)
+        self._mft_runs = runs
+        self._mft_total_records = total
+        new_ranges = []
+        for disk_off, run_bytes in runs:
+            pos = disk_off
+            end = disk_off + run_bytes
+            for o_off, o_bytes in old_runs:
+                o_end = o_off + o_bytes
+                if o_off <= pos < o_end:
+                    pos = o_end
+            if pos < end:
+                new_ranges.append((pos, end - pos))
+        for start, length in new_ranges:
+            for c in range(start // self.cluster_size,
+                           (start + length - 1) // self.cluster_size + 1):
+                self._metadata_clusters.add(c)
+            # Records already written into the new extent before this
+            # refresh went to the image as plain data; give them a sync pass.
+            self._mft_queue.put((None, start, bytes(length)))
+        log(f"$MFT changed: {total} records in {len(runs)} run(s); "
+            f"{len(new_ranges)} new extent(s) queued for sync")
+
     def _mft_worker(self):
         """Background thread: drain the MFT write queue and sync changes to ext4.
 
@@ -1478,7 +1684,8 @@ class ClusterMapper:
                 # next restart cannot help (the failure is deterministic given
                 # the same image state) and the consistency gate reconciles
                 # any residual drift. Leaving it pending would replay forever.
-                self._op_journal.append_done(seq)
+                if seq is not None:      # None: internal pass, not journaled
+                    self._op_journal.append_done(seq)
                 self._mft_queue.task_done()
 
     def _mft_sync_ext4_passes(self, offset: int, data: bytes):
@@ -1523,14 +1730,89 @@ class ClusterMapper:
             with self.lock:
                 in_source = record_num in self.mft_record_to_source
                 in_dir = record_num in self.mft_record_to_dir
-                is_direct = self._is_directly_allocated(record_num)
             if in_source:
-                if is_direct:
-                    continue
+                # Lazily (directly) allocated files used to be skipped here,
+                # and their record writes dropped in _mft_write_to_image, so
+                # a guest resize, rename or delete of any file the bridge
+                # had allocated itself never reached ext4 - while the data
+                # writes did, inflating the ext4 file to the cluster end.
+                # The only thing worth refusing is a stale replay that would
+                # re-sparsify our allocation; see _is_stale_direct_replay.
                 if not self._check_file_deleted(record_num):
                     self._reparse_mft_record(record_num)
             elif not in_dir:
                 self._check_new_file(record_num)
+
+        # Pass 3: directories the guest removed, now that their files are gone
+        self._run_pending_rmdirs()
+
+        # Pass 4: records refused earlier for lack of data, retried now that
+        # more writes have landed (cheap: the set is normally empty)
+        with self.lock:
+            pending = list(self.__dict__.get('_pending_materialize', ()))
+        for rec in pending:
+            with self.lock:
+                still_new = rec not in self.mft_record_to_source
+                await_ = self.__dict__.get('_await_data', {})
+                waiting = rec in await_.values()
+            if not still_new:
+                with self.lock:
+                    self._pending_materialize.discard(rec)
+                continue
+            if waiting:
+                continue
+            if self._check_new_file(rec) is not None:
+                with self.lock:
+                    self._pending_materialize.discard(rec)
+
+    def _ext4_data_write(self, source_path: str, write_offset: int,
+                         chunk: bytes) -> None:
+        """Put guest-written bytes into an ext4 file, without the two ways
+        this used to damage it.
+
+        1. The driver writes whole clusters. Writing the whole chunk past
+           the file's end grew every appended-to file to a cluster multiple
+           with a zero tail - the tail inflation seen in the library. Beyond
+           the current end only the bytes up to the last non-zero one are
+           written; the record's data_size, applied by _reparse_mft_record,
+           then sets the exact length (extending with zeros if the real
+           data ends in zeros).
+        2. While the agent is applying an ext4 change to this path
+           (ext4_sync_in_progress), Windows writes no file data - a create
+           or resize on the guest side is metadata only. Anything arriving
+           then is driver zero-fill or a race, and ext4 already holds the
+           truth. Dropped, logged once per path.
+        """
+        rel = self._get_rel_path(source_path)
+        if rel in self.ext4_sync_in_progress:
+            drops = self.__dict__.setdefault('_drop_counts', {})
+            n = drops.get(source_path, 0) + 1
+            drops[source_path] = n
+            if n <= 8:
+                log(f"  Dropping {len(chunk)}B guest write to {rel} at "
+                    f"{write_offset}: an ext4->NTFS op is in flight for it "
+                    f"({sorted(getattr(self, 'ext4_sync_kinds', {}).get(rel, ()))})")
+            return
+        try:
+            cur = os.path.getsize(source_path)
+        except OSError:
+            cur = 0
+        if write_offset + len(chunk) > cur:
+            keep = max(cur - write_offset, 0)
+            trimmed = chunk.rstrip(b'\x00')
+            if len(trimmed) < keep:
+                trimmed = chunk[:keep]
+            chunk = trimmed
+            if not chunk:
+                return
+        with open(source_path, 'r+b') as f:
+            f.seek(write_offset)
+            f.write(chunk)
+        # The op journal must not read this write back as a host-side
+        # change: that produced a same-size 'resize' for the guest, which,
+        # executed after the guest had already moved the file, resurrected
+        # it at the old path. Same echo window the other ext4 writers use.
+        self.ntfs_sync_timestamps[rel] = time.time()
 
     def _write_inner(self, offset: int, data: bytes):
         """Inner write implementation for non-MFT writes."""
@@ -1559,6 +1841,15 @@ class ClusterMapper:
             # Provenance: a client put these bytes here. Materialisation relies
             # on this to tell real data from image space nobody ever wrote.
             self._mark_guest_written(cluster)
+            await_ = self.__dict__.get('_await_data')
+            if await_:
+                rec = await_.pop(cluster, None)
+                if rec is not None and rec not in await_.values():
+                    # every cluster this record waited for has now been
+                    # written: give it another pass
+                    off = self._rec_offset(rec)
+                    if off is not None:
+                        self._mft_queue.put((None, off, bytes(MFT_RECORD_SIZE)))
 
             if not meta and cluster in self.cluster_map:
                 mapping = self.cluster_map[cluster]
@@ -1578,9 +1869,7 @@ class ClusterMapper:
                         continue
                     write_offset = file_offset + cluster_offset
                     try:
-                        with open(source_path, 'r+b') as f:
-                            f.seek(write_offset)
-                            f.write(chunk_data)
+                        self._ext4_data_write(source_path, write_offset, chunk_data)
                         self._dirty_sources.add(source_path)
                         if not hasattr(self, '_write_logged'):
                             self._write_logged = set()
@@ -1602,9 +1891,7 @@ class ClusterMapper:
                     continue
                 write_offset = file_offset + cluster_offset
                 try:
-                    with open(source_path, 'r+b') as f:
-                        f.seek(write_offset)
-                        f.write(chunk_data)
+                    self._ext4_data_write(source_path, write_offset, chunk_data)
                     self._dirty_sources.add(source_path)
                     if not hasattr(self, '_write_logged'):
                         self._write_logged = set()
@@ -1878,6 +2165,10 @@ class ClusterMapper:
             length = count * self.cluster_size
             bitmap.extend(self.image[offset:offset + length])
         self._bitmap_cache = bitmap
+        # What was allocated when we loaded the bitmap. A cluster the guest
+        # allocates later has no history the bridge could have lost track
+        # of: it is a fresh allocation and reads as zeros until written.
+        self._bitmap_at_load = bytes(bitmap)
         log(f"  Bitmap cached: {len(bitmap) // (1024 * 1024)}MB in RAM")
 
     def _build_free_run_index(self):
@@ -2569,6 +2860,16 @@ class ClusterMapper:
         if byte_i >= len(bitmap):
             return False
         return bool(bitmap[byte_i] & (1 << bit))
+
+    def _allocated_at_load(self, cluster: int) -> bool:
+        """True when the cluster was already in use when $Bitmap was loaded."""
+        snap = getattr(self, '_bitmap_at_load', None)
+        if not snap:
+            return True      # no snapshot: assume history, keep the guard
+        byte_i, bit = divmod(cluster, 8)
+        if byte_i >= len(snap):
+            return True
+        return bool(snap[byte_i] & (1 << bit))
 
     def _read_bitmap(self) -> bytearray:
         """Return the cached cluster bitmap (loaded once at startup)."""
@@ -3571,6 +3872,7 @@ class ClusterMapper:
                 self._map_clusters(data_runs, source_path)
                 self.mft_record_to_source[record_num] = source_path
                 self._note_file_seq(record_num, record)
+                self._note_data_size(record_num, record)
                 # Remove from sparse tracking if it was there
                 self.sparse_files.pop(rel_path, None)
         else:
@@ -3599,6 +3901,8 @@ class ClusterMapper:
                     }
                     self.mft_record_to_source[record_num] = source_path
                     self._note_file_seq(record_num, record)
+                    self._note_resident(record_num, record)
+                    self._note_data_size(record_num, record)
             else:
                 # No data runs and no resident data - check if it's a large sparse file
                 try:
@@ -4082,6 +4386,19 @@ class ClusterMapper:
             return sp == old_source or sp.startswith(old_src_pre)
 
         with self.lock:
+            tracks_old = (any(affects_source(sp)
+                              for sp in self.mft_record_to_source.values())
+                          or any(rp == old_rel or rp.startswith(old_rel_pre)
+                                 for rp in self.mft_record_to_dir.values()))
+            if not tracks_old:
+                # Nothing maps the old path: the bridge itself already moved
+                # this (a guest rename whose inotify echo the journal did not
+                # filter) or it was never exposed. There is nothing to remap,
+                # and the overwrite cleanup below would drop the tracking of
+                # the very record that moved. Leave everything as it is.
+                log(f"  remap {old_rel} -> {new_rel}: nothing tracks the old "
+                    f"path; treating as an echo of our own rename")
+                return
             # Overwrite-rename cleanup: if new_source was already tracked by a
             # DIFFERENT record (ext4 `mv -f A B` over an existing B), Windows
             # frees B's old MFT record. Drop that stale tracking now so a late
@@ -5589,16 +5906,21 @@ class ClusterMapper:
                 # touching the file.
                 return False
 
-            if rel_path in self.ext4_sync_in_progress:
+            kinds = getattr(self, 'ext4_sync_kinds', {}).get(rel_path, set())
+            if rel_path in self.ext4_sync_in_progress and (
+                    not kinds or kinds & {'rm', 'mv'}):
                 log(f"  Skipping delete (ext4 sync in progress): {rel_path}")
                 self._notify_echo_observed(rel_path)
-                del self.mft_record_to_source[record_num]
-                self._file_mft_seq.pop(record_num, None)
-                self.resident_file_data.pop(record_num, None)
-                self.path_to_mft_record.pop(rel_path, None)
+                # Drop EVERY mapping, not just the record's. Leaving the
+                # cluster/run entries behind pointed them at a path ext4 no
+                # longer has, and when the driver reused those clusters for
+                # the next file the stale run-map entry won the lookup and
+                # every read of the new file was EIO.
+                self._drop_file_tracking(record_num, source_path)
                 return True
 
             # Remove tracking before releasing lock
+            self._forget_direct_alloc(record_num, source_path)
             del self.mft_record_to_source[record_num]
             self._file_mft_seq.pop(record_num, None)
             self.resident_file_data.pop(record_num, None)
@@ -5618,6 +5940,7 @@ class ClusterMapper:
         if do_delete:
             try:
                 os.remove(source_path)
+                self._stamp_echo(rel_path)
                 log(f"  FILE DELETED: {rel_path}")
             except OSError as e:
                 log(f"  Failed to delete {rel_path}: {e}")
@@ -5662,6 +5985,12 @@ class ClusterMapper:
                 self.mft_record_to_dir.pop(record_num, None)
                 self._dir_mft_seq.pop(record_num, None)
                 self.path_to_mft_record.pop(old_rel_path, None)
+                if not (flags & 0x01):
+                    # The guest removed the directory. Mirror it - but only
+                    # ever with rmdir: a directory ext4 still has entries in
+                    # is left alone, and the mismatch surfaces at the next
+                    # gate rather than as lost files.
+                    self._dir_record_freed(old_rel_path)
                 return
 
             # Guard: sequence number changed → record was freed and reused for a
@@ -5704,6 +6033,10 @@ class ClusterMapper:
             new_path = self._resolve_source_path(new_rel_path)
             do_move = os.path.exists(old_path) and not os.path.exists(new_path)
             if do_move:
+                base = os.path.basename(old_rel_path)
+                log(f"  dir rename decision: {old_rel_path} -> {new_rel_path}; "
+                    f"windows={sorted(r for r in self.ext4_sync_in_progress if base in r or new_rel_path in r)} "
+                    f"kinds={ {r: sorted(k) for r, k in getattr(self, 'ext4_sync_kinds', {}).items() if base in r} }")
                 self.ntfs_sync_in_progress.add(new_rel_path)
                 self.ntfs_sync_in_progress.add(old_rel_path)
                 now = time.time()
@@ -5716,6 +6049,7 @@ class ClusterMapper:
                 if not (self._refuse_ext4_mutation(old_path, 'directory rename', old_rel_path)
                         or self._refuse_ext4_mutation(new_path, 'directory rename', new_rel_path)):
                     shutil.move(old_path, new_path)
+                    self._stamp_echo(old_rel_path, new_rel_path)
                     log(f"  DIR RENAMED: {old_rel_path} -> {new_rel_path}")
             except OSError as e:
                 log(f"  Failed to rename dir {old_rel_path}: {e}")
@@ -5730,6 +6064,60 @@ class ClusterMapper:
             self._dir_mft_seq[record_num] = seq  # sequence already read above
             self.path_to_mft_record.pop(old_rel_path, None)
             self.path_to_mft_record[new_rel_path] = record_num
+
+    def _dir_record_freed(self, rel_path: str) -> None:
+        """Queue an ext4 directory whose NTFS record the guest freed.
+
+        Pass 1 sees the freed directory records before pass 2 deletes the
+        files that were inside them, so the rmdir has to wait until the
+        end of the sync pass (deepest first) and be retried on later passes
+        when the files arrive in a later MFT batch. Only ever rmdir: a
+        directory ext4 still has entries in is left alone. Caller holds
+        self.lock.
+        """
+        if rel_path in self.ext4_sync_in_progress:
+            self._notify_echo_observed(rel_path)
+            return
+        pending = self.__dict__.setdefault('_pending_rmdirs', {})
+        pending.setdefault(rel_path, 0)
+
+    def _run_pending_rmdirs(self) -> None:
+        """Called at the end of every sync pass, lock NOT held."""
+        with self.lock:
+            pending = self.__dict__.setdefault('_pending_rmdirs', {})
+            todo = sorted(pending, key=lambda r: -r.count(os.sep))
+        for rel_path in todo:
+            dir_path = self._resolve_source_path(rel_path)
+            if not os.path.isdir(dir_path) or os.path.islink(dir_path):
+                with self.lock:
+                    pending.pop(rel_path, None)
+                continue
+            if self._refuse_ext4_mutation(dir_path, 'directory delete', rel_path):
+                with self.lock:
+                    pending.pop(rel_path, None)
+                continue
+            with self.lock:
+                self.ntfs_sync_in_progress.add(rel_path)
+                self.ntfs_sync_timestamps[rel_path] = time.time()
+            try:
+                os.rmdir(dir_path)
+                self._stamp_echo(rel_path)
+                log(f"  DIR DELETED: {rel_path}")
+                with self.lock:
+                    pending.pop(rel_path, None)
+            except OSError as e:
+                with self.lock:
+                    pending[rel_path] = pending.get(rel_path, 0) + 1
+                    tries = pending[rel_path]
+                    if tries >= 20:
+                        pending.pop(rel_path, None)
+                if tries == 1 or tries >= 20:
+                    log(f"  Not removing {rel_path}: {e}"
+                        + (" (giving up; ext4 has content NTFS does not)"
+                           if tries >= 20 else " (will retry)"))
+            finally:
+                with self.lock:
+                    self.ntfs_sync_in_progress.discard(rel_path)
 
     def _update_child_paths_on_dir_rename(self, old_dir_path: str, new_dir_path: str):
         """Update all child file/dir paths when a parent directory is renamed."""
@@ -5876,6 +6264,7 @@ class ClusterMapper:
         try:
             if do_create:
                 os.makedirs(source_path, exist_ok=True)
+                self._stamp_echo(rel_path)
                 log(f"  NEW DIR: {rel_path} -> {source_path}")
         except OSError as e:
             log(f"  Failed to create dir {rel_path}: {e}")
@@ -5945,6 +6334,12 @@ class ClusterMapper:
                 # deleted or renamed, and under record-only / protected roots
                 # that record would otherwise stay unmapped and every read of
                 # it would EIO.
+                if rel_path in self.ext4_sync_in_progress:
+                    # This record IS the echo of the agent's create: report
+                    # it so the suppression window closes, or the guest's
+                    # own delete/edit of the file in the next 30 s would be
+                    # taken for part of the agent op and dropped.
+                    self._notify_echo_observed(rel_path)
                 self.mft_record_to_source[record_num] = source_path
                 self._note_file_seq(record_num, record)
                 self.path_to_mft_record[rel_path] = record_num
@@ -5957,6 +6352,14 @@ class ClusterMapper:
             if rel_path in self.ext4_sync_in_progress:
                 log(f"  Skipping new file (ext4 sync in progress): {rel_path}")
                 self._notify_echo_observed(rel_path)
+                if not os.path.exists(source_path):
+                    # The agent created something ext4 no longer has (the
+                    # op was stale by the time it ran). Mapping clusters to
+                    # a missing file would EIO every read for good; leave
+                    # the record untracked so the next pass treats it as a
+                    # guest creation instead.
+                    log(f"  ... but {rel_path} does not exist on ext4; not tracking")
+                    return None
                 self.mft_record_to_source[record_num] = source_path
                 self._note_file_seq(record_num, record)
                 self.path_to_mft_record[rel_path] = record_num
@@ -5993,6 +6396,17 @@ class ClusterMapper:
                         log(f"  REFUSING materialize: {rel_path} - cluster "
                             f"{unwritten} was never written by a client since "
                             f"mount, so the image holds no data for it")
+                    # The driver can flush the record before the data. Wait
+                    # for the data: re-check this record when a write lands
+                    # on one of its clusters, and at the end of every pass.
+                    await_ = self.__dict__.setdefault('_await_data', {})
+                    for lcn, count in data_runs:
+                        if lcn in (-1, None):
+                            continue
+                        for i in range(count):
+                            if not self._is_guest_written(lcn + i):
+                                await_[lcn + i] = record_num
+                    self.__dict__.setdefault('_pending_materialize', set()).add(record_num)
                     return None
             self.ntfs_sync_in_progress.add(rel_path)
             self.ntfs_sync_timestamps[rel_path] = time.time()
@@ -6019,11 +6433,13 @@ class ClusterMapper:
                 if file_size is not None and file_size > 0:
                     with open(source_path, 'r+b') as f:
                         f.truncate(file_size)
+                self._stamp_echo(rel_path)
                 log(f"  NEW FILE (non-resident): {rel_path} ({file_size} bytes)")
             else:
                 with open(source_path, 'wb') as f:
                     if resident_data:
                         f.write(resident_data)
+                self._stamp_echo(rel_path)
                 log(f"  NEW FILE: {rel_path}")
 
             with self.lock:
@@ -6032,6 +6448,8 @@ class ClusterMapper:
                 self._note_file_seq(record_num, record)
                 self.path_to_mft_record[rel_path] = record_num
                 self._track_file_data(record, record_num, source_path)
+                self.__dict__.get('_pending_materialize', set()).discard(record_num)
+                self._materialize_refused.discard(rel_path)
                 # Safe mode: this file was just created by Windows, so its
                 # data clusters and MFT record remain writable (everything
                 # pre-existing is read-only).
@@ -6043,6 +6461,29 @@ class ClusterMapper:
             with self.lock:
                 self.ntfs_sync_in_progress.discard(rel_path)
             return None
+
+    def record_data_size(self, rel_path: str):
+        """The unnamed $DATA size the record for rel_path carried when the
+        bridge last read it, or None if untracked/unknown."""
+        with self.lock:
+            rec = self.path_to_mft_record.get(rel_path.replace('/', os.sep))
+            if rec is None:
+                return None
+            return self.__dict__.setdefault('_seen_data_size', {}).get(rec)
+
+    def _note_data_size(self, record_num: int, record) -> None:
+        """Remember the unnamed $DATA size this record carried when read, so
+        a later reparse can tell a guest resize from a record we are merely
+        re-reading (e.g. because a neighbour in the same sector changed)."""
+        try:
+            size = self._extract_file_size(record)
+        except Exception:
+            size = None
+        sizes = self.__dict__.setdefault('_seen_data_size', {})
+        if size is None:
+            sizes.pop(record_num, None)
+        else:
+            sizes[record_num] = size
 
     def _note_file_seq(self, record_num: int, record) -> None:
         """Remember a tracked FILE record's MFT sequence number."""
@@ -6061,6 +6502,7 @@ class ClusterMapper:
         gate reconciles any leftover drift. Caller holds self.lock.
         """
         rel_path = self._get_rel_path(source_path)
+        self._forget_direct_alloc(record_num, source_path)
         self.mft_record_to_source.pop(record_num, None)
         self._file_mft_seq.pop(record_num, None)
         self.resident_file_data.pop(record_num, None)
@@ -6075,12 +6517,14 @@ class ClusterMapper:
 
     def _track_file_data(self, record: bytearray, record_num: int, source_path: str):
         """Track file data - either cluster mapping or resident tracking."""
+        self._note_data_size(record_num, record)
         data_runs = self._extract_data_runs(record)
         if data_runs:
             self._map_clusters(data_runs, source_path)
             # Remove from resident tracking if it was resident before
             self.resident_file_data.pop(record_num, None)
         else:
+            self._note_resident(record_num, record)
             resident_loc = self._find_resident_data_location(record, record_num)
             if resident_loc:
                 self.resident_file_data[record_num] = {
@@ -6089,6 +6533,27 @@ class ClusterMapper:
                     'data_abs': resident_loc[1],
                     'available': resident_loc[2],
                 }
+
+    def _note_resident(self, record_num: int, record) -> bytes:
+        """Remember the resident $DATA bytes this record carried when read.
+
+        A file the agent created for the host holds zeros in its record
+        (createnew writes no data), and the guest only ever sees ext4's
+        bytes because reads inject them. Pushing those zeros to ext4 on a
+        later re-read of the record destroyed the host's file. Only
+        resident bytes that CHANGED since we last saw the record are the
+        guest's doing.
+        """
+        try:
+            data = self._extract_resident_data(record)
+        except Exception:
+            data = None
+        seen = self.__dict__.setdefault('_seen_resident', {})
+        if data is None:
+            seen.pop(record_num, None)
+        else:
+            seen[record_num] = bytes(data)
+        return data
 
     def _reparse_mft_record(self, record_num: int):
         """Re-parse an MFT record for cluster updates, renames, and resident data.
@@ -6160,9 +6625,46 @@ class ClusterMapper:
                     new_rel_path = old_rel
 
                 if new_path != source_path:
-                    if os.path.exists(source_path):
+                    if old_rel in self.ext4_sync_in_progress and \
+                            new_rel_path not in self.ext4_sync_in_progress:
+                        # An agent op (a host-side mv) is in flight for the
+                        # path we track, and the record now names a path
+                        # that is neither its old nor its new one: the
+                        # driver renames in steps (name, then parent), and
+                        # this is a step. ext4 already holds the final
+                        # state; moving it to the intermediate name undid
+                        # the host's rename. Leave tracking and ext4 alone
+                        # until the record reaches a path in the window.
+                        log(f"  reparse({record_num}): intermediate rename "
+                            f"state {new_rel_path} during agent op on "
+                            f"{old_rel}; ignoring")
+                        new_path = source_path
+                        new_rel_path = old_rel
+                    if new_path == source_path:
+                        pass
+                    elif os.path.exists(source_path):
                         if new_rel_path not in self.ext4_sync_in_progress:
-                            if not os.path.exists(new_path):
+                            # A rename onto a name another tracked record
+                            # holds is an overwrite (MoveFileEx with
+                            # REPLACE_EXISTING; ntfs-3g's rename): NTFS
+                            # cannot hold two entries of one name in a
+                            # directory, so the other record is freed. Do
+                            # the replace, and forget the other record now -
+                            # its "freed" state would otherwise be processed
+                            # later in this pass as a delete of the file we
+                            # just renamed into place.
+                            other = self.path_to_mft_record.get(new_rel_path)
+                            replacing = (os.path.exists(new_path)
+                                         and other is not None
+                                         and other != record_num
+                                         and other in self.mft_record_to_source)
+                            if replacing:
+                                log(f"  rename onto an existing name: "
+                                    f"{old_rel} -> {new_rel_path} replaces "
+                                    f"record {other}")
+                                self._drop_file_tracking(
+                                    other, self.mft_record_to_source[other])
+                            if not os.path.exists(new_path) or replacing:
                                 do_move = True
                                 self.ntfs_sync_in_progress.add(new_rel_path)
                                 self.ntfs_sync_in_progress.add(old_rel)
@@ -6220,6 +6722,7 @@ class ClusterMapper:
                         except OSError:
                             pass
                     shutil.move(old_source, new_path)
+                    self._stamp_echo(old_rel, new_rel_path)
                     log(f"  FILE RENAMED: {os.path.basename(old_source)} -> {filename}")
             except OSError as e:
                 log(f"  Failed to rename file: {e}")
@@ -6249,7 +6752,17 @@ class ClusterMapper:
         do_write_resident = False
         resident_data = None
         rel_path = None
+        materialize = []      # (file_offset, cluster) newly mapped, guest-written
+        new_size = None
+        do_reconcile = False
         with self.lock:
+            # What was mapped to this file before, as intervals.
+            prev = []
+            if source_path in self.source_to_clusters:
+                prev.extend((c, c + 1) for c in self.source_to_clusters[source_path])
+            prev.extend((s_, e_) for s_, e_, sp, _o in self._direct_run_map
+                        if sp == source_path)
+
             # Remove old cluster mappings
             if source_path in self.source_to_clusters:
                 old_clusters = self.source_to_clusters[source_path]
@@ -6265,16 +6778,57 @@ class ClusterMapper:
             if data_runs:
                 self._map_clusters(data_runs, source_path)
                 self.resident_file_data.pop(record_num, None)
-            else:
                 rel_path = self._get_rel_path(source_path)
-                resident_data = self._extract_resident_data(record)
+                new_size = self._extract_file_size(record)
+                # The guest's own allocation supersedes ours.
+                ours = getattr(self, '_direct_allocated', {}).get(rel_path)
+                if ours and [(st, ct) for st, ct in ours[3]] != \
+                        [(lcn, ct) for lcn, ct in data_runs]:
+                    self._forget_direct_alloc(record_num, source_path)
+                prev_size = self.__dict__.setdefault('_seen_data_size', {}).get(record_num)
+                self._note_data_size(record_num, record)
+                if rel_path not in self.ext4_sync_in_progress:
+                    # Clusters the guest wrote BEFORE this record reached us
+                    # (a file growing out of the MFT, an in-place rewrite
+                    # into fresh clusters) hold data that never went to
+                    # ext4 - at write time nothing mapped them. Provenance
+                    # says which ones a client actually wrote.
+                    #
+                    # Interval arithmetic, not a per-cluster scan: this runs
+                    # under self.lock on every re-read of a record (an atime
+                    # update on a multi-GB file re-parses tens of thousands
+                    # of clusters), and a scan there starved every read.
+                    # For an unchanged file the difference is empty.
+                    file_offset = 0
+                    for lcn, count in data_runs:
+                        if lcn in (-1, None):
+                            file_offset += count * self.cluster_size
+                            continue
+                        for st, en in self._uncovered(lcn, lcn + count, prev):
+                            for c in range(st, en):
+                                if self._is_guest_written(c):
+                                    materialize.append(
+                                        (file_offset + (c - lcn) * self.cluster_size, c))
+                        file_offset += count * self.cluster_size
+                    # Only a size the GUEST changed is applied to ext4. A
+                    # record re-read for any other reason still carries the
+                    # size ext4 had before a host-side edit that the agent
+                    # has not echoed yet; applying that would undo the edit
+                    # (a host truncate came back as a zero-extended file).
+                    do_reconcile = (new_size is not None
+                                    and prev_size is not None
+                                    and new_size != prev_size)
+            else:
+                self._note_data_size(record_num, record)
+                rel_path = self._get_rel_path(source_path)
+                seen_before = self.__dict__.setdefault('_seen_resident', {}).get(record_num)
+                resident_data = self._note_resident(record_num, record)
                 do_write_resident = (
                     resident_data is not None and
-                    rel_path not in self.ext4_sync_in_progress
+                    resident_data != seen_before and
+                    rel_path not in self.ext4_sync_in_progress and
+                    os.path.exists(source_path)
                 )
-                if do_write_resident:
-                    self.ntfs_sync_in_progress.add(rel_path)
-                    self.ntfs_sync_timestamps[rel_path] = time.time()
 
                 resident_loc = self._find_resident_data_location(record, record_num)
                 if resident_loc:
@@ -6284,6 +6838,51 @@ class ClusterMapper:
                         'data_abs': resident_loc[1],
                         'available': resident_loc[2],
                     }
+
+        # Newly mapped guest data and the record's length, outside the lock.
+        if materialize or do_reconcile:
+            try:
+                if self._refuse_ext4_mutation(source_path, 'content update',
+                                              rel_path):
+                    pass
+                elif not os.path.exists(source_path):
+                    pass
+                else:
+                    if materialize:
+                        with self.lock:
+                            self.ntfs_sync_in_progress.add(rel_path)
+                            self.ntfs_sync_timestamps[rel_path] = time.time()
+                        with open(source_path, 'r+b') as f:
+                            for file_offset, c in materialize:
+                                if new_size is not None and file_offset >= new_size:
+                                    break
+                                off = c * self.cluster_size
+                                with self.lock:
+                                    chunk = bytes(self.image[off:off + self.cluster_size])
+                                if new_size is not None:
+                                    chunk = chunk[:max(0, new_size - file_offset)]
+                                f.seek(file_offset)
+                                f.write(chunk)
+                        self._dirty_sources.add(source_path)
+                        self._stamp_echo(rel_path)
+                        log(f"  MATERIALIZED {len(materialize)} cluster(s) into "
+                            f"{rel_path}")
+                    if do_reconcile:
+                        cur = os.path.getsize(source_path)
+                        if cur != new_size:
+                            with self.lock:
+                                self.ntfs_sync_in_progress.add(rel_path)
+                                self.ntfs_sync_timestamps[rel_path] = time.time()
+                            with open(source_path, 'r+b') as f:
+                                f.truncate(new_size)
+                            self._dirty_sources.add(source_path)
+                            self._stamp_echo(rel_path)
+                            log(f"  RESIZED {rel_path}: {cur} -> {new_size}")
+            except OSError as e:
+                log(f"  Error applying record to {rel_path}: {e}")
+            finally:
+                with self.lock:
+                    self.ntfs_sync_in_progress.discard(rel_path)
 
         # Write resident data outside lock (fast, but avoids holding lock during I/O)
         if do_write_resident:
@@ -6313,8 +6912,13 @@ class ClusterMapper:
                                     log(f"  Re-queued for allocation: {rel_path}")
                     elif not self._refuse_ext4_mutation(source_path,
                                                         'resident write', rel_path):
+                        with self.lock:
+                            self.ntfs_sync_in_progress.add(rel_path)
+                            self.ntfs_sync_timestamps[rel_path] = time.time()
                         with open(source_path, 'wb') as f:
                             f.write(resident_data)
+                        self._stamp_echo(rel_path)
+                        log(f"  RESIDENT WRITE: {rel_path} ({len(resident_data)} B)")
             except OSError as e:
                 log(f"  Error writing resident data: {e}")
             finally:

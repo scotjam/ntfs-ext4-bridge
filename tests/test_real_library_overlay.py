@@ -30,8 +30,8 @@ import subprocess
 import sys
 import time
 
-D2 = "/srv/dev-disk-by-uuid-0d919a0b-021a-4259-8c43-3696c1486ab7"
-LOWER = os.path.join(D2, "kidstv2")
+D2 = "/srv/data"
+LOWER = os.path.join(D2, "library")
 BASE = os.path.join(D2, "bridge-ro")
 SHARE = "Shows"                      # neutral name; the real one stays private
 PORT = 10810

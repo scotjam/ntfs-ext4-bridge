@@ -20,6 +20,9 @@ from ntfs_bridge.file_watcher import (EVENT_CREATE, EVENT_DELETE,
 
 
 class FakeMapper:
+    def record_data_size(self, rel):
+        return None
+
     def __init__(self):
         self.ntfs_sync_in_progress = set()
         self.ntfs_sync_timestamps = {}

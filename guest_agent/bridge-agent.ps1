@@ -124,10 +124,10 @@ function Execute-Op($op, $driveLetter) {
         }
         'resize' {
             if (-not (Test-Path -LiteralPath $path)) {
-                # File unknown here yet: degrade to create_sized
-                $op.op = 'create_sized'
-                Execute-Op $op $driveLetter
-                return
+                # Never degrade to a create: the file may have been moved
+                # or deleted on this side since the op was queued, and a
+                # create here resurrects it. Report it; the gate reconciles.
+                throw "ENOENT: $path"
             }
             $old = (Get-Item -LiteralPath $path).Length
             $fs = [System.IO.File]::Open($path, 'Open', 'ReadWrite')

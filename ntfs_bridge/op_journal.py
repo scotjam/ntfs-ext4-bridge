@@ -86,6 +86,9 @@ class OpJournal:
         # Called with the list of op dicts each time ops are handed to the
         # agent (set by SyncCoordinator for echo suppression).
         self.dispatch_callback: Optional[Callable[[List[dict]], None]] = None
+        # Called with a rel path whose pre-opened window must be released
+        # because its op was dropped before dispatch (set by SyncCoordinator).
+        self.release_callback: Optional[Callable[[str], None]] = None
         # Called when escalation thresholds trip (set by ConsistencyGate).
         self.escalation_callback: Optional[Callable[[str], None]] = None
 
@@ -169,8 +172,11 @@ class OpJournal:
         # materialization (same rule the old SyncDaemon used).
         m = self.mapper
         if rel_path in m.ntfs_sync_in_progress:
+            log(f"echo-filtered {event_type} {rel_path} (bridge write in progress)")
             return
-        if time.time() - m.ntfs_sync_timestamps.get(rel_path, 0) < 2.0:
+        age = time.time() - m.ntfs_sync_timestamps.get(rel_path, 0)
+        if age < 2.0:
+            log(f"echo-filtered {event_type} {rel_path} (bridge wrote it {age:.2f}s ago)")
             return
 
         now = time.time()
@@ -227,6 +233,7 @@ class OpJournal:
 
     def _flush_ready(self):
         now = time.time()
+        pre = []
         with self._cond:
             if self._paused:
                 return
@@ -254,19 +261,9 @@ class OpJournal:
 
             new_ops: List[dict] = []
 
-            # 1) moves, in arrival order
+            # 1) moves, in arrival order (the bridge's own remap of these
+            #    paths happens below, once their suppression window is open)
             for old_rel, new_rel, _ts in ready_moves:
-                # Proactively remap the bridge's own cluster mappings from the
-                # old ext4 path to the new one. The rename already happened on
-                # ext4, so reads of the file's clusters must resolve to the
-                # new path now — otherwise they fail with EIO (old path gone)
-                # until the guest echo or a consistency gate catches up.
-                try:
-                    self.mapper.remap_source_path(
-                        old_rel.replace('/', os.sep),
-                        new_rel.replace('/', os.sep))
-                except Exception as e:
-                    log(f"remap_source_path error ({old_rel}->{new_rel}): {e}")
                 new_ops.append({'op': 'mv', 'path': _to_ntfs(old_rel),
                                 'dst': _to_ntfs(new_rel),
                                 '_rel': new_rel, '_rel_old': old_rel})
@@ -300,6 +297,31 @@ class OpJournal:
             if self._first_unacked_ts is None:
                 self._first_unacked_ts = now
             self._cond.notify_all()
+            pre = [op for op in new_ops if op.get('op') == 'mv']
+        if pre:
+            # Order matters. The bridge's tracking is remapped from the old
+            # ext4 path to the new one so reads keep working before the
+            # guest has executed the mv - but from that moment until the
+            # agent's record echo, the guest's record still carries the OLD
+            # name, and a re-read of it looks like a guest-side rename back.
+            # The suppression window for both names must therefore be open
+            # BEFORE the remap; it used to open at dispatch (the agent's
+            # next poll), and in that gap the bridge moved renamed trees
+            # back where they came from. Dispatch re-opening it is
+            # idempotent.
+            if self.dispatch_callback:
+                try:
+                    self.dispatch_callback(pre)
+                except Exception as e:
+                    log(f"dispatch_callback (pre-open) error: {e}")
+            for op in pre:
+                old_rel, new_rel = op['_rel_old'], op['_rel']
+                try:
+                    self.mapper.remap_source_path(
+                        old_rel.replace('/', os.sep),
+                        new_rel.replace('/', os.sep))
+                except Exception as e:
+                    log(f"remap_source_path error ({old_rel}->{new_rel}): {e}")
 
     def _ops_for_upsert(self, rel: str, st: dict) -> List[dict]:
         ops: List[dict] = []
@@ -330,8 +352,18 @@ class OpJournal:
 
         known = rel in self.mapper.path_to_mft_record
         if known and not st['prior_delete']:
-            ops.append({'op': 'resize', 'path': ntfs, 'size': stat.st_size,
-                        'mtime_ms': mtime_ms, '_rel': rel})
+            # Same size: an in-place edit. The guest needs the new mtime
+            # only - its clusters already map to the changed ext4 bytes. A
+            # 'resize' here opened a suppression window during which a
+            # guest write to the same file was dropped; set_mtime opens
+            # none (see SyncCoordinator.on_dispatch).
+            cur = self.mapper.record_data_size(rel)
+            if cur is not None and cur == stat.st_size:
+                ops.append({'op': 'set_mtime', 'path': ntfs,
+                            'mtime_ms': mtime_ms, '_rel': rel})
+            else:
+                ops.append({'op': 'resize', 'path': ntfs, 'size': stat.st_size,
+                            'mtime_ms': mtime_ms, '_rel': rel})
         else:
             ops.append({'op': 'create_sized', 'path': ntfs,
                         'size': stat.st_size, 'mtime_ms': mtime_ms,
@@ -342,9 +374,55 @@ class OpJournal:
     # Serving (control server API)
     # ------------------------------------------------------------------
 
+    def _stale(self, op: dict) -> bool:
+        """An op describing ext4 state that no longer holds.
+
+        Between flush and dispatch the guest (or the host) may have moved
+        or deleted the subject. A create/resize executed then re-creates
+        the file at a path ext4 no longer has - the agent's resize used to
+        degrade to create_sized on a missing path, and that resurrected a
+        just-moved file as a ghost mapped to nothing.
+        """
+        kind = op.get('op')
+        rel = op.get('_rel')
+        if not rel:
+            return False
+        src = os.path.join(self.source_dir, rel)
+        if kind in ('create_sized', 'resize', 'set_mtime'):
+            return not os.path.isfile(src)
+        if kind == 'mkdir':
+            return not os.path.isdir(src)
+        if kind == 'mv':
+            return not os.path.lexists(src)
+        return False
+
     def ops_after(self, cursor: int, limit: int = 64) -> List[dict]:
         with self._cond:
-            out = [op for op in self._ops if op['seq'] > cursor][:limit]
+            out = []
+            for op in self._ops:
+                if op['seq'] <= cursor:
+                    continue
+                if self._stale(op):
+                    log(f"dropping stale op {op['seq']} {op['op']} "
+                        f"{op.get('_rel')}: ext4 no longer has it")
+                    op['_dropped'] = True
+                    if self.release_callback:
+                        for rel in (op.get('_rel'), op.get('_rel_old')):
+                            if rel:
+                                try:
+                                    self.release_callback(rel)
+                                except Exception as e:
+                                    log(f"release_callback error: {e}")
+                    continue
+                out.append(op)
+                if len(out) >= limit:
+                    break
+            # dropped ops are consumed as if acked
+            while self._ops and (self._ops[0]['seq'] <= cursor
+                                 or self._ops[0].get('_dropped')):
+                if self._ops[0].get('_dropped'):
+                    self._acked_seq = self._ops[0]['seq']
+                self._ops.pop(0)
         if out and self.dispatch_callback:
             try:
                 self.dispatch_callback(out)

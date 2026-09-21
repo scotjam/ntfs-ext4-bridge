@@ -206,17 +206,38 @@ def main():
                     len(es) == 1 and es[0]["op"] == "record_update",
                     str([e["op"] for e in es]))
 
-    print("\n[directly allocated records are catalogued too]")
+    print("\n[directly allocated records: guest changes go through, stale replay does not]")
     with tempfile.TemporaryDirectory() as tmp:
         m = make_mapper(tmp)
         m._safe_mode = False
         off = seed(m, base)
         m._direct_allocated_records.add(REC)
+        m._direct_allocated = {"a.bin": (os.path.join(tmp, "a.bin"), 100, REC, [(20, 1)])}
+        want = file_record("a.bin", size=10)
+        m._mft_write_to_image(off, want)
+        ok &= check("truncate of a lazily allocated file is accepted",
+                    bytes(m.image[off:off + MFT_RECORD_SIZE]) == want)
+        ok &= check("nothing catalogued (not refused)", entries(m) == [], str(entries(m)))
+        # a replay of the pre-allocation sparse record (same size, hole
+        # instead of our cluster) must be ignored
+        m.image[off:off + MFT_RECORD_SIZE] = base
+        stale = bytearray(base)
+        data_off = 0x38 + fn_attr_len("a.bin")
+        stale[data_off + 0x40:data_off + 0x43] = bytes([0x01, 0x01, 0x00])   # sparse run, 1 cluster
+        m._mft_write_to_image(off, bytes(stale))
+        ok &= check("stale sparse replay ignored, our record kept",
+                    bytes(m.image[off:off + MFT_RECORD_SIZE]) == base)
+        ok &= check("stale replay: nothing catalogued", entries(m) == [])
+    with tempfile.TemporaryDirectory() as tmp:
+        m = make_mapper(tmp)               # record-only: still catalogued
+        off = seed(m, base)
+        m._direct_allocated_records.add(REC)
+        m._direct_allocated = {"a.bin": (os.path.join(tmp, "a.bin"), 100, REC, [(20, 1)])}
         m._mft_write_to_image(off, file_record("a.bin", size=10))
         es = entries(m)
-        ok &= check("truncate of lazy file catalogued",
+        ok &= check("record-only: truncate of lazy file catalogued once",
                     [e["op"] for e in es] == ["truncate"], str([e["op"] for e in es]))
-        ok &= check("record still protected",
+        ok &= check("record-only: record still protected",
                     bytes(m.image[off:off + MFT_RECORD_SIZE]) == base)
 
     print("\n[_check_new_file links an existing ext4 path instead of refusing]")

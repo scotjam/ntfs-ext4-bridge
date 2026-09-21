@@ -52,6 +52,7 @@ def make_mapper(source_dir, image):
     # mappers via __new__, so the attributes it reads must be set here too.
     m._safe_mode = False
     m._windows_created_sources = set()
+    m._direct_allocated_records = set()
     m._file_mft_seq = {}
     m._dir_mft_seq = {}
     m._protect_refused = set()
