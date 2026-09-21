@@ -244,8 +244,8 @@ def detach_disk(win=None):
     Windows first, then detach, then wait for the target to disappear."""
     if win is not None:
         try:
-            win.ps("Get-Disk | Where-Object { $_.FriendlyName -match 'VirtIO' } | "
-                   "ForEach-Object { Set-Disk -Number $_.Number -IsOffline $true -ErrorAction SilentlyContinue }",
+            win.ps("$d = Get-Disk | Where-Object { $_.Number -ne 0 } | Sort-Object Number | Select-Object -Last 1; "
+                   "if ($d) { Set-Disk -Number $d.Number -IsOffline $true -ErrorAction SilentlyContinue }",
                    check=False)
         except Exception as e:
             log("  (could not offline the disk in Windows: %s)" % e)
@@ -270,11 +270,15 @@ def bring_disk_online(win, serial_hex):
     disk online, then return the drive letter."""
     low32 = int(serial_hex[8:16], 16)
     for _ in range(60):
+        # only the newest disk: a ghost of an earlier hot-unplug that Windows
+        # never released has the same serial and size, and Set-Disk on a
+        # dead NBD disk blocks for minutes
         out = win.ps(r"""
-Get-Disk | Where-Object { $_.Number -ne 0 -and $_.OperationalStatus -ne 'Online' } | ForEach-Object { Set-Disk -Number $_.Number -IsOffline $false -ErrorAction SilentlyContinue; Set-Disk -Number $_.Number -IsReadOnly $false -ErrorAction SilentlyContinue }
-$v = Get-CimInstance Win32_Volume | Where-Object { $_.FileSystem -eq 'NTFS' -and $_.DriveLetter -and ([uint32]$_.SerialNumber -eq %d) }
-if ($v) { $v.DriveLetter.TrimEnd(':') } else { '' }
-""" % low32).strip()
+$d = Get-Disk | Where-Object { $_.Number -ne 0 } | Sort-Object Number | Select-Object -Last 1
+if ($d -and $d.OperationalStatus -ne 'Online') { Set-Disk -Number $d.Number -IsOffline $false -ErrorAction SilentlyContinue; Set-Disk -Number $d.Number -IsReadOnly $false -ErrorAction SilentlyContinue }
+$p = if ($d) { Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue | Where-Object DriveLetter | Select-Object -First 1 } else { $null }
+if ($p) { $v = Get-Volume -DriveLetter $p.DriveLetter -ErrorAction SilentlyContinue; if ($v -and $v.FileSystem -eq 'NTFS') { "$($p.DriveLetter)" } else { '' } } else { '' }
+""").strip()
         if out:
             return out
         time.sleep(3)

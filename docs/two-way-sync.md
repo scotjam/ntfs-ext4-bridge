@@ -215,6 +215,44 @@ the NTFS dirty bit set, so Windows reports the volume "Scan Needed / Warning"
 — reads and writes are unaffected (all content hashes verified in that
 state).
 
+## Behaviour to know (2026-09-21)
+
+Verified with the sandbox harness, with the real library through a
+read-only overlay, and with the real Windows guest (see Testing). These are
+properties of the design, not bugs:
+
+- **Echo window after a host-side change.** When ext4 creates, resizes,
+  moves or deletes something, the agent applies it in Windows. From
+  dispatch until the agent's ack *plus 2 s*, guest data writes to that same
+  path are dropped (logged as `Dropping ... guest write`). The record echo
+  and any trailing driver writes for the op must never land in ext4 over
+  the host's bytes. A Windows program writing into a file within ~2 s of
+  the host having created/resized it loses that write; other files are
+  unaffected, and steady-state concurrent edits of one file (disjoint
+  ranges) keep both sides. Same-size host edits become `set_mtime`, which
+  opens no window.
+- **Cross-root moves on ext4** (between two exposed shares) reach the guest
+  as delete + create: each share has its own inotify watcher, so the two
+  halves of the move cannot be paired. Data is not copied; the new record
+  maps to the ext4 file. Moves within a share are `mv` ops.
+- **Agent throughput.** The PowerShell agent executes one op at a time and
+  spawns `fsutil` per create; measured 4–9 s per op on a loaded host, so a
+  30-file host-side burst takes a few minutes to appear. Bursts above the
+  journal thresholds escalate to a gate.
+- **Startup on a reused image** prunes what ext4 no longer has, adds what it
+  gained, and only then re-enables writes to ext4; `--two-way` never mounts
+  locally, so this is the re-derivation.
+- **After a bridge restart** the agent sees a new epoch on its next poll,
+  re-resolves the volume by serial (the disk may return under another
+  letter) and cycles the disk to drop caches.
+- **`--record-only`** serves the volume live but refuses every guest change
+  to pre-existing ext4 and writes it to `<image>.ext4-attempts.jsonl`
+  instead (deletes, renames, truncates and data writes, with byte ranges);
+  `tools/review_ext4_attempts.py` summarises the catalogue. Composes with
+  `--two-way` for a live ext4→NTFS half with a catalogued NTFS→ext4 half.
+- Guest writes to a file the host is concurrently editing at the same
+  offsets are a conflict with no merge: the last write to reach ext4 wins.
+
 ## Testing
 
 - **Unit/protocol (no root, no VM):**
@@ -227,6 +265,23 @@ state).
   export as a second disk and a slirp `guestfwd` to the control endpoint,
   install the agent, then run the create/rename/delete/write-through checks
   in the runbook below.
+- **Two-way, sandbox (root, no VM):** `tests/test_two_way_live.py all` —
+  bridge in `--two-way`, an ntfs-3g guest on the NBD export, a Python
+  emulation of the agent, an O_DIRECT MFT reader for "what the guest sees".
+  Phases: NTFS→ext4, ext4→NTFS, mixed/concurrent, edge cases (conflicts,
+  rename-over, case-only rename, fragmentation, links, a gate), restart on
+  the reused image; every untouched ext4 path must stay byte-identical.
+- **Two-way on real data without risk:** `tests/test_real_library_two_way.py`
+  runs the same stack on a real tree mounted as the read-only lowerdir of an
+  overlayfs (the kernel cannot write to it); the upperdir is the ledger of
+  what would have been written. `tests/test_windows_two_way.py` does the
+  same with the real Windows VM as guest: hot-plugs the export as a virtio
+  NBD disk, installs the agent over WinRM, drives guest ops from PowerShell
+  and reads the volume back through Windows. Both prove the real tree's
+  stat manifest unchanged and the ledger limited to the scratch subtree.
+- **One-way safety gates:** `tests/test_ext4_immutability.py
+  {readonly,record-only,stale-restart}` and
+  `tests/test_real_library_overlay.py {setup,run,verify,stale,teardown}`.
 
 ## Live VM runbook
 

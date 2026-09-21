@@ -293,6 +293,21 @@ Notes:
   dir and Windows-owned trees (System Volume Information etc.).
 - Trigger a manual gate with `SIGUSR1`, monitor via
   `GET /v1/health` on the control endpoint.
+- After a host-side create/resize/move of a path, guest data writes to that
+  same path are dropped until the agent has acked the op plus ~2 s (the
+  driver's own writes for the op must not land in ext4). Cross-share moves
+  on ext4 arrive in the guest as delete + create. The agent runs one op at a
+  time (~4–9 s per create); large host-side bursts escalate to a gate.
+  Details: `docs/two-way-sync.md`, "Behaviour to know".
+
+## Record-only mode (`--record-only`)
+
+Serves the volume live and keeps the ext4→NTFS half (with `--two-way`), but
+refuses every guest change to pre-existing ext4 content and catalogues it in
+`<image>.ext4-attempts.jsonl` instead — deletes, renames, truncates, resident
+rewrites and data writes, each with the byte ranges and a hash. Use it to
+see what a guest would do to a library before trusting the write-back
+direction; `tools/review_ext4_attempts.py <catalogue>` summarises it.
 
 ## Adding Folders to an Existing Volume
 
