@@ -182,8 +182,26 @@ class OpJournal:
             return
         age = time.time() - m.ntfs_sync_timestamps.get(rel_path, 0)
         if age < 2.0:
-            log(f"echo-filtered {event_type} {rel_path} (bridge wrote it {age:.2f}s ago)")
-            return
+            # Inside the window, but is it the echo? The bridge recorded the
+            # file's size and mtime right after its own write; if the file
+            # no longer matches, the host changed it since - a change that
+            # used to be swallowed here and never reached the guest.
+            fp = getattr(m, 'ntfs_sync_fingerprint', {}).get(rel_path, 'none')
+            if fp != 'none' and event_type != EVENT_DELETE:
+                try:
+                    st = os.stat(os.path.join(self.source_dir, rel_path))
+                    now_fp = (st.st_size, st.st_mtime_ns)
+                except OSError:
+                    now_fp = None
+                if fp is not None and now_fp is not None and now_fp != fp:
+                    log(f"host changed {rel_path} {age:.2f}s after the bridge wrote it; "
+                        f"not an echo")
+                else:
+                    log(f"echo-filtered {event_type} {rel_path} (bridge wrote it {age:.2f}s ago)")
+                    return
+            else:
+                log(f"echo-filtered {event_type} {rel_path} (bridge wrote it {age:.2f}s ago)")
+                return
 
         now = time.time()
         with self._cond:

@@ -1336,16 +1336,39 @@ class ClusterMapper:
             out.append((pos, end))
         return out
 
+    def recheck_path(self, rel_path: str) -> None:
+        """Queue a sync pass for the record behind rel_path (a suppression
+        window just closed; a guest change seen during it was deferred)."""
+        with self.lock:
+            rec = self.path_to_mft_record.get(rel_path.replace('/', os.sep))
+            if rec is None:
+                return
+            off = self._rec_offset(rec)
+        if off is not None:
+            self._mft_queue.put((None, off, bytes(MFT_RECORD_SIZE)))
+
     def _stamp_echo(self, *rels) -> None:
         """Mark rel paths as just-written-by-the-bridge for the op journal's
         echo filter. Called AFTER an ext4 mutation completes as well as
         before it: a slow move (an overlay copy-up, a loaded disk) fires its
         inotify event long after the pre-move stamp, and an unfiltered echo
-        becomes a guest op that undoes what the guest just did."""
+        becomes a guest op that undoes what the guest just did.
+
+        Also records what the file looks like right after the write (size,
+        mtime_ns). The journal treats an event inside the window as an echo
+        only while the file still matches: a genuine host change that lands
+        within the window differs, and used to be swallowed as the echo."""
         now = time.time()
+        fps = self.__dict__.setdefault('ntfs_sync_fingerprint', {})
         for rel in rels:
-            if rel:
-                self.ntfs_sync_timestamps[rel] = now
+            if not rel:
+                continue
+            self.ntfs_sync_timestamps[rel] = now
+            try:
+                st = os.stat(self._resolve_source_path(rel))
+                fps[rel] = (st.st_size, st.st_mtime_ns)
+            except OSError:
+                fps[rel] = None
 
     def _forget_direct_alloc(self, record_num: int, source_path: str) -> None:
         """The guest now owns this record's allocation: stop treating the
@@ -1812,7 +1835,7 @@ class ClusterMapper:
         # change: that produced a same-size 'resize' for the guest, which,
         # executed after the guest had already moved the file, resurrected
         # it at the old path. Same echo window the other ext4 writers use.
-        self.ntfs_sync_timestamps[rel] = time.time()
+        self._stamp_echo(rel)
 
     def _write_inner(self, offset: int, data: bytes):
         """Inner write implementation for non-MFT writes."""
@@ -6786,8 +6809,8 @@ class ClusterMapper:
                         [(lcn, ct) for lcn, ct in data_runs]:
                     self._forget_direct_alloc(record_num, source_path)
                 prev_size = self.__dict__.setdefault('_seen_data_size', {}).get(record_num)
-                self._note_data_size(record_num, record)
                 if rel_path not in self.ext4_sync_in_progress:
+                    self._note_data_size(record_num, record)
                     # Clusters the guest wrote BEFORE this record reached us
                     # (a file growing out of the MFT, an in-place rewrite
                     # into fresh clusters) hold data that never went to
@@ -6822,13 +6845,30 @@ class ClusterMapper:
                 self._note_data_size(record_num, record)
                 rel_path = self._get_rel_path(source_path)
                 seen_before = self.__dict__.setdefault('_seen_resident', {}).get(record_num)
-                resident_data = self._note_resident(record_num, record)
+                in_window = rel_path in self.ext4_sync_in_progress
+                try:
+                    resident_data = self._extract_resident_data(record)
+                except Exception:
+                    resident_data = None
+                if not in_window:
+                    # A change skipped because an ext4->NTFS op is in flight
+                    # must NOT become "seen": the next look would call it
+                    # unchanged and the guest's edit would never reach ext4.
+                    # The window's release re-checks this record.
+                    self._note_resident(record_num, record)
                 do_write_resident = (
                     resident_data is not None and
                     resident_data != seen_before and
-                    rel_path not in self.ext4_sync_in_progress and
+                    not in_window and
                     os.path.exists(source_path)
                 )
+                if resident_data is not None and not do_write_resident \
+                        and (resident_data != seen_before or in_window):
+                    why = ("ext4->NTFS op in flight; will re-check when it ends" if in_window
+                           else "unchanged since last read" if resident_data == seen_before
+                           else "source missing")
+                    log(f"  resident data of {rel_path} not applied: {why} "
+                        f"({len(resident_data)} B)")
 
                 resident_loc = self._find_resident_data_location(record, record_num)
                 if resident_loc:

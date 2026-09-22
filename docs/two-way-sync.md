@@ -252,6 +252,11 @@ properties of the design, not bugs:
   `--two-way` for a live ext4→NTFS half with a catalogued NTFS→ext4 half.
 - Guest writes to a file the host is concurrently editing at the same
   offsets are a conflict with no merge: the last write to reach ext4 wins.
+- **A guest change made while a window is open is deferred, not lost.**
+  It is applied when the window closes (the coordinator re-checks the
+  record). And the bridge's echo filter is content-aware: a host change
+  landing within 2 s of the bridge's own write to the same file is
+  recognised by the file no longer matching what the bridge wrote.
 - **Small files (up to 700 bytes) travel with their content.** They are
   resident in the MFT record; `createnew` would leave zeros there, and
   Windows serves its own cached record, never re-reading it from the

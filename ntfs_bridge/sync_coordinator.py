@@ -150,6 +150,14 @@ class SyncCoordinator:
         with self.mapper._sync_lock:
             self.mapper.ext4_sync_in_progress.discard(rel_path)
             self.mapper.ext4_sync_kinds.pop(rel_path, None)
+        # a guest change to this path seen during the window was deferred,
+        # not recorded; look at the record again now
+        recheck = getattr(self.mapper, 'recheck_path', None)
+        if recheck:
+            try:
+                recheck(rel_path)
+            except Exception as e:
+                log(f"recheck error ({rel_path}): {e}")
 
     def _sweep_loop(self):
         while self._running:
