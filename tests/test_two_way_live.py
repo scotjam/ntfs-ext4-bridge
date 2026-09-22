@@ -538,6 +538,15 @@ class Agent(threading.Thread):
                 # same rule as bridge-agent.ps1: never resurrect a file
                 raise FileNotFoundError("ENOENT: " + path)
             os.makedirs(os.path.dirname(path), exist_ok=True)
+            if op.get("data_b64") is not None:
+                # small (resident) file: bytes travel in the op
+                import base64 as _b64
+                with open(path, "wb") as f:
+                    f.write(_b64.b64decode(op["data_b64"]))
+                if op.get("mtime_ms"):
+                    t = op["mtime_ms"] / 1000.0
+                    os.utime(path, (t, t))
+                return
             size = int(op["size"])
             # fsutil createnew / SetLength allocate real clusters and
             # setvaliddata raises VDL without writing. ntfs-3g's truncate

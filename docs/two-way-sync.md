@@ -252,6 +252,12 @@ properties of the design, not bugs:
   `--two-way` for a live ext4→NTFS half with a catalogued NTFS→ext4 half.
 - Guest writes to a file the host is concurrently editing at the same
   offsets are a conflict with no merge: the last write to reach ext4 wins.
+- **Small files (up to 700 bytes) travel with their content.** They are
+  resident in the MFT record; `createnew` would leave zeros there, and
+  Windows serves its own cached record, never re-reading it from the
+  device where the bridge injects the ext4 bytes. So `create_sized` and
+  `resize` carry `data_b64` for such files and the agent writes the bytes.
+  Larger files are still created empty and mapped, with no data copied.
 
 ## Testing
 

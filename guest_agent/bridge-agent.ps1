@@ -97,6 +97,14 @@ function Execute-Op($op, $driveLetter) {
             if (-not (Test-Path -LiteralPath $parent)) {
                 New-Item -ItemType Directory -Force -Path $parent | Out-Null
             }
+            if ($op.data_b64 -ne $null) {
+                # Small (resident) file: the bytes came with the op. Writing
+                # them puts the real content in the MFT record Windows will
+                # cache; createnew would leave zeros there for good.
+                [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($op.data_b64))
+                Set-MtimeMs $path $op.mtime_ms
+                return
+            }
             if (Test-Path -LiteralPath $path) {
                 # Fall through to resize semantics
                 $fs = [System.IO.File]::Open($path, 'Open', 'ReadWrite')
@@ -123,6 +131,12 @@ function Execute-Op($op, $driveLetter) {
             Set-MtimeMs $path $op.mtime_ms
         }
         'resize' {
+            if ($op.data_b64 -ne $null) {
+                if (-not (Test-Path -LiteralPath $path)) { throw "ENOENT: $path" }
+                [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($op.data_b64))
+                Set-MtimeMs $path $op.mtime_ms
+                return
+            }
             if (-not (Test-Path -LiteralPath $path)) {
                 # Never degrade to a create: the file may have been moved
                 # or deleted on this side since the op was queued, and a

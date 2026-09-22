@@ -20,6 +20,7 @@ exposed root, watching the resolved target, and maps events back to
 "<ShareName>/<rel>" paths.
 """
 
+import base64
 import json
 import os
 import threading
@@ -33,6 +34,11 @@ from .file_watcher import (create_watcher, EVENT_CREATE, EVENT_DELETE,
 
 def log(msg):
     print(f"[OpJournal] {msg}", flush=True)
+
+
+# Files up to this size are resident in their MFT record on the bridge's
+# volume (1 KB records); their content travels in the op, see _ops_for_upsert.
+RESIDENT_BYTES = 700
 
 
 def _to_ntfs(rel: str) -> str:
@@ -350,6 +356,20 @@ class OpJournal:
                 pass
             return ops
 
+        # Files small enough to be resident in the MFT record carry their
+        # bytes in the op. createnew gives such a record zero bytes, and
+        # Windows serves that record from its own cache thereafter - the
+        # bridge's injection of the ext4 bytes only reaches device reads.
+        # For the same reason a same-size edit of a small file must ship
+        # bytes too; a size-only op cannot refresh a cached resident record.
+        small = None
+        if stat.st_size <= RESIDENT_BYTES:
+            try:
+                with open(source, 'rb') as f:
+                    small = base64.b64encode(f.read()).decode('ascii')
+            except OSError:
+                small = None
+
         known = rel in self.mapper.path_to_mft_record
         if known and not st['prior_delete']:
             # Same size: an in-place edit. The guest needs the new mtime
@@ -358,16 +378,21 @@ class OpJournal:
             # guest write to the same file was dropped; set_mtime opens
             # none (see SyncCoordinator.on_dispatch).
             cur = self.mapper.record_data_size(rel)
-            if cur is not None and cur == stat.st_size:
+            if cur is not None and cur == stat.st_size and small is None:
                 ops.append({'op': 'set_mtime', 'path': ntfs,
                             'mtime_ms': mtime_ms, '_rel': rel})
             else:
-                ops.append({'op': 'resize', 'path': ntfs, 'size': stat.st_size,
-                            'mtime_ms': mtime_ms, '_rel': rel})
+                op = {'op': 'resize', 'path': ntfs, 'size': stat.st_size,
+                      'mtime_ms': mtime_ms, '_rel': rel}
+                if small is not None:
+                    op['data_b64'] = small
+                ops.append(op)
         else:
-            ops.append({'op': 'create_sized', 'path': ntfs,
-                        'size': stat.st_size, 'mtime_ms': mtime_ms,
-                        '_rel': rel})
+            op = {'op': 'create_sized', 'path': ntfs,
+                  'size': stat.st_size, 'mtime_ms': mtime_ms, '_rel': rel}
+            if small is not None:
+                op['data_b64'] = small
+            ops.append(op)
         return ops
 
     # ------------------------------------------------------------------
