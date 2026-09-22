@@ -124,7 +124,9 @@ create; the agent applies one op every few seconds.
     # detach from the child so the bridge keeps running after this script exits
     proc_pid = proc.pid
     print("bridge pid %d (kept running); stop with: sudo python3 tools/playground.py stop" % proc_pid)
-    os._exit(0)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)   # leave the bridge child running; no atexit cleanup
 
 
 def cmd_status():
