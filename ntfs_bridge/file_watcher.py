@@ -132,6 +132,18 @@ class FileWatcher:
 
                 (_, type_names, path, filename) = event
 
+                if 'IN_Q_OVERFLOW' in type_names:
+                    # The kernel dropped events: some change on this tree
+                    # will never be reported. Say so, and ask for a sweep.
+                    log("inotify queue OVERFLOW: events were lost; requesting a rescan")
+                    cb = getattr(self, 'overflow_callback', None)
+                    if cb:
+                        try:
+                            cb()
+                        except Exception as e:
+                            log(f"overflow callback error: {e}")
+                    continue
+
                 if not filename:
                     continue
 

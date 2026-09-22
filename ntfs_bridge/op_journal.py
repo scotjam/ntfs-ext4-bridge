@@ -54,7 +54,8 @@ class OpJournal:
                  exclude_cb: Optional[Callable[[str], bool]] = None,
                  quiesce_s: float = 0.5, max_hold_s: float = 5.0,
                  gate_threshold_ops: int = 500,
-                 gate_threshold_age: float = 600.0):
+                 gate_threshold_age: float = 600.0,
+                 rescan_interval: float = 30.0):
         self.journal_path = journal_path
         self.source_dir = os.path.abspath(source_dir)
         self.mapper = mapper
@@ -63,6 +64,17 @@ class OpJournal:
         self.max_hold_s = max_hold_s
         self.gate_threshold_ops = gate_threshold_ops
         self.gate_threshold_age = gate_threshold_age
+        # Seconds between reconciliation sweeps of the shares (0 = off).
+        self.rescan_interval = rescan_interval
+        self._rescan_thread: Optional[threading.Thread] = None
+        self._rescan_now = threading.Event()
+        self._sweep_mtimes: Dict[str, int] = {}
+        self._sweep_misses: Dict[str, int] = {}
+        # rel -> (mtime_ns, size) the sweep last asked about. A path the
+        # guest cannot hold (a name NTFS refuses) never becomes tracked; it
+        # is asked for once per version, not every sweep - each failed op
+        # counts toward the dirty threshold that forces a gate.
+        self._sweep_requested: Dict[str, tuple] = {}
 
         self.epoch = uuid.uuid4().hex
         self._next_seq = 1
@@ -127,6 +139,9 @@ class OpJournal:
                 self._make_share_callback(entry),
                 move_events=True,
             )
+            if hasattr(watcher, 'overflow_callback'):
+                watcher.overflow_callback = lambda e=entry: self.request_rescan(
+                    f"inotify queue overflowed on share {e}")
             watcher.start()
             self._watchers.append(watcher)
             log(f"Watching share '{entry}' at {target}")
@@ -134,6 +149,11 @@ class OpJournal:
         self._flush_thread = threading.Thread(
             target=self._flush_loop, daemon=True, name="OpJournal-Flush")
         self._flush_thread.start()
+
+        if self.rescan_interval and self.rescan_interval > 0:
+            self._rescan_thread = threading.Thread(
+                target=self._rescan_loop, daemon=True, name="OpJournal-Rescan")
+            self._rescan_thread.start()
 
     def stop(self):
         self._running = False
@@ -148,6 +168,133 @@ class OpJournal:
             self._flush_thread = None
         with self._lock:
             self._journal_file.close()
+
+    def request_rescan(self, reason: str = ""):
+        """Sweep the shares now (the watcher lost events, e.g. on an inotify
+        queue overflow)."""
+        if reason:
+            log(f"rescan requested: {reason}")
+        self._rescan_now.set()
+
+    def _rescan_loop(self):
+        # The first sweep only records mtimes; a same-size edit shows up as
+        # an mtime change on a later sweep.
+        first = True
+        while self._running:
+            self._rescan_now.wait(timeout=self.rescan_interval)
+            self._rescan_now.clear()
+            if not self._running:
+                return
+            try:
+                self._rescan_once(record_only=first)
+            except Exception as e:
+                log(f"rescan error: {e}")
+            first = False
+
+    def _rescan_once(self, record_only: bool = False):
+        """Compare the shares on ext4 with what the bridge tracks and feed
+        every difference inotify did not report back through on_event.
+
+        Creates and size/mtime changes are upserts (idempotent: the agent
+        re-applies at worst). Deletes need the path missing on two sweeps
+        in a row and are never swept in safe/record-only mode, because a
+        wrong rm would remove the guest's copy.
+        """
+        m = self.mapper
+        now = time.time()
+        with m.lock:
+            tracked = {k.replace(os.sep, '/'): v
+                       for k, v in m.path_to_mft_record.items()}
+        with self._cond:
+            pending = set(self._pending)
+            pending.update(r for mv in self._moves for r in mv[:2])
+
+        def busy(rel):
+            return (rel in pending or rel in m.ntfs_sync_in_progress
+                    or rel in m.ext4_sync_in_progress
+                    or now - m.ntfs_sync_timestamps.get(rel, 0) < 5.0)
+
+        seen = set()
+        missed = []
+        for share in sorted(m.known_root_entries):
+            root = os.path.join(self.source_dir, share)
+            if not os.path.isdir(root):
+                continue
+            for dp, dn, fn in os.walk(root, followlinks=True):
+                rel_d = os.path.relpath(dp, self.source_dir).replace(os.sep, '/')
+                dn[:] = [d for d in dn if not d.startswith('.')
+                         and not self.exclude_cb(rel_d + '/' + d)]
+                for d in dn:
+                    rel = rel_d + '/' + d
+                    seen.add(rel)
+                    if rel not in tracked and not busy(rel) and not record_only:
+                        try:
+                            key = (os.stat(os.path.join(dp, d)).st_mtime_ns, 0)
+                        except OSError:
+                            continue
+                        if self._sweep_requested.get(rel) != key:
+                            self._sweep_requested[rel] = key
+                            missed.append(('create', rel))
+                for f in fn:
+                    if f.startswith('.'):
+                        continue
+                    rel = rel_d + '/' + f
+                    if self.exclude_cb(rel):
+                        continue
+                    seen.add(rel)
+                    try:
+                        st = os.stat(os.path.join(dp, f))
+                    except OSError:
+                        continue
+                    prev_mtime = self._sweep_mtimes.get(rel)
+                    self._sweep_mtimes[rel] = st.st_mtime_ns
+                    if record_only or busy(rel):
+                        continue
+                    if now - st.st_mtime < 2.0:
+                        continue            # still being written; next sweep
+                    key = (st.st_mtime_ns, st.st_size)
+                    kind = None
+                    if rel not in tracked:
+                        kind = 'create'
+                    else:
+                        size = m.record_data_size(rel)
+                        if size is not None and size != st.st_size:
+                            kind = 'size'
+                        elif prev_mtime is not None and prev_mtime != st.st_mtime_ns:
+                            kind = 'mtime'
+                    if kind and self._sweep_requested.get(rel) != key:
+                        self._sweep_requested[rel] = key
+                        missed.append((kind, rel))
+
+        if not record_only and not getattr(m, '_safe_mode', False):
+            shares = tuple(s + '/' for s in m.known_root_entries)
+            for rel in tracked:
+                if not rel.startswith(shares) or rel in seen:
+                    self._sweep_misses.pop(rel, None)
+                    continue
+                if busy(rel) or os.path.lexists(os.path.join(self.source_dir, rel)):
+                    self._sweep_misses.pop(rel, None)
+                    continue
+                n = self._sweep_misses.get(rel, 0) + 1
+                self._sweep_misses[rel] = n
+                if n >= 2:
+                    missed.append(('delete', rel))
+                    self._sweep_misses.pop(rel, None)
+            for rel in list(self._sweep_mtimes):
+                if rel not in seen:
+                    self._sweep_mtimes.pop(rel, None)
+            for rel in list(self._sweep_requested):
+                if rel not in seen:
+                    self._sweep_requested.pop(rel, None)
+
+        for kind, rel in missed:
+            log(f"rescan: {kind} not reported by inotify: {rel}")
+            if kind == 'delete':
+                self.on_event(EVENT_DELETE, rel)
+            else:
+                self.on_event(EVENT_CREATE, rel)
+        if missed:
+            log(f"rescan: {len(missed)} missed change(s) queued")
 
     def _make_share_callback(self, share: str):
         def cb(event_type: str, payload):

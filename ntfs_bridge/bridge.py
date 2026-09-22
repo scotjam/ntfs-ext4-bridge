@@ -228,6 +228,7 @@ class NTFSBridge:
                  agent_token_file=None,
                  gate_threshold_ops=500,
                  gate_threshold_age=600.0,
+                 rescan_interval=30.0,
                  winrm_url=None, winrm_user=None, winrm_password=None):
         self.image_path = os.path.abspath(image_path)
         self.source_dir = os.path.abspath(source_dir)
@@ -271,6 +272,7 @@ class NTFSBridge:
         self.agent_token_file = agent_token_file
         self.gate_threshold_ops = gate_threshold_ops
         self.gate_threshold_age = gate_threshold_age
+        self.rescan_interval = rescan_interval
         self.winrm_url = winrm_url
         self.winrm_user = winrm_user
         self.winrm_password = winrm_password
@@ -654,6 +656,7 @@ class NTFSBridge:
             exclude_cb=self._should_exclude,
             gate_threshold_ops=self.gate_threshold_ops,
             gate_threshold_age=self.gate_threshold_age,
+            rescan_interval=self.rescan_interval,
         )
         self.sync_coordinator = SyncCoordinator(self.mapper, self.op_journal)
         self.control_server = ControlServer(
@@ -2091,6 +2094,10 @@ def main():
     parser.add_argument('--gate-threshold-ops', type=int, default=500,
                         help='Pending-op count that escalates to a '
                              'consistency gate (default: 500)')
+    parser.add_argument('--rescan-interval', type=float, default=30.0,
+                        help='Two-way: seconds between reconciliation sweeps '
+                             'of the shares, catching changes inotify did not '
+                             'report (0 disables). Default 30.')
     parser.add_argument('--gate-threshold-age', type=float, default=600.0,
                         help='Seconds an op may sit unacked before escalating '
                              'to a consistency gate (default: 600)')
@@ -2128,6 +2135,7 @@ def main():
         agent_token_file=args.agent_token_file,
         gate_threshold_ops=args.gate_threshold_ops,
         gate_threshold_age=args.gate_threshold_age,
+        rescan_interval=args.rescan_interval,
         winrm_url=args.winrm_url,
         winrm_user=args.winrm_user,
         winrm_password=args.winrm_password,

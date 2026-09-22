@@ -113,6 +113,10 @@ same filesystem as `lower`; `share` is the folder name Windows will see.
   the file. Namespace changes (names, sizes) are always live.
 - **Same-offset concurrent edits** have no merge: the last write to reach
   ext4 wins.
+- **F5 in Explorer** re-reads Windows' view, which the agent keeps updated;
+  a host change shows once the agent has applied it (seconds). If inotify
+  ever misses one, the 30 s sweep catches it; `grep rescan <BASE>/bridge.log`
+  shows when that happened.
 - The real tree never changes: `find <LOWER> -newer <BASE>/playground.pid`
   stays empty. The ledger is the complete record of what would have been
   written.

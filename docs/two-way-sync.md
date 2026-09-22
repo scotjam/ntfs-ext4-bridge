@@ -252,6 +252,14 @@ properties of the design, not bugs:
   `--two-way` for a live ext4→NTFS half with a catalogued NTFS→ext4 half.
 - Guest writes to a file the host is concurrently editing at the same
   offsets are a conflict with no merge: the last write to reach ext4 wins.
+- **Host changes are pushed, and swept.** inotify reports most ext4
+  changes within a second; anything it misses (a lost event, an inotify
+  queue overflow, a write that bypassed the watched path) is caught by a
+  sweep of the shares every `--rescan-interval` seconds (default 30):
+  untracked paths become creates, size or mtime changes become upserts,
+  and a tracked path missing on two sweeps in a row becomes a delete.
+  Windows' own refresh (F5 in Explorer) only re-reads Windows' view of the
+  volume, so a host change is visible there once the agent has applied it.
 - **A guest change made while a window is open is deferred, not lost.**
   It is applied when the window closes (the coordinator re-checks the
   record). And the bridge's echo filter is content-aware: a host change
