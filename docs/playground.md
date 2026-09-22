@@ -113,6 +113,10 @@ same filesystem as `lower`; `share` is the folder name Windows will see.
   the file. Namespace changes (names, sizes) are always live.
 - **Same-offset concurrent edits** have no merge: the last write to reach
   ext4 wins.
+- **Guest -> ext4 takes a few seconds** (3-9 s measured): Windows flushes
+  the file's record on its own schedule, and the agent prods it every few
+  seconds. A small file's content lives inside that record, so it arrives
+  with the flush, not with the save.
 - **F5 in Explorer** re-reads Windows' view, which the agent keeps updated;
   a host change shows once the agent has applied it (seconds). If inotify
   ever misses one, the 30 s sweep catches it; `grep rescan <BASE>/bridge.log`

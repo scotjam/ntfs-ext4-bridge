@@ -20,7 +20,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-POLL_TIMEOUT_S = 25
+# Short long-poll: the agent flushes the volume cache between polls, so a
+# guest-side write reaches ext4 within about a poll interval rather than
+# whenever Windows' lazy writer gets to it. An empty poll is one small
+# HTTP request, so the cost of polling often is negligible.
+POLL_TIMEOUT_S = 5
 BATCH_MAX = 64
 
 

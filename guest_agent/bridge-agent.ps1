@@ -188,6 +188,16 @@ Log "bridge-agent $AgentVersion starting"
 $epoch = $null
 $driveLetter = $null
 $lostVolume = $false
+# Windows decides when to flush the records holding a file's metadata (and,
+# for a small file, its content). Until that reaches the bridge over NBD,
+# what the guest wrote is not on ext4. Nothing flushes while the guest is
+# the only writer, so the agent does it between polls. Override with
+# "idle_flush_seconds" in config.json; 0 disables.
+$IdleFlushSeconds = 5
+if ($Config.PSObject.Properties.Name -contains 'idle_flush_seconds') {
+    $IdleFlushSeconds = [double]$Config.idle_flush_seconds
+}
+$lastFlush = [DateTime]::UtcNow
 
 while ($true) {
     try {
@@ -256,7 +266,15 @@ while ($true) {
             continue
         }
 
-        if (-not $resp.ops -or $resp.ops.Count -eq 0) { continue }
+        if (-not $resp.ops -or $resp.ops.Count -eq 0) {
+            if ($IdleFlushSeconds -gt 0 -and $driveLetter -and
+                ([DateTime]::UtcNow - $lastFlush).TotalSeconds -ge $IdleFlushSeconds) {
+                try { Write-VolumeCache -DriveLetter $driveLetter -ErrorAction Stop }
+                catch { Log "idle flush failed: $_" }
+                $lastFlush = [DateTime]::UtcNow
+            }
+            continue
+        }
 
         $results = @()
         $maxSeq = $cursor
@@ -278,6 +296,7 @@ while ($true) {
 
         Invoke-Bridge '/v1/ack' @{ epoch = $epoch; results = $results } | Out-Null
         Set-Cursor $maxSeq
+        $lastFlush = [DateTime]::UtcNow   # the batch ended with flush_volume
         if ($lostVolume) {
             Log "volume ${driveLetter}: is gone; re-resolving via hello"
             $lostVolume = $false

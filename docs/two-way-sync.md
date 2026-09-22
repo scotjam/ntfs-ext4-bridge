@@ -252,6 +252,14 @@ properties of the design, not bugs:
   `--two-way` for a live ext4→NTFS half with a catalogued NTFS→ext4 half.
 - Guest writes to a file the host is concurrently editing at the same
   offsets are a conflict with no merge: the last write to reach ext4 wins.
+- **Guest changes reach ext4 within seconds, not whenever Windows likes.**
+  Windows decides when to flush the records that hold a file's metadata and
+  (for a small file) its content; until that reaches the bridge there is
+  nothing to apply. The agent therefore flushes the volume between polls
+  (`idle_flush_seconds` in the guest's config.json, default 5, 0 disables)
+  and the control long-poll is 5 s so it gets to that check. Measured on a
+  loaded host: a small file created or edited in Windows lands on ext4 in
+  3-9 s, against 2-33 s before.
 - **Host changes are pushed, and swept.** inotify reports most ext4
   changes within a second; anything it misses (a lost event, an inotify
   queue overflow, a write that bypassed the watched path) is caught by a
