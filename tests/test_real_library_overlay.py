@@ -30,10 +30,18 @@ import subprocess
 import sys
 import time
 
-D2 = "/srv/data"
-LOWER = os.path.join(D2, "library")
-BASE = os.path.join(D2, "bridge-ro")
-SHARE = "Shows"                      # neutral name; the real one stays private
+# Site-specific values live outside the repo: /root/.bridge-test.json
+#   {"lower": "/path/to/real/tree", "base": "/path/on/same/disk/bridge-ro",
+#    "share": "Shows", "vm": "libvirt-domain-name"}
+# (or BRIDGE_TEST_CONFIG=<file>). The defaults below are placeholders.
+_CFG_PATH = os.environ.get("BRIDGE_TEST_CONFIG", "/root/.bridge-test.json")
+try:
+    SITE = json.load(open(_CFG_PATH))
+except (OSError, ValueError):
+    SITE = {}
+LOWER = SITE.get("lower", "/srv/data/library")
+BASE = SITE.get("base", "/srv/data/bridge-ro")
+SHARE = SITE.get("share", "Shows")   # neutral name; the real one stays private
 PORT = 10810
 
 UPPER = os.path.join(BASE, "upper", SHARE)

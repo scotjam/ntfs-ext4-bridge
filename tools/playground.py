@@ -39,7 +39,7 @@ import test_windows_two_way as w         # noqa: E402
 
 VM = w.VM
 PIDFILE = os.path.join(ov.BASE, "playground.pid")
-XML_BACKUP = "/root/windows-vm.xml.playground-backup"
+XML_BACKUP = "/root/%s.xml.playground-backup" % VM
 
 
 def sh(cmd):

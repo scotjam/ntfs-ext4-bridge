@@ -60,3 +60,6 @@ venv/
 *.ext4-attempts.jsonl
 *.op-journal.jsonl
 *.mftops
+
+# Site-specific test config (real tree path, VM name)
+.bridge-test.json

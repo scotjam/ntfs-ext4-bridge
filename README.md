@@ -298,7 +298,8 @@ Notes:
   driver's own writes for the op must not land in ext4). Cross-share moves
   on ext4 arrive in the guest as delete + create. The agent runs one op at a
   time (~4–9 s per create); large host-side bursts escalate to a gate.
-  Details: `docs/two-way-sync.md`, "Behaviour to know".
+  Details: `docs/two-way-sync.md`, "Behaviour to know". To try it by hand
+  with a real tree kept read-only, see `docs/playground.md`.
 
 ## Record-only mode (`--record-only`)
 

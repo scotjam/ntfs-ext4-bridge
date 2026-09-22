@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 import test_real_library_overlay as ov  # noqa: E402
 import test_two_way_live as tw           # noqa: E402
 
-VM = "windows-vm"
+VM = ov.SITE.get("vm", "windows-vm")     # libvirt domain name, from the site config
 NBD_PORT = 10820
 CTRL_HOST = "192.168.122.1"
 CTRL_PORT = 10821
